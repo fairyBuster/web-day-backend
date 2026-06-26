@@ -1,0 +1,39 @@
+{% extends "admin/base_site.html" %}
+
+{% block title %}Decode API Response{% endblock %}
+
+{% block content %}
+<div class="container" style="padding: 20px;">
+  {% if error %}
+    <div class="errornote">{{ error }}</div>
+  {% endif %}
+
+  <h1>Decode API Response (Base64 + Salt)</h1>
+
+  <form method="post" action="">
+    {% csrf_token %}
+    <p>
+      <label for="payload">Payload atau full response:</label><br>
+      <textarea id="payload" name="payload" rows="6" style="width: 100%;">{{ payload }}</textarea>
+    </p>
+    <p>
+      <button type="submit" class="button default">Decode</button>
+    </p>
+  </form>
+
+  {% if decoded_text %}
+    <div class="module">
+      <h2>Decoded Text</h2>
+      <textarea rows="6" style="width: 100%;" readonly>{{ decoded_text }}</textarea>
+    </div>
+  {% endif %}
+
+  {% if decoded_json %}
+    <div class="module">
+      <h2>Decoded JSON</h2>
+      <pre>{{ decoded_json }}</pre>
+    </div>
+  {% endif %}
+</div>
+{% endblock %}
+

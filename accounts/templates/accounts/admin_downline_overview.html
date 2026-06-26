@@ -1,0 +1,88 @@
+{% extends "admin/base_site.html" %}
+
+{% block title %}Admin Downline Overview{% endblock %}
+
+{% block content %}
+<div class="container" style="padding: 20px;">
+ 
+  <form method="get" action="" style="margin-bottom: 20px;">
+    <label for="phone">Phone:</label>
+    <input type="text" id="phone" name="phone" value="{{ phone }}" placeholder="08xxxxxxxxxx" style="width: 260px;" />
+    <button type="submit" class="button">Cari</button>
+  </form>
+
+  {% if error %}
+    <div class="errornote">{{ error }}</div>
+  {% endif %}
+
+  {% if result %}
+    <h2>Target: {{ result.target.full_name }} ({{ result.target.phone }})</h2>
+    <div class="module">
+      <h3>Ringkasan</h3>
+      <ul>
+        <li>Total Members: {{ result.total_members }}</li>
+        <li>Total Profit Commission: {{ result.total_profit_commission }}</li>
+        <li>Total Purchase Commission: {{ result.total_purchase_commission }}</li>
+        <li>Total Earned Commission: {{ result.total_earned_commission }}</li>
+        <li>Total Investments: {{ result.total_investments }} | Amount: {{ result.total_investment_amount }} | Active: {{ result.active_investments }}</li>
+        <li>Total Deposits (COMPLETED): {{ result.total_deposits }} | Amount: {{ result.total_deposit_amount }}</li>
+      </ul>
+    </div>
+
+    {% for level in result.levels %}
+      <div class="module">
+        <h3>Level {{ level.level }} — Members: {{ level.member_count }}</h3>
+        <p>
+          Profit: {{ level.total_profit_commission }} | Purchase: {{ level.total_purchase_commission }} | Earned: {{ level.total_earned_commission }}
+          <br />Investments: {{ level.total_investments }} (Active: {{ level.active_investments }}) Amount: {{ level.total_investment_amount }}
+          <br />Deposits (COMPLETED): {{ level.total_deposits }} Amount: {{ level.total_deposit_amount }}
+        </p>
+        <table class="listing" style="width: 100%;">
+          <thead>
+            <tr>
+              <th>Member</th>
+              <th>Phone</th>
+              <th>Investments</th>
+              <th>Deposits (COMPLETED)</th>
+              <th>Profit</th>
+              <th>Purchase</th>
+              <th>Earned</th>
+              <th>Trx Komisi (50 terbaru)</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for m in level.members %}
+              <tr>
+                <td>{{ m.full_name }}</td>
+                <td>{{ m.phone }}</td>
+                <td>{{ m.total_investments }} / {{ m.total_investment_amount }}</td>
+                <td>{{ m.total_deposits }} / {{ m.total_deposit_amount }}</td>
+                <td>{{ m.total_profit_commission }}</td>
+                <td>{{ m.total_purchase_commission }}</td>
+                <td>{{ m.total_earned_commission }}</td>
+                <td>
+                  {% if m.transaction_history %}
+                    <details>
+                      <summary>Lihat</summary>
+                      <ul>
+                        {% for t in m.transaction_history %}
+                          <li>
+                            {{ t.created_at }} — {{ t.type }} — {{ t.amount }} —
+                            {% if t.product %}{{ t.product.name }}{% else %}-{% endif %}
+                          </li>
+                        {% endfor %}
+                      </ul>
+                    </details>
+                  {% else %}
+                    -
+                  {% endif %}
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endfor %}
+  {% endif %}
+</div>
+{% endblock %}

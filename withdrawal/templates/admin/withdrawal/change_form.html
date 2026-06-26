@@ -1,0 +1,189 @@
+{% extends "admin/change_form.html" %}
+
+{% block content %}
+  {{ block.super }}
+
+  <div class="module" style="margin-top: 2rem;">
+    <h2>Process via Jayapay</h2>
+    {% if not jayapay_enabled %}
+      <p style="color:#b00;">Jayapay tidak aktif. Set <code>JAYAPAY_ENABLED=true</code> dan isi konfigurasi merchant.</p>
+    {% endif %}
+
+    <form method="post" action="{{ process_jayapay_url }}" novalidate>
+      {% csrf_token %}
+      <fieldset class="module aligned">
+        <div class="form-row">
+          <div>
+            <label for="id_bankCode">Bank</label>
+            <select id="id_bankCode" name="bankCode" required>
+              <option value="">-- pilih bank --</option>
+              {% for b in jayapay_banks %}
+                <option value="{{ b.bankCode }}" {% if jayapay_initial.bankCode == b.bankCode %}selected{% endif %}>
+                  {{ b.bankCode }} - {{ b.bankAbbreviation }} - {{ b.theNameOfTheBank }}
+                </option>
+              {% endfor %}
+            </select>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div>
+            <label for="id_accountNumber">Account Number</label>
+            <input type="text" id="id_accountNumber" name="accountNumber" value="{{ jayapay_initial.accountNumber }}" required />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div>
+            <label for="id_accountName">Account Name</label>
+            <input type="text" id="id_accountName" name="accountName" value="{{ jayapay_initial.accountName }}" required />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div>
+            <label for="id_amount">Amount</label>
+            <input type="number" step="1" id="id_amount" name="amount" value="{{ jayapay_initial.amount }}" required />
+          </div>
+        </div>
+      </fieldset>
+
+      <div class="submit-row">
+        <button type="submit" class="default">Submit to Jayapay</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="module" style="margin-top: 2rem;">
+    <h2>Process via Jayapay PH</h2>
+    {% if not jayapay_ph_enabled %}
+      <p style="color:#b00;">Jayapay PH tidak aktif. Aktifkan di WithdrawalSettings (jayapay_ph_payout_enabled) dan isi konfigurasi mchNo/privateKey/app_domain.</p>
+    {% endif %}
+
+    <form method="post" action="{{ process_jayapay_ph_url }}" novalidate>
+      {% csrf_token %}
+      <fieldset class="module aligned">
+        <div class="form-row">
+          <div>
+            <label for="id_ph_bankCode">Bank/Walet</label>
+            <select id="id_ph_bankCode" name="bankCode" required>
+              <option value="">-- pilih bankCode --</option>
+              {% for b in jayapay_ph_banks %}
+                <option value="{{ b.bankCode }}" {% if jayapay_ph_initial.bankCode == b.bankCode %}selected{% endif %}>
+                  {{ b.bankCode }} - {{ b.bankName }}
+                </option>
+              {% endfor %}
+            </select>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div>
+            <label for="id_ph_bankCard">Bank Card / Wallet Number</label>
+            <input type="text" id="id_ph_bankCard" name="bankCard" value="{{ jayapay_ph_initial.bankCard }}" required />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div>
+            <label for="id_ph_accountName">Account Name</label>
+            <input type="text" id="id_ph_accountName" name="accountName" value="{{ jayapay_ph_initial.accountName }}" required />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div>
+            <label for="id_ph_amount">Amount</label>
+            <input type="number" step="0.01" id="id_ph_amount" name="amount" value="{{ jayapay_ph_initial.amount }}" required />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div>
+            <label for="id_ph_feeType">Fee Type</label>
+            <select id="id_ph_feeType" name="feeType" required>
+              <option value="0" {% if jayapay_ph_initial.feeType == "0" %}selected{% endif %}>0 - Deduction within the order</option>
+              <option value="1" {% if jayapay_ph_initial.feeType == "1" %}selected{% endif %}>1 - Handling fee calculated separately</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div>
+            <label for="id_ph_description">Description</label>
+            <input type="text" id="id_ph_description" name="description" value="{{ jayapay_ph_initial.description }}" />
+          </div>
+        </div>
+      </fieldset>
+
+      <div class="submit-row">
+        <button type="submit" class="default">Submit to Jayapay PH</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="module" style="margin-top: 2rem;">
+    <h2>Process via USD Payout</h2>
+    {% if not usd_payout_enabled %}
+      <p style="color:#b00;">USD payout tidak aktif. Set <code>USD_PAYOUT_ENABLED=true</code> dan isi konfigurasi merchant.</p>
+    {% endif %}
+
+    <form method="post" action="{{ process_usd_payout_url }}" novalidate>
+      {% csrf_token %}
+      <fieldset class="module aligned">
+        <div class="form-row">
+          <div>
+            <label for="id_usd_bankCode">Bank Code</label>
+            <select id="id_usd_bankCode" name="bankCode" required>
+              <option value="">-- pilih bankCode --</option>
+              {% for b in usd_payout_bank_codes %}
+                <option value="{{ b.code }}" {% if usd_payout_initial.bankCode == b.code %}selected{% endif %}>
+                  {{ b.code }} - {{ b.name }}
+                </option>
+              {% endfor %}
+            </select>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div>
+            <label for="id_usd_accNo">Account Number</label>
+            <input type="text" id="id_usd_accNo" name="accNo" value="{{ usd_payout_initial.accNo }}" required />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div>
+            <label for="id_usd_accName">Account Name</label>
+            <input type="text" id="id_usd_accName" name="accName" value="{{ usd_payout_initial.accName }}" required />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div>
+            <label for="id_usd_email">Email</label>
+            <input type="text" id="id_usd_email" name="email" value="{{ usd_payout_initial.email }}" />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div>
+            <label for="id_usd_phone">Phone</label>
+            <input type="text" id="id_usd_phone" name="phone" value="{{ usd_payout_initial.phone }}" />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div>
+            <label for="id_usd_orderAmount">Amount</label>
+            <input type="number" step="0.01" id="id_usd_orderAmount" name="orderAmount" value="{{ usd_payout_initial.orderAmount }}" required />
+          </div>
+        </div>
+      </fieldset>
+
+      <div class="submit-row">
+        <button type="submit" class="default">Submit to USD Payout</button>
+      </div>
+    </form>
+  </div>
+{% endblock %}

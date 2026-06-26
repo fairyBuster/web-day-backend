@@ -1,0 +1,32 @@
+* text=auto
+
+# Default to LF for source files
+*.py   text eol=lf
+*.html text eol=lf
+*.css  text eol=lf
+*.js   text eol=lf
+*.ts   text eol=lf
+*.tsx  text eol=lf
+*.json text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.md   text eol=lf
+*.sql  text eol=lf
+
+# Django templates & configuration
+*.txt  text eol=lf
+*.ini  text eol=lf
+*.cfg  text eol=lf
+
+# Windows scripts should use CRLF
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+
+# Binary files
+*.png  -text
+*.jpg  -text
+*.jpeg -text
+*.gif  -text
+*.ico  -text
+*.pdf  -text

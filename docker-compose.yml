@@ -1,0 +1,142 @@
+services:
+  web:
+    build: .
+    env_file:
+      - .env
+    ports:
+      - "8080:8000"
+    volumes:
+      - .:/app
+      - media:/app/media
+      - staticfiles:/app/staticfiles
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    environment:
+      - DEBUG=0
+      - DATABASE_HOST=pgbouncer
+      - DATABASE_PORT=6432
+      - DB_CONN_MAX_AGE=0
+      - WORKERS=6
+      - THREADS=2
+      - TIMEOUT=120
+      - KEEP_ALIVE=15
+      - MAX_REQUESTS=1000
+      - MAX_REQUESTS_JITTER=50
+      - LOG_LEVEL=info
+      - TZ=Asia/Jakarta
+    depends_on:
+      pgbouncer:
+        condition: service_started
+    restart: unless-stopped
+  
+
+  db:
+    image: postgres:18
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: ${DATABASE_NAME}
+      POSTGRES_USER: ${DATABASE_USER}
+      POSTGRES_PASSWORD: ${DATABASE_PASSWORD}
+      TZ: Asia/Jakarta
+    command: ["postgres", "-c", "timezone=Asia/Jakarta", "-c", "log_timezone=Asia/Jakarta"]
+    volumes:
+      - postgres_data:/var/lib/postgresql
+      - ./database:/docker-entrypoint-initdb.d:ro
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+    restart: unless-stopped
+
+  db_backup:
+    image: postgres:18
+    env_file:
+      - .env
+    environment:
+      PGPASSWORD: ${DATABASE_PASSWORD}
+      TZ: Asia/Jakarta
+    volumes:
+      - ./backups:/backups
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    depends_on:
+      - db
+    restart: unless-stopped
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        mkdir -p /backups
+        echo "Waiting for Postgres..."
+        until pg_isready -h db -p 5432 -U "$$DATABASE_USER" -d "$$DATABASE_NAME"; do
+          sleep 2
+        done
+        echo "Postgres is ready."
+        while true; do
+          ts="$$(date +%Y%m%d_%H%M%S)"
+          out="/backups/$${DATABASE_NAME}_$${ts}.sql.gz"
+          echo "Creating backup: $${out}"
+          pg_dump -h db -p 5432 -U "$$DATABASE_USER" -d "$$DATABASE_NAME" | gzip > "$${out}"
+          keep="$${BACKUP_KEEP:-8}"
+          if [ "$${keep}" -gt 0 ]; then
+            ls -1t /backups/*.sql.gz 2>/dev/null | tail -n +$$(($${keep}+1)) | xargs -r rm -f || true
+          fi
+          sleep "$${BACKUP_INTERVAL_SECONDS:-86400}"
+        done
+  
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    environment:
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_USER=${DATABASE_USER}
+      - DB_PASSWORD=${DATABASE_PASSWORD}
+      - DB_NAME=${DATABASE_NAME}
+      - LISTEN_PORT=6432
+      - POOL_MODE=session
+      - AUTH_TYPE=scram-sha-256
+      - TZ=Asia/Jakarta
+    depends_on:
+      - db
+    restart: unless-stopped
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+  
+  caddy:
+    image: caddy:2-alpine
+    env_file:
+      - .env
+    environment:
+      - APP_DOMAIN=${APP_DOMAIN}
+      - ACME_EMAIL=${ACME_EMAIL:-}
+      - CORS_ORIGIN_REGEX=${CORS_ORIGIN_REGEX:-^https?://(localhost|127\.0\.0\.1)(:\d+)?$}
+      - TZ=Asia/Jakarta
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - .:/app:ro
+      - media:/app/media:ro
+      - staticfiles:/app/staticfiles:ro
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  caddy_data:
+  caddy_config:
+  media:
+  staticfiles:

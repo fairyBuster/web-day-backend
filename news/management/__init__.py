@@ -1,0 +1,1 @@
+# Init for news management package

@@ -1,0 +1,189 @@
+{% load static %}
+{% load product_tags %}
+<div class="rebate-settings-widget">
+    <div class="purchase-levels">
+        <h3>Purchase Rebate Levels</h3>
+        <div class="levels-container" id="purchase-levels-container">
+            {% for key, value in widget.purchase_levels|to_items %}
+            <div class="level-input">
+                <label for="{{ widget.name }}_purchase_{{ key }}">Level {{ forloop.counter }}:</label>
+                <input type="number" 
+                       name="{{ widget.name }}_purchase_{{ key }}"
+                       id="{{ widget.name }}_purchase_{{ key }}"
+                       value="{{ value }}"
+                       min="0"
+                       max="100"
+                       step="0.01"
+                       class="purchase-level">
+                <span class="percentage">%</span>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+
+    <div class="profit-levels">
+        <h3>Profit Rebate Levels</h3>
+        <div class="levels-container" id="profit-levels-container">
+            {% for key, value in widget.profit_levels|to_items %}
+            <div class="level-input">
+                <label for="{{ widget.name }}_profit_{{ key }}">Level {{ forloop.counter }}:</label>
+                <input type="number"
+                       name="{{ widget.name }}_profit_{{ key }}"
+                       id="{{ widget.name }}_profit_{{ key }}"
+                       value="{{ value }}"
+                       min="0"
+                       max="100"
+                       step="0.01"
+                       class="profit-level">
+                <span class="percentage">%</span>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+</div>
+
+<style>
+.rebate-settings-widget {
+    display: flex;
+    gap: 2rem;
+    margin-top: 1rem;
+}
+
+.purchase-levels, .profit-levels {
+    flex: 1;
+    background: #f8f8f8;
+    padding: 1rem;
+    border-radius: 4px;
+}
+
+.purchase-levels h3, .profit-levels h3 {
+    margin-top: 0;
+    margin-bottom: 1rem;
+    color: #666;
+    font-size: 1rem;
+}
+
+.levels-container {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.level-input {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    background: white;
+    padding: 0.5rem;
+    border-radius: 4px;
+    border: 1px solid #ddd;
+}
+
+.level-input label {
+    min-width: 80px;
+    color: #666;
+}
+
+.level-input input {
+    width: 100px;
+    padding: 4px 8px;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+}
+
+.level-input input:focus {
+    outline: none;
+    border-color: #79aec8;
+}
+
+.percentage {
+    color: #666;
+}
+
+/* Animations */
+.level-input {
+    transition: all 0.3s ease;
+}
+
+.level-input.new {
+    animation: slideDown 0.3s ease;
+}
+
+@keyframes slideDown {
+    from {
+        opacity: 0;
+        transform: translateY(-10px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+</style>
+
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    function createLevelInput(type, number) {
+        const div = document.createElement('div');
+        div.className = 'level-input new';
+        
+        const label = document.createElement('label');
+        label.htmlFor = `id_rebate_settings_${type}_level${number}`;
+        label.textContent = `Level ${number}:`;
+        
+        const input = document.createElement('input');
+        input.type = 'number';
+        input.name = `rebate_settings_${type}_level${number}`;
+        input.id = `id_rebate_settings_${type}_level${number}`;
+        input.min = '0';
+        input.max = '100';
+        input.step = '0.01';
+        input.className = `${type}-level`;
+        input.value = '0';
+        
+        const span = document.createElement('span');
+        span.className = 'percentage';
+        span.textContent = '%';
+        
+        div.appendChild(label);
+        div.appendChild(input);
+        div.appendChild(span);
+        
+        return div;
+    }
+
+    window.updatePurchaseLevels = function(count) {
+        const container = document.getElementById('purchase-levels-container');
+        const currentCount = container.children.length;
+        
+        if (count > currentCount) {
+            // Add new levels
+            for (let i = currentCount + 1; i <= count; i++) {
+                container.appendChild(createLevelInput('purchase', i));
+            }
+        } else if (count < currentCount) {
+            // Remove excess levels
+            while (container.children.length > count) {
+                container.removeChild(container.lastChild);
+            }
+        }
+    }
+
+    window.updateProfitLevels = function(count) {
+        const container = document.getElementById('profit-levels-container');
+        const currentCount = container.children.length;
+        
+        if (count > currentCount) {
+            // Add new levels
+            for (let i = currentCount + 1; i <= count; i++) {
+                container.appendChild(createLevelInput('profit', i));
+            }
+        } else if (count < currentCount) {
+            // Remove excess levels
+            while (container.children.length > count) {
+                container.removeChild(container.lastChild);
+            }
+        }
+    }
+});
+</script>

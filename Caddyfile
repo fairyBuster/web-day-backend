@@ -1,0 +1,99 @@
+{
+    email {$ACME_EMAIL}
+    servers {
+        trusted_proxies static 173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32
+    }
+    log {
+        output stdout
+        format console
+        level info
+    }
+}
+
+(site_common) {
+    header X-Content-Type-Options "nosniff"
+    header X-Frame-Options "DENY"
+    header X-XSS-Protection "1; mode=block"
+    header Referrer-Policy "strict-origin-when-cross-origin"
+    header -Server
+
+    handle /health {
+        reverse_proxy web:8000 {
+            header_up Host {$APP_DOMAIN}
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_ip}
+            header_up X-Forwarded-For {remote_ip}
+        }
+    }
+
+    handle_path /static/* {
+        root * /app/staticfiles
+        encode gzip zstd
+        file_server
+    }
+
+    handle_path /media/* {
+        root * /app/media
+        header Cache-Control "public, max-age=31536000, immutable"
+        file_server
+    }
+
+    route /api/* {
+        @cors_preflight_allowed {
+            method OPTIONS
+            header_regexp origin Origin {env.CORS_ORIGIN_REGEX}
+        }
+        handle @cors_preflight_allowed {
+            header Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+            header Access-Control-Allow-Headers "Content-Type, Authorization, X-Requested-With"
+            header Access-Control-Allow-Credentials "true"
+            header Access-Control-Max-Age "86400"
+            header Access-Control-Allow-Origin {http.request.header.Origin}
+            respond "" 204
+        }
+
+        @cors_preflight_denied {
+            method OPTIONS
+        }
+        handle @cors_preflight_denied {
+            respond "CORS origin not allowed" 403
+        }
+
+        @api_allowed {
+            header_regexp origin Origin {env.CORS_ORIGIN_REGEX}
+        }
+        handle @api_allowed {
+            header Access-Control-Allow-Origin {http.request.header.Origin}
+            header Access-Control-Allow-Credentials "true"
+            reverse_proxy web:8000 {
+                header_up Host {$APP_DOMAIN}
+                header_up X-Forwarded-Proto https
+                header_up X-Real-IP {remote_ip}
+                header_up X-Forwarded-For {remote_ip}
+                header_up X-Request-ID {http.request.id}
+            }
+            encode gzip zstd
+        }
+
+        respond "CORS origin not allowed" 403
+    }
+
+    handle {
+        reverse_proxy web:8000 {
+            header_up Host {$APP_DOMAIN}
+            header_up X-Forwarded-Proto https
+            header_up X-Real-IP {remote_ip}
+            header_up X-Forwarded-For {remote_ip}
+            header_up X-Request-ID {http.request.id}
+        }
+        encode gzip zstd
+    }
+}
+
+{$APP_DOMAIN} {
+    import site_common
+}
+
+www.{$APP_DOMAIN} {
+    import site_common
+}

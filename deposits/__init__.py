@@ -1,0 +1,1 @@
+"""Deposits app for handling user top-ups via payment gateways."""

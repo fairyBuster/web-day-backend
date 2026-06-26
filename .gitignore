@@ -1,0 +1,50 @@
+# Backup files
+*.bak
+backup.tar.gz
+nginx_backup/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.egg-info/
+.installed.cfg
+*.egg
+instance/
+.webassets-cache
+
+# Django
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+media/
+.env
+.env.*
+!.env.example
+staticfiles/
+
+# Logs
+logs/
+*.log
+*.out
+*.err
+
+# Other
+.DS_Store
+run/
+.venv/
+*.pid
+deploy/*.sql

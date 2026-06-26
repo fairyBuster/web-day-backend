@@ -1,0 +1,210 @@
+from django.conf import settings
+from django.db import models
+from django.utils import timezone
+
+from django.db import transaction as db_transaction
+from products.models import Transaction
+import uuid
+
+
+class WithdrawalSettings(models.Model):
+    BALANCE_CHOICES = [
+        ('balance', 'Balance'),
+        ('balance_deposit', 'Balance Deposit'),
+    ]
+
+    is_active = models.BooleanField(default=True)
+    require_bank_account = models.BooleanField(default=True)
+    require_pin = models.BooleanField(default=False)
+    require_active_investment = models.BooleanField(default=False, help_text="User must have at least one active investment to withdraw")
+    max_withdrawal_count = models.PositiveIntegerField(
+        default=0,
+        help_text="Batas maksimal jumlah penarikan per user. 0 = tanpa batas. Hanya menghitung request PENDING, PROCESSING, dan COMPLETED."
+    )
+    minimum_product_quantity = models.PositiveIntegerField(default=0)
+    required_product = models.ForeignKey('products.Product', on_delete=models.SET_NULL, null=True, blank=True)
+    balance_source = models.CharField(max_length=20, choices=BALANCE_CHOICES, default='balance')
+    require_withdraw_service = models.BooleanField(default=True, help_text="Jika ON, user wajib memilih WithdrawalService aktif; jika OFF, boleh tanpa service")
+
+    app_domain = models.CharField(max_length=255, blank=True, default='', help_text='Contoh: myapp.example.com (tanpa http/https)')
+
+    jayapay_enabled = models.BooleanField(default=False)
+    jayapay_merchant_code = models.CharField(max_length=100, blank=True, default='')
+    jayapay_private_key = models.TextField(blank=True, default='', help_text='Paste RSA PRIVATE KEY body ONLY (without BEGIN/END headers)')
+    jayapay_public_key = models.TextField(blank=True, default='', help_text='Optional: PUBLIC KEY untuk verifikasi/dekripsi callback bila diperlukan')
+
+    jayapay_ph_payout_enabled = models.BooleanField(default=False)
+    jayapay_ph_payout_mch_no = models.CharField(max_length=100, blank=True, default='')
+    jayapay_ph_payout_private_key = models.TextField(blank=True, default='', help_text='Paste RSA PRIVATE KEY body ONLY (without BEGIN/END headers)')
+    jayapay_ph_payout_public_key = models.TextField(blank=True, default='', help_text='Optional: Platform PUBLIC KEY untuk verifikasi callback')
+    jayapay_ph_payout_api_url = models.CharField(max_length=255, blank=True, default='')
+    jayapay_ph_payout_fee_type = models.PositiveSmallIntegerField(default=1, help_text='0: fee deduct in order; 1: handling fee calculated separately')
+
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'withdrawal_settings'
+
+    def __str__(self):
+        return f"WithdrawalSettings(active={self.is_active})"
+
+
+class WithdrawalService(models.Model):
+    name = models.CharField(max_length=100)
+    description = models.TextField(blank=True)
+    duration_hours = models.PositiveIntegerField()
+    fee_percent = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    fee_fixed = models.DecimalField(max_digits=15, decimal_places=2, default=0)
+    is_active = models.BooleanField(default=True)
+    sort_order = models.PositiveSmallIntegerField(default=0)
+
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'withdrawal_services'
+        ordering = ['sort_order', 'duration_hours', 'name']
+
+    def __str__(self):
+        return f"{self.name} ({self.duration_hours} jam, {self.fee_percent}% + {self.fee_fixed})"
+
+
+class Withdrawal(models.Model):
+    STATUS_CHOICES = [
+        ('PENDING', 'Pending'),
+        ('PROCESSING', 'Processing'),
+        ('COMPLETED', 'Completed'),
+        ('REJECTED', 'Rejected'),
+        ('CANCELLED', 'Cancelled'),
+    ]
+
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='withdrawals')
+    bank_account = models.ForeignKey('banks.UserBank', on_delete=models.SET_NULL, null=True, blank=True, related_name='withdrawals')
+    withdrawal_service = models.ForeignKey('WithdrawalService', on_delete=models.SET_NULL, null=True, blank=True, related_name='withdrawals')
+
+    amount = models.DecimalField(max_digits=15, decimal_places=2)
+    fee = models.DecimalField(max_digits=15, decimal_places=2, default=0)
+    net_amount = models.DecimalField(max_digits=15, decimal_places=2, default=0)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='PENDING')
+
+    note = models.TextField(blank=True)
+    transaction = models.ForeignKey('products.Transaction', on_delete=models.SET_NULL, null=True, blank=True, related_name='related_withdrawal')
+
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'withdrawals'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.user.phone} - {self.amount} ({self.status})"
+
+    def save(self, *args, **kwargs):
+        # Capture previous status before saving to detect transitions
+        prev_status = None
+        if self.pk:
+            try:
+                prev_status = Withdrawal.objects.only('status').get(pk=self.pk).status
+            except Withdrawal.DoesNotExist:
+                prev_status = None
+
+        super().save(*args, **kwargs)
+
+        # Keep linked transaction status in sync
+        if self.transaction and self.transaction.status != self.status:
+            self.transaction.status = self.status
+            self.transaction.save(update_fields=['status'])
+
+        # Auto refund when rejected/cancelled from a pending/processing state
+        if prev_status in ('PENDING', 'PROCESSING') and self.status in ('REJECTED', 'CANCELLED'):
+            # Determine wallet field from original transaction
+            wallet_field = None
+            wallet_type = None
+            if self.transaction:
+                wallet_type = self.transaction.wallet_type
+                if wallet_type == 'BALANCE':
+                    wallet_field = 'balance'
+                elif wallet_type == 'BALANCE_DEPOSIT':
+                    wallet_field = 'balance_deposit'
+
+            if wallet_field:
+                # Ensure idempotency: do not double-refund
+                refund_exists = Transaction.objects.filter(
+                    related_transaction=self.transaction,
+                    type__in=['REJECT', 'CREDIT'],
+                    description__icontains='Withdrawal',
+                ).exists()
+                if not refund_exists:
+                    with db_transaction.atomic():
+                        # Refund full amount deducted at request time
+                        current_value = getattr(self.user, wallet_field)
+                        setattr(self.user, wallet_field, current_value + self.amount)
+                        self.user.save(update_fields=[wallet_field])
+
+                        # Record refund transaction
+                        Transaction.objects.create(
+                            user=self.user,
+                            product=None,
+                            upline_user=None,
+                            trx_id=f"WDREF-{uuid.uuid4().hex[:10].upper()}",
+                            type='REJECT',
+                            amount=self.amount,
+                            description='Withdrawal rejected - refund',
+                            status='COMPLETED',
+                            wallet_type=wallet_type or 'BALANCE',
+                            related_transaction=self.transaction,
+                        )
+
+
+class JayapayWithdrawal(models.Model):
+    withdrawal = models.OneToOneField(Withdrawal, on_delete=models.CASCADE, related_name='jayapay_withdrawal')
+    request_params = models.JSONField(default=dict)
+    response_payload = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'withdrawal_jayapay'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"Jayapay for Withdrawal #{self.withdrawal.pk}"
+
+
+class JayapayPhPayoutWithdrawal(models.Model):
+    withdrawal = models.OneToOneField(Withdrawal, on_delete=models.CASCADE, related_name='jayapay_ph_payout_withdrawal')
+    request_params = models.JSONField(default=dict)
+    response_payload = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'withdrawal_jayapay_ph_payout'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"Jayapay PH payout for Withdrawal #{self.withdrawal.pk}"
+
+
+class UsdPayoutWithdrawal(models.Model):
+    withdrawal = models.OneToOneField(Withdrawal, on_delete=models.CASCADE, related_name='usd_payout_withdrawal')
+    request_params = models.JSONField(default=dict)
+    response_payload = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'withdrawal_usd_payout'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"USD payout for Withdrawal #{self.withdrawal.pk}"
+
+
+class WithdrawalJayapay(Withdrawal):
+    class Meta:
+        proxy = True
+        verbose_name = 'Withdrawal Jayapay'
+        verbose_name_plural = 'Withdrawals Jayapay'

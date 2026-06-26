@@ -1,0 +1,37 @@
+{% extends "admin/base_site.html" %}
+
+{% block content %}
+<div class="container">
+  <h1>Process Withdrawal via Jayapay</h1>
+  <p>
+    Withdrawal ID: {{ withdrawal.id }}<br>
+    User: {{ withdrawal.user }}<br>
+    Status: {{ withdrawal.status }}<br>
+    Net Amount: {{ withdrawal.net_amount }}
+  </p>
+
+  <form method="post" novalidate>
+    {% csrf_token %}
+    <div class="form-row">
+      <label for="bankCode">Bank Code</label>
+      <input type="text" id="bankCode" name="bankCode" value="{{ initial.bankCode }}" required />
+    </div>
+    <div class="form-row">
+      <label for="accountNumber">Account Number</label>
+      <input type="text" id="accountNumber" name="accountNumber" value="{{ initial.accountNumber }}" required />
+    </div>
+    <div class="form-row">
+      <label for="accountName">Account Name</label>
+      <input type="text" id="accountName" name="accountName" value="{{ initial.accountName }}" required />
+    </div>
+    <div class="form-row">
+      <label for="amount">Amount</label>
+      <input type="number" step="1" id="amount" name="amount" value="{{ initial.amount }}" required />
+    </div>
+    <div class="submit-row">
+      <button type="submit" class="default">Submit to Jayapay</button>
+      <a class="button" href="{% url 'admin:withdrawal_withdrawal_change' withdrawal.id %}">Back</a>
+    </div>
+  </form>
+</div>
+{% endblock %}

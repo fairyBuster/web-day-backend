@@ -1,0 +1,109 @@
+{% extends "admin/change_list.html" %}
+{% load admin_urls static product_tags %}
+
+{% block content_title %}
+    {{ block.super }}
+    {% if summary %}
+    <div style="background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 8px; padding: 20px; margin: 20px 0; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+        <h3 style="margin: 0 0 15px 0; color: #495057; font-size: 18px;">📊 Investment Tracking Summary</h3>
+        
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px;">
+            <!-- Investment Overview -->
+            <div style="background: white; padding: 15px; border-radius: 6px; border-left: 4px solid #007bff;">
+                <h4 style="margin: 0 0 10px 0; color: #007bff; font-size: 14px;">📈 Investment Overview</h4>
+                <div style="font-size: 12px; line-height: 1.4;">
+                    <div><strong>Total Investments:</strong> {{ summary.total_investments }}</div>
+                    <div style="color: #28a745;"><strong>Active:</strong> {{ summary.active_investments }}</div>
+                    <div style="color: #007bff;"><strong>Completed:</strong> {{ summary.completed_investments }}</div>
+                    <div style="color: #ffc107;"><strong>Expired:</strong> {{ summary.expired_investments }}</div>
+                </div>
+            </div>
+            
+            <!-- Financial Overview -->
+            <div style="background: white; padding: 15px; border-radius: 6px; border-left: 4px solid #28a745;">
+                <h4 style="margin: 0 0 10px 0; color: #28a745; font-size: 14px;">💰 Financial Overview</h4>
+                <div style="font-size: 12px; line-height: 1.4;">
+                    <div><strong>Total Invested:</strong> {{ summary.total_invested|format_currency }}</div>
+                    <div><strong>Total Claimed:</strong> {{ summary.total_claimed|format_currency }}</div>
+                    <div style="color: #007bff;"><strong>Claim Rate:</strong> {{ summary.claim_rate }}%</div>
+                </div>
+            </div>
+            
+            <!-- Performance Alerts -->
+            <div style="background: white; padding: 15px; border-radius: 6px; border-left: 4px solid #ffc107;">
+                <h4 style="margin: 0 0 10px 0; color: #ffc107; font-size: 14px;">⚠️ Performance Alerts</h4>
+                <div style="font-size: 12px; line-height: 1.4;">
+                    <div style="color: #dc3545;"><strong>Expiring Soon:</strong> {{ summary.expiring_soon }} (≤7 days)</div>
+                    <div style="color: #6c757d;"><strong>Never Claimed:</strong> {{ summary.never_claimed }}</div>
+                    <div style="color: #28a745;"><strong>High Performers:</strong> {{ summary.high_performers }} (≥80% claimed)</div>
+                </div>
+            </div>
+            
+            <!-- Quick Actions -->
+            <div style="background: white; padding: 15px; border-radius: 6px; border-left: 4px solid #6f42c1;">
+                <h4 style="margin: 0 0 10px 0; color: #6f42c1; font-size: 14px;">🔍 Quick Search Tips</h4>
+                <div style="font-size: 12px; line-height: 1.6;">
+                    <div><strong>Search by:</strong> Phone, Product, Status, Transaction ID</div>
+                    <div><strong>Examples:</strong> "ACTIVE", "0812345", "Bitcoin"</div>
+                    <div><strong>Status:</strong> ACTIVE, COMPLETED, EXPIRED, CANCELLED</div>
+                    <div><strong>Performance:</strong> Use actions for bulk operations</div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Performance Bar -->
+        <div style="margin-top: 15px;">
+            <div style="font-size: 13px; margin-bottom: 5px;"><strong>Overall Claim Performance: {{ summary.claim_rate }}%</strong></div>
+            <div style="width: 100%; background: #e9ecef; border-radius: 10px; height: 20px; overflow: hidden;">
+                <div class="performance-bar" data-width="{{ summary.claim_rate }}" style="height: 100%; background: linear-gradient(90deg, #28a745 0%, #20c997 50%, #17a2b8 100%); transition: width 0.3s ease;"></div>
+            </div>
+        </div>
+    </div>
+    {% endif %}
+{% endblock %}
+
+{% block extrahead %}
+    {{ block.super }}
+    <style>
+        /* Custom styles for better tracking interface */
+        .admin-object-tools {
+            margin-top: 10px;
+        }
+        
+        /* Responsive grid for smaller screens */
+        @media (max-width: 768px) {
+            .summary-grid {
+                grid-template-columns: 1fr !important;
+            }
+        }
+        
+        /* Enhance table readability */
+        .results table {
+            font-size: 12px;
+        }
+        
+        .results th {
+            background: #f8f9fa !important;
+            border-bottom: 2px solid #dee2e6 !important;
+        }
+        
+        /* Pagination styling */
+        .paginator {
+            margin-top: 20px;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 6px;
+        }
+    </style>
+    
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            // Set performance bar width dynamically to avoid CSS linter issues
+            const performanceBar = document.querySelector('.performance-bar');
+            if (performanceBar) {
+                const width = performanceBar.getAttribute('data-width');
+                performanceBar.style.width = width + '%';
+            }
+        });
+    </script>
+{% endblock %}

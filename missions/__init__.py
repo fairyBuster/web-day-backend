@@ -1,0 +1,1 @@
+"""Missions app initialization."""
