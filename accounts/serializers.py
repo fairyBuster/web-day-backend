@@ -665,7 +665,7 @@ class DownlineMemberSerializer(serializers.Serializer):
     username = serializers.CharField()
     phone = serializers.CharField()
     referral_code = serializers.CharField()
-    rank = serializers.IntegerField(allow_null=True)
+    rank = serializers.CharField(source='rank_title', allow_null=True)
     registration_date = serializers.DateTimeField(source='created_at', read_only=True)
     
     # Commission data

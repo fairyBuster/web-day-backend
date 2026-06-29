@@ -23,6 +23,21 @@ class OTPTest(TestCase):
         response = self.client.post('/api/auth/request-otp/', {'phone': '08123456789'})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertTrue(PhoneOTP.objects.filter(phone=normalize_phone('08123456789')).exists())
+
+    @patch('accounts.views.send_whatsapp_otp')
+    def test_request_otp_success_for_existing_user_phone(self, mock_send):
+        self.User.objects.create(
+            username='existinguser',
+            phone='08123456780',
+            email='existing@example.com',
+            full_name='Existing User',
+        )
+        mock_send.return_value = (True, "OTP sent successfully")
+
+        response = self.client.post('/api/auth/request-otp/', {'phone': '08123456780'})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(PhoneOTP.objects.filter(phone=normalize_phone('08123456780')).exists())
         
     def test_otp_disabled(self):
         self.setting.otp_enabled = False

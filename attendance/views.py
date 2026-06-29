@@ -120,6 +120,15 @@ def _get_daily_program_state(user, today):
     }
 
 
+def _iter_dates(start_date, end_date):
+    if not start_date or not end_date:
+        return
+    cur = start_date
+    while cur <= end_date:
+        yield cur
+        cur = cur + timezone.timedelta(days=1)
+
+
 class AttendanceSettingsViewSet(viewsets.ModelViewSet):
     queryset = AttendanceSettings.objects.all()
     serializer_class = AttendanceSettingsSerializer
@@ -196,6 +205,9 @@ class AttendanceLogViewSet(viewsets.ReadOnlyModelViewSet):
                         'program_start_date': serializers.DateField(allow_null=True),
                         'program_end_date': serializers.DateField(allow_null=True),
                         'program_claim_count': serializers.IntegerField(),
+                        'program_claim_dates': serializers.ListField(child=serializers.DateField()),
+                        'missed_claim_count': serializers.IntegerField(),
+                        'missed_claim_dates': serializers.ListField(child=serializers.DateField()),
                         'total_claimed_amount': serializers.DecimalField(max_digits=15, decimal_places=2),
                         'total_claim_count': serializers.IntegerField(),
                     },
@@ -235,6 +247,9 @@ class AttendanceLogViewSet(viewsets.ReadOnlyModelViewSet):
         program_start_date = None
         program_end_date = None
         program_claim_count = 0
+        program_claim_dates = []
+        missed_claim_dates = []
+        missed_claim_count = 0
         next_claim_date = today + timezone.timedelta(days=1)
         if settings_obj and settings_obj.reward_type == 'daily':
             daily_state = _get_daily_program_state(user, today)
@@ -248,6 +263,22 @@ class AttendanceLogViewSet(viewsets.ReadOnlyModelViewSet):
             program_end_date = daily_state['program_end_date']
             program_claim_count = daily_state['program_claim_count']
             next_claim_date = None if program_completed else today + timezone.timedelta(days=1)
+            if program_start_date and program_end_date:
+                program_logs_qs = AttendanceLog.objects.filter(
+                    user=user,
+                    date__gte=program_start_date,
+                    date__lte=program_end_date,
+                )
+                program_claim_dates = list(program_logs_qs.order_by('date', 'created_at').values_list('date', flat=True))
+                range_end = program_end_date if today > program_end_date else (today - timezone.timedelta(days=1))
+                if range_end >= program_start_date:
+                    claimed_before_range_end = set(
+                        program_logs_qs.filter(date__lte=range_end).values_list('date', flat=True)
+                    )
+                    missed_claim_dates = [
+                        d for d in _iter_dates(program_start_date, range_end) if d not in claimed_before_range_end
+                    ]
+                    missed_claim_count = len(missed_claim_dates)
 
         return Response({
             'streak': streak_val,
@@ -261,6 +292,9 @@ class AttendanceLogViewSet(viewsets.ReadOnlyModelViewSet):
             'program_start_date': program_start_date,
             'program_end_date': program_end_date,
             'program_claim_count': program_claim_count,
+            'program_claim_dates': program_claim_dates,
+            'missed_claim_count': missed_claim_count,
+            'missed_claim_dates': missed_claim_dates,
             'total_claimed_amount': aggregate_data.get('total_claimed_amount') or Decimal('0.00'),
             'total_claim_count': int(aggregate_data.get('total_claim_count') or 0),
         })

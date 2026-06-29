@@ -177,21 +177,19 @@ class Command(BaseCommand):
                             )
                         # Return principal to user's wallet regardless of product flag
                         try:
-                            original_trx = investment.transaction
-                            wallet_type = original_trx.wallet_type if original_trx else 'BALANCE'
-                            if wallet_type == 'BALANCE':
-                                user.balance += investment.total_amount
-                                user.save(update_fields=['balance'])
-                            elif wallet_type == 'BALANCE_DEPOSIT':
-                                user.balance_deposit += investment.total_amount
-                                user.save(update_fields=['balance_deposit'])
+                            wallet_type = 'BALANCE'
+                            principal_amount = abs(investment.total_amount or Decimal('0'))
+                            if principal_amount <= 0:
+                                raise ValueError("Principal amount invalid")
+                            user.balance += principal_amount
+                            user.save(update_fields=['balance'])
                             Transaction.objects.create(
                                 user=user,
                                 product=investment.product,
                                 upline_user=None,
                                 trx_id=f'INVRET-{timezone.now().strftime("%Y%m%d%H%M%S")}-{uuid.uuid4().hex[:6].upper()}',
                                 type='RETURN',
-                                amount=investment.total_amount,
+                                amount=principal_amount,
                                 description=f'Principal return at maturity for {investment.product.name}',
                                 status='COMPLETED',
                                 wallet_type=wallet_type,

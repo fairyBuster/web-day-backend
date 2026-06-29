@@ -23,7 +23,7 @@ from decimal import Decimal
 from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiExample, OpenApiResponse, OpenApiParameter, inline_serializer
 from .serializers import RankLevelSerializer, RankStatusResponseSerializer
 from .models import RankLevel
-from .utils import calculate_user_rank_progress, calculate_user_rank_progress_breakdown, send_whatsapp_otp, check_whatsapp_registered, validate_whatsapp_otp, normalize_phone, is_indonesia_phone
+from .utils import calculate_user_rank_progress, calculate_user_rank_progress_breakdown, send_whatsapp_otp, check_whatsapp_registered, validate_whatsapp_otp, normalize_phone, is_indonesia_phone, update_user_rank
 import random
 import base64
 import json
@@ -187,15 +187,6 @@ class RequestOTPView(APIView):
                 },
                 status=status.HTTP_503_SERVICE_UNAVAILABLE
             )
-
-        # Check if phone already registered (optional, but good practice)
-        if User.objects.filter(phone=phone).exists():
-             return Response(
-                 {
-                     'phone': 'Already registered'
-                 },
-                 status=status.HTTP_400_BAD_REQUEST
-             )
 
         # Rate Limiting: Check last OTP request time
         # Allow only 1 request per minute
@@ -1097,6 +1088,8 @@ class DownlineOverviewView(APIView):
         """Get downline members organized by level (1-5) with bulk aggregations"""
         levels_data = {}
         current_level = [user]
+        rank_title_map = dict(RankLevel.objects.all().values_list('rank', 'title'))
+        default_rank_title = 'Belum Rank'
 
         for level in range(1, max_level + 1):
             downlines_qs = User.objects.filter(referral_by__in=current_level)
@@ -1208,6 +1201,8 @@ class DownlineOverviewView(APIView):
                     m.completed_deposits = d.get('total_deposits', 0) or 0
                     # Anggap aktif jika pernah deposit completed ATAU punya investasi ACTIVE.
                     m.is_active = (m.completed_deposits > 0 or m.active_investments > 0)
+                    rank_val = update_user_rank(m)
+                    m.rank_title = rank_title_map.get(rank_val) if rank_val else default_rank_title
 
                     m.transaction_history = history_map.get(m.id, [])
 
@@ -1279,7 +1274,7 @@ class DownlineOverviewView(APIView):
                                             'username': 'member1',
                                             'phone': '085123456789',
                                             'referral_code': 'REFMEM001',
-                                            'rank': 2,
+                                    'rank': 'Belum Rank',
                                             'registration_date': '2024-01-01T00:00:00Z',
                                             'total_profit_commission': '10000.00',
                                             'total_purchase_commission': '5000.00',
@@ -1404,6 +1399,8 @@ class AdminDownlineOverviewView(APIView):
         """Get downline members organized by level (1..max_level) for target_user with bulk aggregations"""
         levels_data = {}
         current_level = [target_user]
+        rank_title_map = dict(RankLevel.objects.all().values_list('rank', 'title'))
+        default_rank_title = 'Belum Rank'
 
         for level in range(1, max_level + 1):
             downlines_qs = User.objects.filter(referral_by__in=current_level)
@@ -1515,6 +1512,8 @@ class AdminDownlineOverviewView(APIView):
                     m.completed_deposits = d.get('total_deposits', 0) or 0
                     # Anggap aktif jika pernah deposit completed.
                     m.is_active = (m.completed_deposits > 0)
+                    rank_val = update_user_rank(m)
+                    m.rank_title = rank_title_map.get(rank_val) if rank_val else default_rank_title
 
                     m.transaction_history = history_map.get(m.id, [])
 

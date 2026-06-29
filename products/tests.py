@@ -118,6 +118,45 @@ class InvestmentPrincipalReturnTest(TestCase):
         self.user.refresh_from_db()
         self.assertTrue(investment.principal_returned)
         self.assertEqual(self.user.balance, Decimal("100.00"))
+        ret_trx = Transaction.objects.filter(
+            user=self.user,
+            type="RETURN",
+            related_transaction=self.purchase_transaction,
+        ).order_by("-created_at").first()
+        self.assertIsNotNone(ret_trx)
+        self.assertEqual(ret_trx.amount, Decimal("100.00"))
+        self.assertEqual(ret_trx.wallet_type, "BALANCE")
+
+    def test_claim_principal_always_returns_to_main_balance(self):
+        self.purchase_transaction.wallet_type = "BALANCE_DEPOSIT"
+        self.purchase_transaction.save(update_fields=["wallet_type"])
+        self.user.balance = Decimal("10.00")
+        self.user.balance_deposit = Decimal("50.00")
+        self.user.save(update_fields=["balance", "balance_deposit"])
+
+        investment = self._create_investment(claims_count=3, status="COMPLETED")
+
+        success = self.client.post(
+            "/api/investments/claim-principal/",
+            {"investment_id": investment.id},
+            format="json",
+        )
+
+        self.assertEqual(success.status_code, 200)
+        self.assertEqual(success.data["wallet_type"], "BALANCE")
+
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.balance, Decimal("110.00"))
+        self.assertEqual(self.user.balance_deposit, Decimal("50.00"))
+
+        ret_trx = Transaction.objects.filter(
+            user=self.user,
+            type="RETURN",
+            related_transaction=self.purchase_transaction,
+        ).order_by("-created_at").first()
+        self.assertIsNotNone(ret_trx)
+        self.assertEqual(ret_trx.wallet_type, "BALANCE")
+        self.assertEqual(ret_trx.amount, Decimal("100.00"))
 
 
 class ProductPurchaseWithdrawPinTest(TestCase):

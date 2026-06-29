@@ -706,14 +706,11 @@ class Investment(models.Model):
             return None
         if not self.transaction:
             return None
-        wallet_type = self.transaction.wallet_type
-        if wallet_type == 'BALANCE':
-            wallet_field = 'balance'
-        elif wallet_type == 'BALANCE_DEPOSIT':
-            wallet_field = 'balance_deposit'
-        else:
+        wallet_type = 'BALANCE'
+        wallet_field = 'balance'
+        amount = abs(self.total_amount or Decimal('0'))
+        if amount <= 0:
             return None
-        amount = self.total_amount
         user = self.user
         with db_transaction.atomic():
             current_value = getattr(user, wallet_field)

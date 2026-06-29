@@ -71,6 +71,8 @@ class AttendanceDailyProgramTest(TestCase):
         self.assertEqual(streak.data["total_claim_count"], 2)
         self.assertTrue(streak.data["can_claim_today"])
         self.assertFalse(streak.data["program_completed"])
+        self.assertEqual(streak.data["missed_claim_dates"], ["2026-01-02"])
+        self.assertEqual(streak.data["missed_claim_count"], 1)
 
     def test_cannot_claim_again_after_seven_day_window_ends(self):
         first = self._claim_at(2026, 1, 1)
@@ -88,3 +90,15 @@ class AttendanceDailyProgramTest(TestCase):
         self.assertTrue(streak.data["program_completed"])
         self.assertFalse(streak.data["can_claim_today"])
         self.assertIsNone(streak.data["next_claim_date"])
+        self.assertEqual(
+            streak.data["missed_claim_dates"],
+            [
+                "2026-01-02",
+                "2026-01-03",
+                "2026-01-04",
+                "2026-01-05",
+                "2026-01-06",
+                "2026-01-07",
+            ],
+        )
+        self.assertEqual(streak.data["missed_claim_count"], 6)

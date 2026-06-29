@@ -358,7 +358,7 @@ class TransactionAdmin(admin.ModelAdmin):
     def amount_display(self, obj):
         # Check transaction type for color and prefix
         t = obj.type.upper()
-        if t in ['CREDIT', 'BONUS', 'PURCHASE_COMMISSION', 'PROFIT_COMMISSION', 'INTEREST', 'ATTENDANCE', 'VOUCHER','MISSIONS','DEPOSIT','CASHBACK', 'REJECT']:
+        if t in ['CREDIT', 'BONUS', 'PURCHASE_COMMISSION', 'PROFIT_COMMISSION', 'INTEREST', 'ATTENDANCE', 'VOUCHER','MISSIONS','DEPOSIT','CASHBACK', 'REJECT', 'RETURN']:
             if t in ['CREDIT', 'BONUS']:
                 color = '#007cba'  # Blue for credit
             elif t == 'PURCHASE_COMMISSION':
