@@ -61,20 +61,17 @@ class GeneralSetting(models.Model):
         help_text='Persentase cashback dari deposit sendiri. Contoh: 1 = 1%.',
     )
     # Kebijakan perhitungan rank
-    RANK_BASIS_CHOICES = [
-        ('missions', 'Berdasarkan misi selesai'),
-        ('downlines_total', 'Jumlah anggota downline'),
-        ('downlines_active', 'Jumlah downline aktif'),
-        ('deposit_self_total', 'Jumlah deposit sendiri'),
-        ('team_deposit_level_1_total', 'Jumlah deposit tim level 1'),
+    RANK_LOGIC_CHOICES = [
+        ('OR', 'Salah satu syarat aktif terpenuhi'),
+        ('AND', 'Semua syarat aktif harus terpenuhi'),
     ]
-    rank_basis = models.CharField(
-        max_length=30,
-        choices=RANK_BASIS_CHOICES,
-        default='missions',
-        help_text='Basis perhitungan rank: misi selesai, jumlah downline, atau downline aktif'
+    rank_logic = models.CharField(
+        max_length=10,
+        choices=RANK_LOGIC_CHOICES,
+        default='OR',
+        help_text='Tentukan apakah evaluasi rank memakai logika OR atau AND untuk basis yang aktif.'
     )
-    # Flag basis rank (gunakan OR: jika salah satu true dan memenuhi ambang, rank tercapai)
+    # Flag basis rank
     rank_use_missions = models.BooleanField(
         default=True,
         help_text='Jika ON, progres misi selesai (distinct) digunakan untuk rank'
@@ -98,6 +95,25 @@ class GeneralSetting(models.Model):
     rank_count_levels_upto = models.PositiveSmallIntegerField(
         default=1,
         help_text='Hitung downline hingga level ini (1=Level 1 saja, 2=Level 1+2, dst.)'
+    )
+
+    ACTIVE_MEMBER_LOGIC_CHOICES = [
+        ('OR', 'Aktif jika salah satu kondisi terpenuhi'),
+        ('AND', 'Aktif jika semua kondisi terpenuhi'),
+    ]
+    active_member_logic = models.CharField(
+        max_length=10,
+        choices=ACTIVE_MEMBER_LOGIC_CHOICES,
+        default='OR',
+        help_text='Logika penentuan member aktif berdasarkan kondisi yang diaktifkan di bawah.',
+    )
+    active_member_use_deposit_completed = models.BooleanField(
+        default=True,
+        help_text='Jika ON, member dianggap aktif jika punya deposit status COMPLETED.',
+    )
+    active_member_use_active_investment = models.BooleanField(
+        default=False,
+        help_text='Jika ON, member dianggap aktif jika punya investasi status ACTIVE dari product yang qualify_as_active_investment=ON.',
     )
     
     # OTP Settings

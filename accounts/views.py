@@ -23,7 +23,7 @@ from decimal import Decimal
 from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiExample, OpenApiResponse, OpenApiParameter, inline_serializer
 from .serializers import RankLevelSerializer, RankStatusResponseSerializer
 from .models import RankLevel
-from .utils import calculate_user_rank_progress, calculate_user_rank_progress_breakdown, send_whatsapp_otp, check_whatsapp_registered, validate_whatsapp_otp, normalize_phone, is_indonesia_phone, update_user_rank
+from .utils import calculate_user_rank_progress, calculate_user_rank_progress_breakdown, send_whatsapp_otp, check_whatsapp_registered, validate_whatsapp_otp, normalize_phone, is_indonesia_phone, update_user_rank, get_highest_eligible_rank_level, get_rank_evaluation_flags, get_active_member_definition
 import random
 import base64
 import json
@@ -815,39 +815,39 @@ class ChangePasswordWithOldPasswordAndOTPView(APIView):
         data['phone'] = phone
 
         setting = GeneralSetting.objects.order_by('-updated_at').first()
-        if not setting or not setting.otp_enabled:
-            return Response({'otp': ['OTP sedang dimatikan. Silakan hubungi admin.']}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        otp_required = bool(setting and setting.otp_enabled)
+        if otp_required:
+            otp_code = data.get('otp')
+            if not otp_code:
+                return Response({'otp': ['OTP code is required.']}, status=status.HTTP_400_BAD_REQUEST)
 
-        otp_code = data.get('otp')
-        if not otp_code:
-            return Response({'otp': ['OTP code is required.']}, status=status.HTTP_400_BAD_REQUEST)
+            try:
+                phone_otp = PhoneOTP.objects.get(phone=phone)
+            except PhoneOTP.DoesNotExist:
+                return Response({'otp': ['OTP not requested or expired.']}, status=status.HTTP_400_BAD_REQUEST)
 
-        try:
-            phone_otp = PhoneOTP.objects.get(phone=phone)
-        except PhoneOTP.DoesNotExist:
-            return Response({'otp': ['OTP not requested or expired.']}, status=status.HTTP_400_BAD_REQUEST)
+            is_valid = False
+            provider = (getattr(phone_otp, 'provider', None) or '').strip().upper()
+            if not provider:
+                provider = 'VERIFYNOW' if phone_otp.verification_id else 'VERIFYWAY'
 
-        is_valid = False
-        provider = (getattr(phone_otp, 'provider', None) or '').strip().upper()
-        if not provider:
-            provider = 'VERIFYNOW' if phone_otp.verification_id else 'VERIFYWAY'
+            if provider == 'FAZPASS':
+                from .utils import validate_fazpass_otp
+                is_valid, error_msg = validate_fazpass_otp(phone_otp.verification_id, otp_code)
+            elif provider == 'VERIFYNOW' and phone_otp.verification_id:
+                is_valid, error_msg = validate_whatsapp_otp(phone, phone_otp.verification_id, otp_code)
+            else:
+                is_valid = (phone_otp.otp_code == otp_code)
+                error_msg = "Invalid OTP code."
 
-        if provider == 'FAZPASS':
-            from .utils import validate_fazpass_otp
-            is_valid, error_msg = validate_fazpass_otp(phone_otp.verification_id, otp_code)
-        elif provider == 'VERIFYNOW' and phone_otp.verification_id:
-            is_valid, error_msg = validate_whatsapp_otp(phone, phone_otp.verification_id, otp_code)
-        else:
-            is_valid = (phone_otp.otp_code == otp_code)
-            error_msg = "Invalid OTP code."
-
-        if not is_valid:
-            return Response({'otp': [f'Invalid OTP code ({error_msg}).']}, status=status.HTTP_400_BAD_REQUEST)
+            if not is_valid:
+                return Response({'otp': [f'Invalid OTP code ({error_msg}).']}, status=status.HTTP_400_BAD_REQUEST)
 
         serializer = ChangePasswordWithOldPasswordAndOTPSerializer(data=data)
         if serializer.is_valid():
             serializer.save()
-            PhoneOTP.objects.filter(phone=phone).delete()
+            if otp_required:
+                PhoneOTP.objects.filter(phone=phone).delete()
             return Response({'detail': 'Password berhasil diubah.'}, status=status.HTTP_200_OK)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -899,39 +899,39 @@ class ChangeWithdrawPinWithOldPinAndOTPView(APIView):
         data['phone'] = phone
 
         setting = GeneralSetting.objects.order_by('-updated_at').first()
-        if not setting or not setting.otp_enabled:
-            return Response({'otp': ['OTP sedang dimatikan. Silakan hubungi admin.']}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        otp_required = bool(setting and setting.otp_enabled)
+        if otp_required:
+            otp_code = data.get('otp')
+            if not otp_code:
+                return Response({'otp': ['OTP code is required.']}, status=status.HTTP_400_BAD_REQUEST)
 
-        otp_code = data.get('otp')
-        if not otp_code:
-            return Response({'otp': ['OTP code is required.']}, status=status.HTTP_400_BAD_REQUEST)
+            try:
+                phone_otp = PhoneOTP.objects.get(phone=phone)
+            except PhoneOTP.DoesNotExist:
+                return Response({'otp': ['OTP not requested or expired.']}, status=status.HTTP_400_BAD_REQUEST)
 
-        try:
-            phone_otp = PhoneOTP.objects.get(phone=phone)
-        except PhoneOTP.DoesNotExist:
-            return Response({'otp': ['OTP not requested or expired.']}, status=status.HTTP_400_BAD_REQUEST)
+            is_valid = False
+            provider = (getattr(phone_otp, 'provider', None) or '').strip().upper()
+            if not provider:
+                provider = 'VERIFYNOW' if phone_otp.verification_id else 'VERIFYWAY'
 
-        is_valid = False
-        provider = (getattr(phone_otp, 'provider', None) or '').strip().upper()
-        if not provider:
-            provider = 'VERIFYNOW' if phone_otp.verification_id else 'VERIFYWAY'
+            if provider == 'FAZPASS':
+                from .utils import validate_fazpass_otp
+                is_valid, error_msg = validate_fazpass_otp(phone_otp.verification_id, otp_code)
+            elif provider == 'VERIFYNOW' and phone_otp.verification_id:
+                is_valid, error_msg = validate_whatsapp_otp(phone, phone_otp.verification_id, otp_code)
+            else:
+                is_valid = (phone_otp.otp_code == otp_code)
+                error_msg = "Invalid OTP code."
 
-        if provider == 'FAZPASS':
-            from .utils import validate_fazpass_otp
-            is_valid, error_msg = validate_fazpass_otp(phone_otp.verification_id, otp_code)
-        elif provider == 'VERIFYNOW' and phone_otp.verification_id:
-            is_valid, error_msg = validate_whatsapp_otp(phone, phone_otp.verification_id, otp_code)
-        else:
-            is_valid = (phone_otp.otp_code == otp_code)
-            error_msg = "Invalid OTP code."
-
-        if not is_valid:
-            return Response({'otp': [f'Invalid OTP code ({error_msg}).']}, status=status.HTTP_400_BAD_REQUEST)
+            if not is_valid:
+                return Response({'otp': [f'Invalid OTP code ({error_msg}).']}, status=status.HTTP_400_BAD_REQUEST)
 
         serializer = ChangeWithdrawPinWithOldPinAndOTPSerializer(data=data)
         if serializer.is_valid():
             serializer.save()
-            PhoneOTP.objects.filter(phone=phone).delete()
+            if otp_required:
+                PhoneOTP.objects.filter(phone=phone).delete()
             return Response({'detail': 'Withdraw PIN berhasil diubah.'}, status=status.HTTP_200_OK)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -986,6 +986,11 @@ class AccountInfoView(APIView):
     )
     def get(self, request):
         """Get current user's account information"""
+        try:
+            update_user_rank(request.user)
+            request.user.refresh_from_db(fields=['rank'])
+        except Exception:
+            pass
         serializer = self.serializer_class(request.user, context={'request': request})
         return Response(serializer.data, status=status.HTTP_200_OK)
 
@@ -1090,6 +1095,8 @@ class DownlineOverviewView(APIView):
         current_level = [user]
         rank_title_map = dict(RankLevel.objects.all().values_list('rank', 'title'))
         default_rank_title = 'Belum Rank'
+        settings_obj = GeneralSetting.objects.order_by('-updated_at').first()
+        active_def = get_active_member_definition(settings_obj)
 
         for level in range(1, max_level + 1):
             downlines_qs = User.objects.filter(referral_by__in=current_level)
@@ -1199,8 +1206,22 @@ class DownlineOverviewView(APIView):
                     m.total_deposits = d.get('total_deposits', 0) or 0
                     m.total_deposit_amount = d.get('total_deposit_amount', 0) or 0
                     m.completed_deposits = d.get('total_deposits', 0) or 0
-                    # Anggap aktif jika pernah deposit completed ATAU punya investasi ACTIVE.
-                    m.is_active = (m.completed_deposits > 0 or m.active_investments > 0)
+                    use_dep = bool(active_def.get('use_deposit_completed'))
+                    use_inv = bool(active_def.get('use_active_investment'))
+                    logic = (active_def.get('logic') or 'OR').strip().upper()
+                    dep_ok = (m.completed_deposits > 0) if use_dep else False
+                    inv_ok = (m.active_investments > 0) if use_inv else False
+                    if logic == 'AND':
+                        if use_dep and use_inv:
+                            m.is_active = dep_ok and inv_ok
+                        elif use_dep:
+                            m.is_active = dep_ok
+                        elif use_inv:
+                            m.is_active = inv_ok
+                        else:
+                            m.is_active = False
+                    else:
+                        m.is_active = dep_ok or inv_ok
                     rank_val = update_user_rank(m)
                     m.rank_title = rank_title_map.get(rank_val) if rank_val else default_rank_title
 
@@ -1401,6 +1422,8 @@ class AdminDownlineOverviewView(APIView):
         current_level = [target_user]
         rank_title_map = dict(RankLevel.objects.all().values_list('rank', 'title'))
         default_rank_title = 'Belum Rank'
+        settings_obj = GeneralSetting.objects.order_by('-updated_at').first()
+        active_def = get_active_member_definition(settings_obj)
 
         for level in range(1, max_level + 1):
             downlines_qs = User.objects.filter(referral_by__in=current_level)
@@ -1510,8 +1533,22 @@ class AdminDownlineOverviewView(APIView):
                     m.total_deposits = d.get('total_deposits', 0) or 0
                     m.total_deposit_amount = d.get('total_deposit_amount', 0) or 0
                     m.completed_deposits = d.get('total_deposits', 0) or 0
-                    # Anggap aktif jika pernah deposit completed.
-                    m.is_active = (m.completed_deposits > 0)
+                    use_dep = bool(active_def.get('use_deposit_completed'))
+                    use_inv = bool(active_def.get('use_active_investment'))
+                    logic = (active_def.get('logic') or 'OR').strip().upper()
+                    dep_ok = (m.completed_deposits > 0) if use_dep else False
+                    inv_ok = (m.active_investments > 0) if use_inv else False
+                    if logic == 'AND':
+                        if use_dep and use_inv:
+                            m.is_active = dep_ok and inv_ok
+                        elif use_dep:
+                            m.is_active = dep_ok
+                        elif use_inv:
+                            m.is_active = inv_ok
+                        else:
+                            m.is_active = False
+                    else:
+                        m.is_active = dep_ok or inv_ok
                     rank_val = update_user_rank(m)
                     m.rank_title = rank_title_map.get(rank_val) if rank_val else default_rank_title
 
@@ -2280,23 +2317,23 @@ class RankLevelListView(APIView):
     )
     def get(self, request):
         levels = RankLevel.objects.all()
+        try:
+            update_user_rank(request.user)
+            request.user.refresh_from_db(fields=['rank'])
+        except Exception:
+            pass
         b = calculate_user_rank_progress_breakdown(request.user)
-        settings_obj = GeneralSetting.objects.order_by('-updated_at').first()
-        use_missions = True if not settings_obj else bool(settings_obj.rank_use_missions)
-        use_downlines_total = False if not settings_obj else bool(settings_obj.rank_use_downlines_total)
-        use_downlines_active = False if not settings_obj else bool(settings_obj.rank_use_downlines_active)
-        use_deposit_self_total = False if not settings_obj else bool(settings_obj.rank_use_deposit_self_total)
-        use_team_deposit_level_1_total = False if not settings_obj else bool(settings_obj.rank_use_team_deposit_level_1_total)
+        flags = get_rank_evaluation_flags()
         candidates = []
-        if use_missions:
+        if flags['missions']:
             candidates.append(b['missions'])
-        if use_downlines_total:
+        if flags['downlines_total']:
             candidates.append(b['downlines_total'])
-        if use_downlines_active:
+        if flags['downlines_active']:
             candidates.append(b['downlines_active'])
-        if use_deposit_self_total:
+        if flags['deposit_self_total']:
             candidates.append(b['deposit_self_total'])
-        if use_team_deposit_level_1_total:
+        if flags['team_deposit_level_1_total']:
             candidates.append(b['team_deposit_level_1_total'])
         user_progress = {**b, 'max': max(candidates) if candidates else 0}
         ser = RankLevelSerializer(levels, many=True, context={'request': request, 'user_progress': user_progress})
@@ -2313,27 +2350,8 @@ class RankStatusView(APIView):
     )
     def get(self, request):
         user = request.user
-        settings_obj = GeneralSetting.objects.order_by('-updated_at').first()
-        use_missions = True if not settings_obj else bool(settings_obj.rank_use_missions)
-        use_downlines_total = False if not settings_obj else bool(settings_obj.rank_use_downlines_total)
-        use_downlines_active = False if not settings_obj else bool(settings_obj.rank_use_downlines_active)
-        use_deposit_self_total = False if not settings_obj else bool(settings_obj.rank_use_deposit_self_total)
-        use_team_deposit_level_1_total = False if not settings_obj else bool(settings_obj.rank_use_team_deposit_level_1_total)
-
         b = calculate_user_rank_progress_breakdown(user)
-
-        qs = RankLevel.objects.all()
-        if use_missions:
-            qs = qs.filter(missions_required_total__lte=b['missions'])
-        if use_downlines_total:
-            qs = qs.filter(downlines_total_required__lte=b['downlines_total'])
-        if use_downlines_active:
-            qs = qs.filter(downlines_active_required__lte=b['downlines_active'])
-        if use_deposit_self_total:
-            qs = qs.filter(deposit_self_total_required__lte=b['deposit_self_total'])
-        if use_team_deposit_level_1_total:
-            qs = qs.filter(team_deposit_level_1_total_required__lte=b['team_deposit_level_1_total'])
-        target_level = qs.order_by('-rank').first()
+        target_level = get_highest_eligible_rank_level(user, progress_breakdown=b)
 
         if target_level and (user.rank is None or target_level.rank > user.rank):
             user.rank = target_level.rank
@@ -2763,7 +2781,7 @@ class PublicGeneralSettingView(APIView):
     
     @extend_schema(
         tags=[USER_TAG],
-        description="Get public General Settings (frontend_url only)",
+        description="Get public General Settings (frontend_url + OTP flags)",
         responses={200: PublicGeneralSettingSerializer}
     )
     def get(self, request):

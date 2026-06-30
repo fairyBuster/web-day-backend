@@ -20,7 +20,12 @@ class PublicGeneralSettingSerializer(serializers.ModelSerializer):
     """Serializer untuk setting publik yang aman dibuka ke frontend"""
     class Meta:
         model = GeneralSetting
-        fields = ('frontend_url',)
+        fields = (
+            'frontend_url',
+            'otp_enabled',
+            'otp_provider',
+            'whatsapp_check_enabled',
+        )
 
 
 class UserSerializer(serializers.ModelSerializer):
@@ -189,7 +194,7 @@ class ChangePasswordWithOldPasswordAndOTPSerializer(serializers.Serializer):
     old_password = serializers.CharField(write_only=True, required=True)
     new_password = serializers.CharField(write_only=True, required=True, validators=[validate_password])
     new_password_confirm = serializers.CharField(write_only=True, required=True)
-    otp = serializers.CharField(write_only=True, required=True)
+    otp = serializers.CharField(write_only=True, required=False, allow_blank=True)
 
     def validate(self, attrs):
         phone = attrs.get('phone')
@@ -224,7 +229,7 @@ class ChangeWithdrawPinWithOldPinAndOTPSerializer(serializers.Serializer):
     old_withdraw_pin = serializers.CharField(write_only=True, required=True)
     new_withdraw_pin = serializers.CharField(write_only=True, required=True)
     new_withdraw_pin_confirm = serializers.CharField(write_only=True, required=True)
-    otp = serializers.CharField(write_only=True, required=True)
+    otp = serializers.CharField(write_only=True, required=False, allow_blank=True)
 
     def validate(self, attrs):
         phone = attrs.get('phone')

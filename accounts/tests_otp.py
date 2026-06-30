@@ -266,6 +266,59 @@ class OTPTest(TestCase):
         self.assertTrue(user.check_withdraw_pin('222222'))
         self.assertFalse(PhoneOTP.objects.filter(phone=normalize_phone('08129990011')).exists())
 
+
+class OTPBypassWhenDisabledTest(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.User = get_user_model()
+        self.setting = GeneralSetting.objects.create(
+            otp_enabled=False,
+            verifyway_api_key='test_key',
+            whatsapp_check_enabled=False,
+            checknumber_api_key=''
+        )
+
+    def test_change_password_bypass_otp_when_disabled(self):
+        user = self.User.objects.create(
+            username='bypasspass',
+            phone='08129990020',
+            email='bypasspass@example.com',
+            full_name='Bypass Pass',
+        )
+        user.set_password('oldpass')
+        user.save()
+
+        resp = self.client.post('/api/auth/change-password-otp/', {
+            'phone': '08129990020',
+            'old_password': 'oldpass',
+            'new_password': '123456',
+            'new_password_confirm': '123456',
+        })
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        user.refresh_from_db()
+        self.assertTrue(user.check_password('123456'))
+
+    def test_change_withdraw_pin_bypass_otp_when_disabled(self):
+        user = self.User.objects.create(
+            username='bypasspin',
+            phone='08129990021',
+            email='bypasspin@example.com',
+            full_name='Bypass Pin',
+        )
+        user.set_password('oldpass')
+        user.save()
+        user.set_withdraw_pin('111111')
+
+        resp = self.client.post('/api/auth/change-withdraw-pin-otp/', {
+            'phone': '08129990021',
+            'old_withdraw_pin': '111111',
+            'new_withdraw_pin': '222222',
+            'new_withdraw_pin_confirm': '222222',
+        })
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        user.refresh_from_db()
+        self.assertTrue(user.check_withdraw_pin('222222'))
+
     def test_email_login_token_success(self):
         u = self.User.objects.create(
             username='uemail',

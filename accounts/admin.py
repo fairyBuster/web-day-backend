@@ -454,7 +454,7 @@ class UserAdmin(BaseUserAdmin):
 class GeneralSettingAdmin(admin.ModelAdmin):
     list_display = (
         'referral_code_case', 'referral_code_length', 'exclude_similar_chars',
-        'referral_code_pattern', 'referral_daily_invite_limit', 'auto_login_on_register', 'registration_bonus_enabled', 'registration_bonus_amount', 'registration_bonus_wallet', 'deposit_cashback_enabled', 'deposit_cashback_percent', 'currency_code', 'rank_basis', 'rank_count_levels_upto', 'frontend_url', 'updated_at'
+        'referral_code_pattern', 'referral_daily_invite_limit', 'auto_login_on_register', 'registration_bonus_enabled', 'registration_bonus_amount', 'registration_bonus_wallet', 'deposit_cashback_enabled', 'deposit_cashback_percent', 'currency_code', 'rank_logic', 'rank_count_levels_upto', 'frontend_url', 'updated_at'
     )
     readonly_fields = ('created_at', 'updated_at')
     fieldsets = (
@@ -483,7 +483,7 @@ class GeneralSettingAdmin(admin.ModelAdmin):
         }),
         ('Kebijakan Rank', {
             'fields': (
-                'rank_basis',
+                'rank_logic',
                 'rank_use_missions',
                 'rank_use_downlines_total',
                 'rank_use_downlines_active',
@@ -492,9 +492,20 @@ class GeneralSettingAdmin(admin.ModelAdmin):
                 'rank_count_levels_upto'
             ),
             'description': (
-                'Pilih basis rank melalui flag boolean. Jika lebih dari satu basis dipilih, rank mensyaratkan SEMUA basis tersebut terpenuhi (AND). '
+                'Pilih basis rank melalui flag boolean. Atur cara evaluasinya lewat field Rank Logic: OR untuk salah satu syarat aktif, AND untuk semua syarat aktif. '
                 'Level downline menentukan seberapa dalam perhitungan jumlah/aktif downline. '
                 'Deposit tim level 1 hanya menghitung total deposit downline langsung saja.'
+            )
+        }),
+        ('Kebijakan Member Aktif', {
+            'fields': (
+                'active_member_logic',
+                'active_member_use_deposit_completed',
+                'active_member_use_active_investment',
+            ),
+            'description': (
+                'Tentukan definisi member aktif untuk kebutuhan rank/missions/dll. '
+                'Jika investasi dipakai, hanya investasi ACTIVE dari produk dengan qualify_as_active_investment=ON yang dihitung.'
             )
         }),
         ('Waktu', {
@@ -532,7 +543,7 @@ class RankLevelAdmin(admin.ModelAdmin):
             ),
             'description': (
                 'Isi syarat untuk tiap basis. Yang akan dipakai mengikuti General Settings -> Kebijakan Rank. '
-                'Jika lebih dari satu basis diaktifkan, user wajib memenuhi semuanya (AND).'
+                'Jika lebih dari satu basis diaktifkan, evaluasinya mengikuti General Settings -> Rank Logic (AND/OR).'
             )
         }),
         ('Waktu', {

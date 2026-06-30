@@ -217,6 +217,8 @@ def calculate_user_rank_progress_breakdown(user):
     total_downlines = 0
     active_downlines = 0
     try:
+        settings_obj = GeneralSetting.objects.order_by('-updated_at').first()
+        active_def = get_active_member_definition(settings_obj)
         current_level_users = [user]
         for _lvl in range(1, levels_upto + 1):
             next_level = []
@@ -224,12 +226,9 @@ def calculate_user_rank_progress_breakdown(user):
                 ds = list(u.referrals.all())
                 next_level.extend(ds)
                 total_downlines += len(ds)
-                for d in ds:
-                    if Deposit.objects.filter(
-                        user=d,
-                        status='COMPLETED',
-                    ).exists():
-                        active_downlines += 1
+                if ds:
+                    active_ids = resolve_active_member_ids([d.id for d in ds], definition=active_def)
+                    active_downlines += len(active_ids)
             current_level_users = next_level
             if not current_level_users:
                 break
@@ -288,6 +287,113 @@ def calculate_user_rank_progress(user):
     except Exception:
         return 0
 
+
+def get_rank_evaluation_flags(settings_obj=None):
+    if settings_obj is None:
+        settings_obj = GeneralSetting.objects.order_by('-updated_at').first()
+    return {
+        'missions': True if not settings_obj else bool(settings_obj.rank_use_missions),
+        'downlines_total': False if not settings_obj else bool(settings_obj.rank_use_downlines_total),
+        'downlines_active': False if not settings_obj else bool(settings_obj.rank_use_downlines_active),
+        'deposit_self_total': False if not settings_obj else bool(settings_obj.rank_use_deposit_self_total),
+        'team_deposit_level_1_total': False if not settings_obj else bool(settings_obj.rank_use_team_deposit_level_1_total),
+    }
+
+
+def get_rank_evaluation_logic(settings_obj=None):
+    if settings_obj is None:
+        settings_obj = GeneralSetting.objects.order_by('-updated_at').first()
+    logic = (getattr(settings_obj, 'rank_logic', 'OR') or 'OR').strip().upper()
+    return logic if logic in {'OR', 'AND'} else 'OR'
+
+
+def get_active_member_definition(settings_obj=None):
+    if settings_obj is None:
+        settings_obj = GeneralSetting.objects.order_by('-updated_at').first()
+    logic = (getattr(settings_obj, 'active_member_logic', 'OR') or 'OR').strip().upper()
+    if logic not in {'OR', 'AND'}:
+        logic = 'OR'
+    return {
+        'logic': logic,
+        'use_deposit_completed': True if not settings_obj else bool(getattr(settings_obj, 'active_member_use_deposit_completed', True)),
+        'use_active_investment': False if not settings_obj else bool(getattr(settings_obj, 'active_member_use_active_investment', False)),
+    }
+
+
+def resolve_active_member_ids(user_ids, definition=None):
+    if not user_ids:
+        return set()
+    definition = definition or get_active_member_definition()
+    use_dep = bool(definition.get('use_deposit_completed'))
+    use_inv = bool(definition.get('use_active_investment'))
+    logic = (definition.get('logic') or 'OR').strip().upper()
+
+    dep_ids = set()
+    inv_ids = set()
+    if use_dep:
+        dep_ids = set(
+            Deposit.objects.filter(user_id__in=user_ids, status='COMPLETED')
+            .values_list('user_id', flat=True)
+            .distinct()
+        )
+    if use_inv:
+        inv_ids = set(
+            Investment.objects.filter(
+                user_id__in=user_ids,
+                status='ACTIVE',
+                product__qualify_as_active_investment=True,
+            )
+            .values_list('user_id', flat=True)
+            .distinct()
+        )
+
+    if logic == 'AND':
+        if use_dep and use_inv:
+            return dep_ids & inv_ids
+        if use_dep:
+            return dep_ids
+        if use_inv:
+            return inv_ids
+        return set()
+
+    active = set()
+    if use_dep:
+        active |= dep_ids
+    if use_inv:
+        active |= inv_ids
+    return active
+
+
+def get_highest_eligible_rank_level(user, progress_breakdown=None, settings_obj=None):
+    if not user or not user.is_authenticated:
+        return None
+
+    settings_obj = settings_obj or GeneralSetting.objects.order_by('-updated_at').first()
+    flags = get_rank_evaluation_flags(settings_obj)
+    logic = get_rank_evaluation_logic(settings_obj)
+    progress = progress_breakdown or calculate_user_rank_progress_breakdown(user)
+
+    active_checks = []
+    if flags['missions']:
+        active_checks.append(lambda level: int(level.missions_required_total or 0) <= int(progress['missions'] or 0))
+    if flags['downlines_total']:
+        active_checks.append(lambda level: int(level.downlines_total_required or 0) <= int(progress['downlines_total'] or 0))
+    if flags['downlines_active']:
+        active_checks.append(lambda level: int(level.downlines_active_required or 0) <= int(progress['downlines_active'] or 0))
+    if flags['deposit_self_total']:
+        active_checks.append(lambda level: (level.deposit_self_total_required or 0) <= (progress['deposit_self_total'] or 0))
+    if flags['team_deposit_level_1_total']:
+        active_checks.append(lambda level: (level.team_deposit_level_1_total_required or 0) <= (progress['team_deposit_level_1_total'] or 0))
+
+    if not active_checks:
+        return None
+
+    for level in RankLevel.objects.all().order_by('-rank'):
+        is_eligible = any(check(level) for check in active_checks) if logic == 'OR' else all(check(level) for check in active_checks)
+        if is_eligible:
+            return level
+    return None
+
 def update_user_rank(user):
     """
     Evaluates and updates the user's rank based on current progress.
@@ -297,28 +403,8 @@ def update_user_rank(user):
         return None
         
     try:
-        settings_obj = GeneralSetting.objects.order_by('-updated_at').first()
-        use_missions = True if not settings_obj else bool(settings_obj.rank_use_missions)
-        use_downlines_total = False if not settings_obj else bool(settings_obj.rank_use_downlines_total)
-        use_downlines_active = False if not settings_obj else bool(settings_obj.rank_use_downlines_active)
-        use_deposit_self_total = False if not settings_obj else bool(settings_obj.rank_use_deposit_self_total)
-        use_team_deposit_level_1_total = False if not settings_obj else bool(settings_obj.rank_use_team_deposit_level_1_total)
-
         b = calculate_user_rank_progress_breakdown(user)
-
-        qs = RankLevel.objects.all()
-        if use_missions:
-            qs = qs.filter(missions_required_total__lte=b['missions'])
-        if use_downlines_total:
-            qs = qs.filter(downlines_total_required__lte=b['downlines_total'])
-        if use_downlines_active:
-            qs = qs.filter(downlines_active_required__lte=b['downlines_active'])
-        if use_deposit_self_total:
-            qs = qs.filter(deposit_self_total_required__lte=b['deposit_self_total'])
-        if use_team_deposit_level_1_total:
-            qs = qs.filter(team_deposit_level_1_total_required__lte=b['team_deposit_level_1_total'])
-
-        target = qs.order_by('-rank').first()
+        target = get_highest_eligible_rank_level(user, progress_breakdown=b)
         
         if target:
             current_rank = user.rank if user.rank is not None else 0
