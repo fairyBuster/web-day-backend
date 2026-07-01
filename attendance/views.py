@@ -87,6 +87,7 @@ def _get_daily_program_state(user, today):
             'last_claimed_day': 0,
             'has_claimed_today': has_claimed_today,
             'total_claim_count': total_claim_count,
+            'program_claim_count': 0,
         }
 
     program_start_date = first_log.date

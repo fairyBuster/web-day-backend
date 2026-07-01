@@ -17,6 +17,7 @@ import logging
 import json
 import re
 from django.http import HttpResponse
+from urllib.parse import urlparse, parse_qs
 
 from products.models import Transaction
 from products.serializers import TransactionSerializer
@@ -207,6 +208,181 @@ def _usd_gateway_sign(payload: dict, sign_key: str, *, hex_key: bool = False) ->
     return hmac.new(key_bytes, raw.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
+JAYAPAY_ID_PAYMENT_METHODS = [
+    "BCA",
+    "MANDIRI",
+    "PERMATA",
+    "CIMB",
+    "BNI",
+    "MAYBANK",
+    "DANAMON",
+    "BRI",
+    "BSI",
+    "BNC",
+    "OVO",
+    "DANA",
+    "DANA_QRIS",
+    "LINKAJA",
+    "SHOPEEPAY",
+    "QRIS",
+    "GOPAY_QRIS",
+    "ALFAMART",
+    "TRANSFER_BCA",
+]
+
+
+def _extract_jayapay_plat_order_num_from_payment_url(payment_url: str) -> str:
+    try:
+        parsed = urlparse(payment_url or "")
+        qs = parse_qs(parsed.query or "")
+        value = qs.get("orderNum") or qs.get("ordernum") or []
+        if value and value[0]:
+            return str(value[0]).strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def _jayapay_cash_detail_endpoint(payment_url: str) -> str:
+    parsed = urlparse(payment_url or "")
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    return f"{parsed.scheme}://{parsed.netloc}/gateway/order/detail/v2"
+
+
+def _fetch_jayapay_cash_order_detail(payment_url: str, plat_order_num: str, merchant_order_num: str = "", method: str = "") -> dict:
+    payment_url = _strip_backticks(payment_url)
+    endpoint = _jayapay_cash_detail_endpoint(payment_url)
+    if not endpoint or not plat_order_num:
+        return {}
+
+    method = (method or "").strip().upper()
+    parsed = urlparse(payment_url or "")
+    origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""
+    qs = parse_qs(parsed.query or "")
+    md = (qs.get("MD") or [""])[0]
+    sg = (qs.get("SG") or [""])[0]
+    sx = (qs.get("SX") or [""])[0]
+    sv = (qs.get("SV") or [""])[0]
+    sn = (qs.get("SN") or [""])[0]
+
+    fingerprint_seed = f"{plat_order_num}{md}{sg}{sx}{sv}{sn}"
+    fingerprint = hashlib.md5(fingerprint_seed.encode("utf-8")).hexdigest()
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "ordernum": plat_order_num,
+        "browser-fingerprint": fingerprint,
+        "origin": origin,
+        "referer": payment_url,
+        "user-agent": "Mozilla/5.0",
+        "accept-language": "en-GB,en-US;q=0.9,en;q=0.8,id;q=0.7",
+    }
+
+    json_bodies = [
+        {"orderNum": plat_order_num, "method": method} if method else {"orderNum": plat_order_num},
+        {"orderNum": plat_order_num, "MD": md, "SG": sg, "SX": sx, "SV": sv, "SN": sn, "method": method} if method else {"orderNum": plat_order_num, "MD": md, "SG": sg, "SX": sx, "SV": sv, "SN": sn},
+    ]
+    last_error = None
+    best_error = None
+    attempts = []
+    session = requests.Session()
+    try:
+        session.get(
+            payment_url,
+            headers={
+                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "user-agent": headers["user-agent"],
+            },
+            timeout=15,
+            allow_redirects=True,
+        )
+    except Exception as e:
+        last_error = {"step": "warmup_get", "error": str(e)}
+
+    def _choose_best_error(err: dict):
+        nonlocal best_error
+        if not best_error:
+            best_error = err
+            return
+        def _score(e: dict) -> int:
+            http_status = int(e.get("http_status") or 0) if str(e.get("http_status") or "").isdigit() else 0
+            payload = e.get("payload") if isinstance(e.get("payload"), dict) else {}
+            code = payload.get("code")
+            msg = str(payload.get("msg") or "")
+            step = str(e.get("step") or "")
+            kind = str(e.get("request_kind") or "")
+            score = 0
+            if step == "provider_response":
+                score += 100
+            if http_status == 200:
+                score += 50
+            if code is not None:
+                score += 20
+            if "ordernum" in msg.lower():
+                score += 10
+            if kind == "json":
+                score += 5
+            if kind == "query":
+                score += 3
+            if kind == "form":
+                score += 1
+            return score
+        if _score(err) >= _score(best_error):
+            best_error = err
+
+    def _handle_response(resp, *, request_kind: str, request_meta: dict):
+        nonlocal last_error
+        content_type = (resp.headers.get("content-type") or "").lower()
+        try:
+            data = resp.json() if resp.content else {}
+        except Exception as e:
+            text_head = (resp.text or "")[:240]
+            last_error = {
+                "step": "json_decode",
+                "request_kind": request_kind,
+                "request_meta": request_meta,
+                "http_status": resp.status_code,
+                "content_type": content_type,
+                "text_head": text_head,
+                "error": str(e),
+            }
+            _choose_best_error(last_error)
+            return None
+
+        if isinstance(data, dict) and (data.get("code") == 0 or str(data.get("msg") or "").lower() == "success"):
+            return data
+        if isinstance(data, dict) and isinstance(data.get("data"), dict) and data.get("data"):
+            return data
+
+        last_error = {
+            "step": "provider_response",
+            "request_kind": request_kind,
+            "request_meta": request_meta,
+            "http_status": resp.status_code,
+            "content_type": content_type,
+            "payload": data,
+        }
+        _choose_best_error(last_error)
+        return None
+
+    for body in json_bodies:
+        try:
+            resp = session.post(endpoint, json=body, headers=headers, timeout=15)
+        except Exception as e:
+            last_error = {"step": "post", "request_kind": "json", "request_meta": body, "error": str(e)}
+            _choose_best_error(last_error)
+            continue
+        attempts.append({"request_kind": "json", "request_meta": body, "http_status": resp.status_code})
+        out = _handle_response(resp, request_kind="json", request_meta=body)
+        if out is not None:
+            return out
+    error_out = best_error or last_error
+    if error_out:
+        return {"_fetch_error": error_out, "_attempts": attempts[:8]}
+    return {}
+
+
 class JayapayDepositInitiateView(APIView):
     permission_classes = [permissions.IsAuthenticated]
     throttle_scope = 'deposit_initiate'
@@ -229,6 +405,8 @@ class JayapayDepositInitiateView(APIView):
                 "properties": {
                     "order_num": {"type": "string", "example": "DEP-20250101XXXX-ABC123"},
                     "payment_url": {"type": "string", "example": "https://gateway.example/pay?id=..."},
+                    "plat_order_num": {"type": "string", "example": "PTXXXXXXXXXXXX"},
+                    "order_detail": {"type": "object"},
                 },
             },
             400: {"description": "Permintaan tidak valid"},
@@ -344,26 +522,268 @@ class JayapayDepositInitiateView(APIView):
             return Response({'detail': f'Gagal menghubungi gateway: {str(e)}'}, status=status.HTTP_502_BAD_GATEWAY)
 
         if data.get('platRespCode') == 'SUCCESS':
-            payment_url = data.get('url')
+            payment_url = _strip_backticks(data.get('url'))
             if payment_url:
+                plat_order_num = _extract_jayapay_plat_order_num_from_payment_url(payment_url)
+                order_detail = _fetch_jayapay_cash_order_detail(payment_url, plat_order_num, merchant_order_num=order_num)
                 dep.payment_url = payment_url
-                dep.response_payload = data
+                dep.response_payload = {"gateway": data, "plat_order_num": plat_order_num, "order_detail": order_detail}
                 dep.save(update_fields=['payment_url', 'response_payload'])
-                return Response({'order_num': order_num, 'payment_url': payment_url}, status=status.HTTP_200_OK)
+                va_number, qris_payload = "", ""
+                if isinstance(order_detail, dict):
+                    od = order_detail.get("data") if isinstance(order_detail.get("data"), dict) else {}
+                    va_raw = str(od.get("vaNumber") or "").strip()
+                    if va_raw.startswith("000201"):
+                        qris_payload = va_raw
+                    else:
+                        va_number = va_raw
+                return Response({'order_num': order_num, 'payment_url': payment_url, 'plat_order_num': plat_order_num, 'order_detail': order_detail, 'va_number': va_number or None, 'qris_payload': qris_payload or None}, status=status.HTTP_200_OK)
             else:
                 trx.status = 'FAILED'
                 trx.save(update_fields=['status'])
-                dep.response_payload = data
+                dep.response_payload = {"gateway": data}
                 dep.status = 'FAILED'
                 dep.save(update_fields=['response_payload', 'status'])
                 return Response({'detail': 'Gateway tidak mengembalikan URL pembayaran'}, status=status.HTTP_502_BAD_GATEWAY)
         else:
             trx.status = 'FAILED'
             trx.save(update_fields=['status'])
-            dep.response_payload = data
+            dep.response_payload = {"gateway": data}
             dep.status = 'FAILED'
             dep.save(update_fields=['response_payload', 'status'])
             return Response({'detail': data.get('platRespMessage') or 'Pembayaran gagal'}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class JayapayDepositInitiateDirectMethodView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_scope = 'deposit_initiate'
+
+    @extend_schema(
+        summary="Inisiasi deposit via Jayapay (langsung pilih metode pembayaran)",
+        request={
+            "application/json": {
+                "type": "object",
+                "properties": {
+                    "amount": {"type": "number", "example": 100000},
+                    "method": {"type": "string", "enum": JAYAPAY_ID_PAYMENT_METHODS, "example": "BCA"},
+                    "wallet_type": {"type": "string", "enum": ["BALANCE", "BALANCE_DEPOSIT"], "example": "BALANCE"},
+                },
+                "required": ["amount", "method"],
+            }
+        },
+        responses={
+            200: {
+                "type": "object",
+                "properties": {
+                    "order_num": {"type": "string", "example": "DEP-20250101XXXX-ABC123"},
+                    "payment_url": {"type": "string", "example": "https://gateway.example/pay?id=..."},
+                    "plat_order_num": {"type": "string", "example": "PTXXXXXXXXXXXX"},
+                    "order_detail": {"type": "object"},
+                },
+            },
+            400: {"description": "Permintaan tidak valid"},
+            502: {"description": "Gagal menghubungi gateway"},
+        },
+    )
+    def post(self, request):
+        gs = GatewaySettings.objects.order_by('-updated_at').first()
+        jayapay_enabled = bool(gs and gs.jayapay_enabled)
+        merchant_code = (gs.jayapay_merchant_code or '').strip() if gs else ''
+        private_key = (gs.jayapay_private_key or '').strip() if gs else ''
+        app_domain = (gs.app_domain or '').strip() if gs else ''
+        min_deposit_amount = (gs.min_deposit_amount or Decimal('0')) if gs else Decimal('0')
+        max_deposit_amount = (gs.max_deposit_amount or Decimal('0')) if gs else Decimal('0')
+
+        if not jayapay_enabled:
+            return Response({'detail': 'Jayapay tidak aktif'}, status=status.HTTP_400_BAD_REQUEST)
+        if not merchant_code or not private_key:
+            return Response({'detail': 'Konfigurasi Jayapay belum lengkap'}, status=status.HTTP_400_BAD_REQUEST)
+        if not app_domain:
+            return Response({'detail': 'Konfigurasi domain untuk callback belum diisi'}, status=status.HTTP_400_BAD_REQUEST)
+
+        wallet_type_raw = request.data.get('wallet_type')
+        wallet_type = (str(wallet_type_raw).strip().upper() if wallet_type_raw else (gs.default_wallet_type if gs and gs.default_wallet_type else 'BALANCE'))
+        if wallet_type not in ('BALANCE', 'BALANCE_DEPOSIT'):
+            return Response({'detail': 'wallet_type tidak valid'}, status=status.HTTP_400_BAD_REQUEST)
+
+        method_raw = request.data.get('method')
+        method = (str(method_raw).strip().upper() if method_raw is not None else '')
+        if not method:
+            return Response({'detail': 'method wajib diisi'}, status=status.HTTP_400_BAD_REQUEST)
+        if len(method) > 16:
+            return Response({'detail': 'method terlalu panjang'}, status=status.HTTP_400_BAD_REQUEST)
+        if method not in JAYAPAY_ID_PAYMENT_METHODS:
+            return Response({'detail': 'method tidak valid'}, status=status.HTTP_400_BAD_REQUEST)
+
+        amount_raw = request.data.get('amount')
+        try:
+            amount = Decimal(str(amount_raw))
+            if amount <= 0:
+                raise InvalidOperation()
+        except Exception:
+            return Response({'detail': 'amount tidak valid'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if min_deposit_amount and min_deposit_amount > 0 and amount < min_deposit_amount:
+            return Response({'detail': f'Minimal deposit adalah {min_deposit_amount}'}, status=status.HTTP_400_BAD_REQUEST)
+        if max_deposit_amount and max_deposit_amount > 0 and amount > max_deposit_amount:
+            return Response({'detail': f'Maksimal deposit adalah {max_deposit_amount}'}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = request.user
+        order_num = f"DEP-{_now_wib().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
+
+        trx = Transaction.objects.create(
+            user=user,
+            product=None,
+            type='DEPOSIT',
+            amount=amount,
+            currency_code='IDR',
+            description=f'Deposit via Jayapay ({wallet_type})',
+            status='PENDING',
+            wallet_type=wallet_type,
+            trx_id=order_num,
+        )
+
+        pay_money = str(int(round(float(amount))))
+        now = _now_wib()
+        notify_url = f"https://{app_domain}/api/deposits/jayapay/callback/"
+
+        params = {
+            'merchantCode': merchant_code,
+            'orderType': '0',
+            'method': method,
+            'orderNum': order_num,
+            'payMoney': pay_money,
+            'name': user.full_name or user.username,
+            'email': getattr(user, 'email', '') or '',
+            'phone': getattr(user, 'phone', '') or '',
+            'notifyUrl': notify_url,
+            'dateTime': format_datetime(now),
+            'expiryPeriod': '1000',
+            'productDetail': 'Top Up Saldo',
+        }
+
+        try:
+            sign = sign_params_legacy(params, private_key)
+        except Exception as e:
+            trx.status = 'FAILED'
+            trx.save(update_fields=['status'])
+            return Response({'detail': f'Gagal membuat signature: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        params['sign'] = sign
+
+        dep = Deposit.objects.create(
+            user=user,
+            gateway='JAYAPAY',
+            order_num=order_num,
+            amount=amount,
+            amount_currency_code='IDR',
+            wallet_type=wallet_type,
+            status='PENDING',
+            transaction=trx,
+            request_params=params,
+        )
+
+        try:
+            jayapay_url = (gs.jayapay_api_url or '').strip() if gs else ''
+            api_url = jayapay_url or 'https://openapi.jayapayment.com/gateway/prepaidOrder'
+            resp = requests.post(api_url, json=params, timeout=30)
+            data = resp.json()
+        except Exception as e:
+            trx.status = 'FAILED'
+            trx.save(update_fields=['status'])
+            dep.response_payload = {'error': str(e)}
+            dep.status = 'FAILED'
+            dep.save(update_fields=['response_payload', 'status'])
+            return Response({'detail': f'Gagal menghubungi gateway: {str(e)}'}, status=status.HTTP_502_BAD_GATEWAY)
+
+        if data.get('platRespCode') == 'SUCCESS':
+            payment_url = _strip_backticks(data.get('url'))
+            if payment_url:
+                plat_order_num = _extract_jayapay_plat_order_num_from_payment_url(payment_url)
+                order_detail = _fetch_jayapay_cash_order_detail(payment_url, plat_order_num, merchant_order_num=order_num, method=method)
+                dep.payment_url = payment_url
+                dep.response_payload = {"gateway": data, "plat_order_num": plat_order_num, "order_detail": order_detail, "method": method}
+                dep.save(update_fields=['payment_url', 'response_payload'])
+                va_number, qris_payload = "", ""
+                if isinstance(order_detail, dict):
+                    od = order_detail.get("data") if isinstance(order_detail.get("data"), dict) else {}
+                    va_raw = str(od.get("vaNumber") or "").strip()
+                    if va_raw.startswith("000201"):
+                        qris_payload = va_raw
+                    else:
+                        va_number = va_raw
+                return Response({'order_num': order_num, 'payment_url': payment_url, 'plat_order_num': plat_order_num, 'order_detail': order_detail, 'va_number': va_number or None, 'qris_payload': qris_payload or None}, status=status.HTTP_200_OK)
+            trx.status = 'FAILED'
+            trx.save(update_fields=['status'])
+            dep.response_payload = {"gateway": data}
+            dep.status = 'FAILED'
+            dep.save(update_fields=['response_payload', 'status'])
+            return Response({'detail': 'Gateway tidak mengembalikan URL pembayaran'}, status=status.HTTP_502_BAD_GATEWAY)
+
+        trx.status = 'FAILED'
+        trx.save(update_fields=['status'])
+        dep.response_payload = {"gateway": data}
+        dep.status = 'FAILED'
+        dep.save(update_fields=['response_payload', 'status'])
+        return Response({'detail': data.get('platRespMessage') or 'Pembayaran gagal'}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class JayapayDepositOrderDetailView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_scope = "deposit_initiate"
+
+    @extend_schema(
+        summary="Ambil detail pembayaran Jayapay berdasarkan order_num deposit",
+        parameters=[
+            OpenApiParameter(name="order_num", type=OpenApiTypes.STR, required=True, location=OpenApiParameter.QUERY),
+        ],
+        responses={
+            200: {
+                "type": "object",
+                "properties": {
+                    "order_num": {"type": "string"},
+                    "payment_url": {"type": "string"},
+                    "plat_order_num": {"type": "string"},
+                    "order_detail": {"type": "object"},
+                },
+            },
+            400: {"description": "Permintaan tidak valid"},
+            404: {"description": "Deposit tidak ditemukan"},
+        },
+    )
+    def get(self, request):
+        order_num = (request.query_params.get("order_num") or "").strip()
+        if not order_num:
+            return Response({"detail": "order_num wajib diisi"}, status=status.HTTP_400_BAD_REQUEST)
+
+        dep = Deposit.objects.filter(user=request.user, order_num=order_num, gateway="JAYAPAY").first()
+        if not dep:
+            return Response({"detail": "Deposit tidak ditemukan"}, status=status.HTTP_404_NOT_FOUND)
+
+        payment_url = (dep.payment_url or "").strip()
+        plat_order_num = _extract_jayapay_plat_order_num_from_payment_url(payment_url)
+        method = ""
+        if isinstance(dep.response_payload, dict):
+            method = str(dep.response_payload.get("method") or "").strip().upper()
+        order_detail = _fetch_jayapay_cash_order_detail(payment_url, plat_order_num, merchant_order_num=dep.order_num, method=method)
+
+        dep.response_payload = (dep.response_payload or {}) if isinstance(dep.response_payload, dict) else {}
+        dep.response_payload["plat_order_num"] = plat_order_num
+        dep.response_payload["order_detail"] = order_detail
+        dep.save(update_fields=["response_payload"])
+
+        va_number, qris_payload = "", ""
+        if isinstance(order_detail, dict):
+            od = order_detail.get("data") if isinstance(order_detail.get("data"), dict) else {}
+            va_raw = str(od.get("vaNumber") or "").strip()
+            if va_raw.startswith("000201"):
+                qris_payload = va_raw
+            else:
+                va_number = va_raw
+
+        return Response(
+            {"order_num": dep.order_num, "payment_url": payment_url, "plat_order_num": plat_order_num, "order_detail": order_detail, "va_number": va_number or None, "qris_payload": qris_payload or None},
+            status=status.HTTP_200_OK,
+        )
 
 
 class JayapayDepositCallbackView(APIView):
