@@ -1,6 +1,7 @@
 from datetime import timedelta
 from decimal import Decimal
 
+from django.core.management import call_command
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 from django.utils import timezone
@@ -157,6 +158,139 @@ class InvestmentPrincipalReturnTest(TestCase):
         self.assertIsNotNone(ret_trx)
         self.assertEqual(ret_trx.wallet_type, "BALANCE")
         self.assertEqual(ret_trx.amount, Decimal("100.00"))
+
+    def test_claim_principal_cannot_be_claimed_twice(self):
+        investment = self._create_investment(claims_count=3, status="COMPLETED")
+
+        first = self.client.post(
+            "/api/investments/claim-principal/",
+            {"investment_id": investment.id},
+            format="json",
+        )
+        second = self.client.post(
+            "/api/investments/claim-principal/",
+            {"investment_id": investment.id},
+            format="json",
+        )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 400)
+        self.assertEqual(second.data["error"], "Modal sudah pernah dikembalikan")
+        self.assertEqual(
+            Transaction.objects.filter(
+                user=self.user,
+                type="RETURN",
+                related_transaction=self.purchase_transaction,
+            ).count(),
+            1,
+        )
+
+    def test_claim_principal_rejects_duplicate_return_when_flag_not_synced(self):
+        investment = self._create_investment(claims_count=3, status="COMPLETED")
+        Transaction.objects.create(
+            user=self.user,
+            product=self.product,
+            trx_id="INVRET-EXISTING-001",
+            type="RETURN",
+            amount=Decimal("100.00"),
+            description="Existing principal return",
+            status="COMPLETED",
+            wallet_type="BALANCE",
+            related_transaction=self.purchase_transaction,
+        )
+
+        response = self.client.post(
+            "/api/investments/claim-principal/",
+            {"investment_id": investment.id},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["error"], "Modal sudah pernah dikembalikan")
+        investment.refresh_from_db()
+        self.assertTrue(investment.principal_returned)
+        self.assertEqual(
+            Transaction.objects.filter(
+                user=self.user,
+                type="RETURN",
+                related_transaction=self.purchase_transaction,
+            ).count(),
+            1,
+        )
+
+
+class HoldInvestmentMaturityProcessingTest(TestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.user = User.objects.create_user(
+            username="hold-product-user",
+            phone="81110000005",
+            email="hold-product@example.com",
+            password="pass123",
+        )
+        self.user.balance = Decimal("0.00")
+        self.user.balance_hold = Decimal("0.00")
+        self.user.save(update_fields=["balance", "balance_hold"])
+
+        self.product = Product.objects.create(
+            name="Produk Hold Manual Release",
+            description="Test hold maturity flow",
+            price=Decimal("100.00"),
+            status=1,
+            purchase_limit=1,
+            stock=100,
+            stock_enabled=False,
+            max_purchase_count=3,
+            profit_type="fixed",
+            profit_rate=Decimal("10.00"),
+            profit_method="hold",
+            duration=1,
+            balance_source="balance",
+            claim_reset_mode="after_purchase",
+            return_principal_on_completion=True,
+        )
+
+        self.purchase_transaction = Transaction.objects.create(
+            user=self.user,
+            product=self.product,
+            trx_id="PUR-HOLD-001",
+            type="INVESTMENTS",
+            amount=Decimal("100.00"),
+            description="Purchase hold product",
+            status="COMPLETED",
+            wallet_type="BALANCE",
+        )
+
+    def test_hold_completion_does_not_auto_transfer_hold_balance_or_return_principal(self):
+        investment = Investment.objects.create(
+            user=self.user,
+            product=self.product,
+            transaction=self.purchase_transaction,
+            quantity=1,
+            total_amount=Decimal("100.00"),
+            profit_type="fixed",
+            profit_rate=Decimal("10.00"),
+            profit_method="hold",
+            claim_reset_mode="after_purchase",
+            duration_days=1,
+            remaining_days=1,
+            expires_at=timezone.now() + timedelta(days=1),
+            status="ACTIVE",
+            next_claim_time=timezone.now() - timedelta(minutes=1),
+        )
+
+        call_command("process_automatic_profits", quiet=True)
+
+        investment.refresh_from_db()
+        self.user.refresh_from_db()
+
+        self.assertEqual(investment.status, "COMPLETED")
+        self.assertEqual(investment.claims_count, 1)
+        self.assertFalse(investment.principal_returned)
+        self.assertEqual(self.user.balance, Decimal("0.00"))
+        self.assertEqual(self.user.balance_hold, Decimal("10.00"))
+        self.assertFalse(Transaction.objects.filter(user=self.user, type="TRANSFER").exists())
+        self.assertFalse(Transaction.objects.filter(user=self.user, type="RETURN").exists())
 
 
 class ProductPurchaseWithdrawPinTest(TestCase):

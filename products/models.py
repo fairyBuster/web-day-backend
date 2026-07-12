@@ -679,10 +679,19 @@ class Investment(models.Model):
     def has_completed_all_profit_cycles(self):
         return int(self.claims_count or 0) >= int(self.duration_days or 0)
 
+    def get_existing_principal_return_transaction(self):
+        if not self.transaction_id:
+            return None
+        return Transaction.objects.filter(
+            user=self.user,
+            type='RETURN',
+            related_transaction=self.transaction,
+        ).order_by('-created_at').first()
+
     def get_principal_return_block_reason(self):
         if not getattr(self.product, 'return_principal_on_completion', False):
             return 'Produk ini tidak mengaktifkan pengembalian modal'
-        if self.principal_returned:
+        if self.principal_returned or self.get_existing_principal_return_transaction():
             return 'Modal sudah pernah dikembalikan'
         if not self.has_completed_all_profit_cycles():
             return 'Semua siklus profit belum selesai diklaim'
@@ -696,40 +705,56 @@ class Investment(models.Model):
         return self.get_principal_return_block_reason() is None
 
     def return_principal_if_eligible(self):
-        if not getattr(self.product, 'return_principal_on_completion', False):
-            return None
-        if self.principal_returned:
-            return None
-        if not self.has_completed_all_profit_cycles():
-            return None
-        if self.status not in ('COMPLETED', 'EXPIRED'):
-            return None
-        if not self.transaction:
-            return None
-        wallet_type = 'BALANCE'
-        wallet_field = 'balance'
-        amount = abs(self.total_amount or Decimal('0'))
-        if amount <= 0:
-            return None
-        user = self.user
         with db_transaction.atomic():
+            locked_investment = Investment.objects.select_for_update().select_related(
+                'product', 'transaction', 'user'
+            ).get(pk=self.pk)
+
+            if not getattr(locked_investment.product, 'return_principal_on_completion', False):
+                return None
+            if locked_investment.principal_returned:
+                return None
+            if not locked_investment.has_completed_all_profit_cycles():
+                return None
+            if locked_investment.status not in ('COMPLETED', 'EXPIRED'):
+                return None
+            if not locked_investment.transaction:
+                return None
+
+            existing_return = locked_investment.get_existing_principal_return_transaction()
+            if existing_return:
+                if not locked_investment.principal_returned:
+                    locked_investment.principal_returned = True
+                    locked_investment.save(update_fields=['principal_returned'])
+                self.principal_returned = True
+                return None
+
+            wallet_type = 'BALANCE'
+            wallet_field = 'balance'
+            amount = abs(locked_investment.total_amount or Decimal('0'))
+            if amount <= 0:
+                return None
+
+            user_model = locked_investment.user.__class__
+            user = user_model.objects.select_for_update().get(pk=locked_investment.user_id)
             current_value = getattr(user, wallet_field)
             setattr(user, wallet_field, current_value + amount)
             user.save(update_fields=[wallet_field])
             trx = Transaction.objects.create(
                 user=user,
-                product=self.product,
+                product=locked_investment.product,
                 upline_user=None,
                 trx_id=f'INVRET-{timezone.now().strftime("%Y%m%d%H%M%S")}-{uuid.uuid4().hex[:6].upper()}',
                 type='RETURN',
                 amount=amount,
-                description=f'Principal return for {self.product.name} investment',
+                description=f'Principal return for {locked_investment.product.name} investment',
                 status='COMPLETED',
                 wallet_type=wallet_type,
-                related_transaction=self.transaction,
+                related_transaction=locked_investment.transaction,
             )
+            locked_investment.principal_returned = True
+            locked_investment.save(update_fields=['principal_returned'])
             self.principal_returned = True
-            self.save(update_fields=['principal_returned'])
             return {
                 'amount': amount,
                 'wallet_type': wallet_type,

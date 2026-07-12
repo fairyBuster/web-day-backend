@@ -1251,23 +1251,29 @@ class InvestmentViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         
         investment_id = serializer.validated_data['investment_id']
-        investment = Investment.objects.select_related('product', 'transaction', 'user').get(id=investment_id, user=request.user)
-        
-        investment.update_remaining_days()
-        investment.refresh_from_db()
+        with transaction.atomic():
+            investment = Investment.objects.select_for_update().select_related(
+                'product', 'transaction', 'user'
+            ).get(id=investment_id, user=request.user)
 
-        block_reason = investment.get_principal_return_block_reason()
-        if block_reason:
-            return Response({
-                'error': block_reason
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
-        result = investment.return_principal_if_eligible()
-        if not result:
-            return Response({
-                'error': investment.get_principal_return_block_reason() or 'Tidak dapat mengembalikan modal'
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
+            investment.update_remaining_days()
+            investment.refresh_from_db()
+
+            block_reason = investment.get_principal_return_block_reason()
+            if block_reason:
+                return Response({
+                    'error': block_reason
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            result = investment.return_principal_if_eligible()
+            if not result:
+                investment.refresh_from_db()
+                return Response({
+                    'error': investment.get_principal_return_block_reason() or 'Tidak dapat mengembalikan modal'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            investment.refresh_from_db()
+
         return Response({
             'message': 'Modal berhasil dikembalikan',
             'returned_amount': str(result['amount']),

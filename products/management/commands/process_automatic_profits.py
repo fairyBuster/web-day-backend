@@ -150,56 +150,6 @@ class Command(BaseCommand):
                     
                     investment.save()
                     
-                    # If HOLD method and investment completed, release held profits and principal
-                    if investment.product.profit_method == 'hold' and investment.status == 'COMPLETED':
-                        release_amount = investment.total_claimed_profit
-                        if release_amount and release_amount > 0:
-                            # Move from balance_hold to balance
-                            user.refresh_from_db(fields=['balance', 'balance_hold'])
-                            if user.balance_hold >= release_amount:
-                                user.balance_hold -= release_amount
-                            else:
-                                release_amount = max(0, user.balance_hold)
-                                user.balance_hold = 0
-                            user.balance += release_amount
-                            user.save(update_fields=['balance', 'balance_hold'])
-                            # Record release transaction
-                            Transaction.objects.create(
-                                user=user,
-                                product=investment.product,
-                                type='TRANSFER',
-                                amount=release_amount,
-                                description=f'Transfer profit from balance hold to balance at maturity for {investment.product.name}',
-                                status='COMPLETED',
-                                wallet_type='BALANCE',
-                                related_transaction=profit_transaction,
-                                trx_id=f'REL-{_now_in_zone(ZoneInfo("Asia/Jakarta")).strftime("%Y%m%d%H%M%S")}-{uuid.uuid4().hex[:6].upper()}'
-                            )
-                        # Return principal to user's wallet regardless of product flag
-                        try:
-                            wallet_type = 'BALANCE'
-                            principal_amount = abs(investment.total_amount or Decimal('0'))
-                            if principal_amount <= 0:
-                                raise ValueError("Principal amount invalid")
-                            user.balance += principal_amount
-                            user.save(update_fields=['balance'])
-                            Transaction.objects.create(
-                                user=user,
-                                product=investment.product,
-                                upline_user=None,
-                                trx_id=f'INVRET-{timezone.now().strftime("%Y%m%d%H%M%S")}-{uuid.uuid4().hex[:6].upper()}',
-                                type='RETURN',
-                                amount=principal_amount,
-                                description=f'Principal return at maturity for {investment.product.name}',
-                                status='COMPLETED',
-                                wallet_type=wallet_type,
-                                related_transaction=investment.transaction,
-                            )
-                            investment.principal_returned = True
-                            investment.save(update_fields=['principal_returned'])
-                        except Exception as e:
-                            logger.error(f'Failed to return principal at maturity: {e}')
-                    
                     # Create ClaimHistory record
                     from products.models import ClaimHistory
                     ClaimHistory.objects.create(
