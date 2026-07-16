@@ -1,6 +1,6 @@
 from rest_framework import serializers
 from .models import Mission
-from .utils import compute_mission_progress
+from .utils import compute_mission_progress, _get_period_bounds
 
 
 class MissionSerializer(serializers.ModelSerializer):
@@ -13,13 +13,15 @@ class MissionSerializer(serializers.ModelSerializer):
     claimed_count = serializers.SerializerMethodField()
     last_claimed_at = serializers.SerializerMethodField()
     status = serializers.SerializerMethodField()
+    reset_at = serializers.SerializerMethodField()
 
     class Meta:
         model = Mission
         fields = (
             'id', 'title', 'description', 'type', 'requirement', 'reward', 'reward_balance_type',
             'is_active', 'is_repeatable', 'level', 'referral_levels', 'created_at', 'updated_at',
-            'progress', 'progress_amount', 'claimable_times', 'remaining', 'can_claim', 'claimed', 'claimed_count', 'last_claimed_at', 'status'
+            'progress', 'progress_amount', 'claimable_times', 'remaining', 'can_claim', 'claimed', 'claimed_count', 'last_claimed_at', 'status', 'reset_at',
+            'is_time_limited', 'time_period_days'
         )
 
     def get_progress(self, obj):
@@ -98,6 +100,18 @@ class MissionSerializer(serializers.ModelSerializer):
         if obj.is_repeatable and times <= claimed:
             return 'exhausted'
         return 'in_progress'
+
+    def get_reset_at(self, obj):
+        if not obj.is_time_limited or not obj.time_period_days:
+            return None
+        user = self.context.get('request').user
+        sm = self.context.get('state_map') or {}
+        state = sm.get(obj.id)
+        if not state:
+            from .models import MissionUserState
+            state, _ = MissionUserState.objects.get_or_create(user=user, mission=obj)
+        _, period_end = _get_period_bounds(obj, state, user)
+        return period_end.isoformat()
 
 
 class ClaimMissionSerializer(serializers.Serializer):

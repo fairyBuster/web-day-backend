@@ -561,6 +561,7 @@ class RankLevelSerializer(serializers.ModelSerializer):
         fields = (
             'rank',
             'title',
+            'description',
             'missions_required_total',
             'downlines_total_required',
             'downlines_active_required',
@@ -670,7 +671,8 @@ class DownlineMemberSerializer(serializers.Serializer):
     username = serializers.CharField()
     phone = serializers.CharField()
     referral_code = serializers.CharField()
-    rank = serializers.CharField(source='rank_title', allow_null=True)
+    rank = serializers.IntegerField(allow_null=True)
+    rank_title = serializers.CharField(allow_null=True)
     registration_date = serializers.DateTimeField(source='created_at', read_only=True)
     
     # Commission data

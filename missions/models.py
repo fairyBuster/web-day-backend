@@ -78,6 +78,19 @@ class Mission(models.Model):
         verbose_name='Level downline yang dihitung',
         help_text='Daftar level downline (mis. [1], [1,2], [1,2,3]) yang disertakan dalam perhitungan'
     )
+    
+    # Time limit settings
+    is_time_limited = models.BooleanField(
+        default=False,
+        verbose_name='Dibatasi Waktu',
+        help_text='Jika aktif, progres misi hanya dihitung untuk periode waktu tertentu'
+    )
+    time_period_days = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        verbose_name='Periode (Hari)',
+        help_text='Jumlah hari untuk periode waktu (mis. 7 untuk mingguan, 30 untuk bulanan)'
+    )
 
     created_at = models.DateTimeField(default=timezone.now, verbose_name='Dibuat')
     updated_at = models.DateTimeField(auto_now=True, verbose_name='Diubah')
@@ -95,6 +108,7 @@ class MissionUserState(models.Model):
     mission = models.ForeignKey(Mission, on_delete=models.CASCADE)
     claimed_count = models.PositiveIntegerField(default=0)
     last_claimed_at = models.DateTimeField(null=True, blank=True)
+    period_start = models.DateTimeField(null=True, blank=True, help_text='Waktu mulai periode untuk misi yang dibatasi waktu')
 
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)

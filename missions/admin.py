@@ -7,10 +7,10 @@ from .forms import MissionAdminForm
 class MissionAdmin(admin.ModelAdmin):
     list_display = (
         'id', 'title', 'description', 'type_display', 'requirement', 'reward', 'reward_balance_display',
-        'is_active', 'is_repeatable', 'level', 'created_at'
+        'is_active', 'is_repeatable', 'is_time_limited', 'time_period_days', 'level', 'created_at'
     )
     search_fields = ('title', 'description', 'type')
-    list_filter = ('type', 'is_active', 'is_repeatable', 'reward_balance_type')
+    list_filter = ('type', 'is_active', 'is_repeatable', 'is_time_limited', 'reward_balance_type')
     readonly_fields = ('created_at', 'updated_at')
     form = MissionAdminForm
     fieldsets = (
@@ -31,6 +31,13 @@ class MissionAdmin(admin.ModelAdmin):
                 'Reward adalah nominal hadiah per klaim. '
                 'Dompet hadiah dapat dipilih: balance atau balance_deposit. '
                 'Jika misi repeatable, Anda dapat klaim berkali-kali setiap kelipatan requirement tercapai.'
+            )
+        }),
+        ('Batasan Waktu', {
+            'fields': ('is_time_limited', 'time_period_days'),
+            'description': (
+                'Jika dibatasi waktu, progres misi hanya dihitung untuk periode waktu tertentu (mis. 7 hari terakhir). '
+                'Setelah periode berakhir, progres akan direset secara otomatis.'
             )
         }),
         ('Level Referral yang Dihitung', {

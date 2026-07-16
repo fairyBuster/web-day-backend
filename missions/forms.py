@@ -14,7 +14,7 @@ class MissionAdminForm(forms.ModelForm):
         model = Mission
         fields = [
             'title', 'description', 'type', 'is_active', 'is_repeatable', 'level',
-            'requirement', 'reward', 'reward_balance_type'
+            'requirement', 'reward', 'reward_balance_type', 'is_time_limited', 'time_period_days'
         ]
         labels = {
             'title': 'Judul Misi',
@@ -26,6 +26,8 @@ class MissionAdminForm(forms.ModelForm):
             'requirement': 'Ambang Progres',
             'reward': 'Nominal Hadiah',
             'reward_balance_type': 'Dompet Hadiah',
+            'is_time_limited': 'Dibatasi Waktu',
+            'time_period_days': 'Periode (Hari)',
         }
         help_texts = {
             'title': 'Judul singkat misi untuk tampil di admin dan aplikasi.',
@@ -37,6 +39,8 @@ class MissionAdminForm(forms.ModelForm):
             'requirement': 'Ambang batas progres (contoh: 20 berarti perlu 20 orang/progress sesuai tipe misi).',
             'reward': 'Nominal hadiah per klaim. Untuk misi repeatable dikali jumlah klaim (times).',
             'reward_balance_type': 'Dompet tujuan hadiah: balance atau balance_deposit.',
+            'is_time_limited': 'Jika diaktifkan, progres misi hanya dihitung untuk periode waktu tertentu.',
+            'time_period_days': 'Jumlah hari untuk periode waktu (mis. 7 untuk mingguan, 30 untuk bulanan).',
         }
 
     def __init__(self, *args, **kwargs):

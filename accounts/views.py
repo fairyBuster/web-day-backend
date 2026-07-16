@@ -1089,7 +1089,7 @@ class DownlineOverviewView(APIView):
         }
         return paginated_level
     
-    def _get_downlines_by_level(self, user, max_level=5):
+    def _get_downlines_by_level(self, user, max_level=5, search_query=None):
         """Get downline members organized by level (1-5) with bulk aggregations"""
         levels_data = {}
         current_level = [user]
@@ -1100,6 +1100,16 @@ class DownlineOverviewView(APIView):
 
         for level in range(1, max_level + 1):
             downlines_qs = User.objects.filter(referral_by__in=current_level)
+            
+            if search_query:
+                search_query = search_query.strip()
+                downlines_qs = downlines_qs.filter(
+                    Q(username__icontains=search_query) | 
+                    Q(phone__icontains=search_query) | 
+                    Q(full_name__icontains=search_query) | 
+                    Q(referral_code__icontains=search_query)
+                )
+                
             level_members = list(downlines_qs)
             next_level = level_members
 
@@ -1258,6 +1268,18 @@ class DownlineOverviewView(APIView):
                 description='Halaman anggota per level. Setiap level menampilkan maksimal 20 anggota.',
                 required=False,
             ),
+            OpenApiParameter(
+                name='search',
+                type=str,
+                description='Cari anggota referral berdasarkan username, phone, full_name, atau referral_code.',
+                required=False,
+            ),
+            OpenApiParameter(
+                name='level',
+                type=int,
+                description='Filter hanya untuk level tertentu (1-5).',
+                required=False,
+            ),
         ],
         responses={
             200: OpenApiResponse(
@@ -1359,29 +1381,61 @@ class DownlineOverviewView(APIView):
     def get(self, request):
         """Get downline members overview with commission statistics"""
         user = request.user
-        levels_data = self._get_downlines_by_level(user)
+        search_query = request.query_params.get('search', None)
+        levels_data = self._get_downlines_by_level(user, search_query=search_query)
         try:
             page_number = int(request.query_params.get('page', '1'))
         except (TypeError, ValueError):
             page_number = 1
         if page_number < 1:
             page_number = 1
+            
+        try:
+            filter_level = int(request.query_params.get('level', None))
+            if filter_level not in (1,2,3,4,5):
+                filter_level = None
+        except (TypeError, ValueError):
+            filter_level = None
         
         # Calculate overall totals
-        total_members = sum(level['member_count'] for level in levels_data.values())
-        total_profit_commission = sum(level['total_profit_commission'] for level in levels_data.values())
-        total_purchase_commission = sum(level['total_purchase_commission'] for level in levels_data.values())
-        total_earned_commission = sum(level['total_earned_commission'] for level in levels_data.values())
-        
-        # Calculate overall investment totals
-        total_investments = sum(level['total_investments'] for level in levels_data.values())
-        total_investment_amount = sum(level['total_investment_amount'] for level in levels_data.values())
-        active_investments = sum(level['active_investments'] for level in levels_data.values())
-        
-        # Calculate overall deposit totals
-        total_deposits = sum(level['total_deposits'] for level in levels_data.values())
-        total_deposit_amount = sum(level['total_deposit_amount'] for level in levels_data.values())
-        completed_deposits = sum(level['completed_deposits'] for level in levels_data.values())
+        if filter_level:
+            if filter_level in levels_data:
+                total_members = levels_data[filter_level]['member_count']
+                total_profit_commission = levels_data[filter_level]['total_profit_commission']
+                total_purchase_commission = levels_data[filter_level]['total_purchase_commission']
+                total_earned_commission = levels_data[filter_level]['total_earned_commission']
+                total_investments = levels_data[filter_level]['total_investments']
+                total_investment_amount = levels_data[filter_level]['total_investment_amount']
+                active_investments = levels_data[filter_level]['active_investments']
+                total_deposits = levels_data[filter_level]['total_deposits']
+                total_deposit_amount = levels_data[filter_level]['total_deposit_amount']
+                completed_deposits = levels_data[filter_level]['completed_deposits']
+            else:
+                total_members = 0
+                total_profit_commission = 0
+                total_purchase_commission = 0
+                total_earned_commission = 0
+                total_investments = 0
+                total_investment_amount = 0
+                active_investments = 0
+                total_deposits = 0
+                total_deposit_amount = 0
+                completed_deposits = 0
+        else:
+            total_members = sum(level['member_count'] for level in levels_data.values())
+            total_profit_commission = sum(level['total_profit_commission'] for level in levels_data.values())
+            total_purchase_commission = sum(level['total_purchase_commission'] for level in levels_data.values())
+            total_earned_commission = sum(level['total_earned_commission'] for level in levels_data.values())
+            
+            # Calculate overall investment totals
+            total_investments = sum(level['total_investments'] for level in levels_data.values())
+            total_investment_amount = sum(level['total_investment_amount'] for level in levels_data.values())
+            active_investments = sum(level['active_investments'] for level in levels_data.values())
+            
+            # Calculate overall deposit totals
+            total_deposits = sum(level['total_deposits'] for level in levels_data.values())
+            total_deposit_amount = sum(level['total_deposit_amount'] for level in levels_data.values())
+            completed_deposits = sum(level['completed_deposits'] for level in levels_data.values())
         
         # Prepare response data
         response_data = {
@@ -1399,7 +1453,8 @@ class DownlineOverviewView(APIView):
         }
         
         # Add levels data in order
-        for level in range(1, 6):
+        levels_to_include = [filter_level] if filter_level else [1,2,3,4,5]
+        for level in levels_to_include:
             if level in levels_data:
                 level_data = self._paginate_level_members(levels_data[level], page_number)
                 response_data['levels'].append(level_data)
@@ -1749,20 +1804,20 @@ class BalanceStatisticsView(APIView):
     
     @extend_schema(
         tags=[USER_TAG],
-        description="Statistik saldo (deposit/withdraw/commission/income) untuk period 'today' atau 'all-time'",
+        description="Statistik saldo (deposit/withdraw/commission/income) untuk period 'today', 'yesterday', 'weekly', 'monthly' atau 'all-time'",
         responses={200: OpenApiResponse(response=BalanceStatisticsSerializer)},
     )
     def get(self, request, period=None):
         """
         GET /api/accounts/balance-statistics/{period}/
-        period: 'today' atau 'all-time'
+        period: 'today', 'yesterday', 'weekly', 'monthly' atau 'all-time'
         """
         user = request.user
         
         # Validasi period parameter
-        if period not in ['today', 'all-time']:
+        if period not in ['today', 'yesterday', 'weekly', 'monthly', 'all-time']:
             return Response({
-                'error': 'Invalid period. Use "today" or "all-time"'
+                'error': 'Invalid period. Use "today", "yesterday", "weekly", "monthly" or "all-time"'
             }, status=status.HTTP_400_BAD_REQUEST)
         
         # Set date filter berdasarkan period
@@ -1777,7 +1832,52 @@ class BalanceStatisticsView(APIView):
             end_dt = start_dt + timedelta(days=1)
             date_filter = Q(created_at__gte=start_dt, created_at__lt=end_dt)
             period_label = 'today'
-        else:
+        elif period == 'yesterday':
+            now_dt = timezone.now()
+            yesterday = (timezone.localdate(now_dt) if timezone.is_aware(now_dt) else now_dt.date()) - timedelta(days=1)
+            if timezone.is_aware(now_dt):
+                tz = timezone.get_current_timezone()
+                start_dt = timezone.make_aware(datetime.combine(yesterday, datetime.min.time()), tz)
+            else:
+                start_dt = datetime.combine(yesterday, datetime.min.time())
+            end_dt = start_dt + timedelta(days=1)
+            date_filter = Q(created_at__gte=start_dt, created_at__lt=end_dt)
+            period_label = 'yesterday'
+        elif period == 'weekly':
+            now_dt = timezone.now()
+            today = timezone.localdate(now_dt) if timezone.is_aware(now_dt) else now_dt.date()
+            # Get start of week (Monday)
+            start_of_week = today - timedelta(days=today.weekday())
+            if timezone.is_aware(now_dt):
+                tz = timezone.get_current_timezone()
+                start_dt = timezone.make_aware(datetime.combine(start_of_week, datetime.min.time()), tz)
+            else:
+                start_dt = datetime.combine(start_of_week, datetime.min.time())
+            end_dt = start_dt + timedelta(days=7)
+            date_filter = Q(created_at__gte=start_dt, created_at__lt=end_dt)
+            period_label = 'weekly'
+        elif period == 'monthly':
+            now_dt = timezone.now()
+            today = timezone.localdate(now_dt) if timezone.is_aware(now_dt) else now_dt.date()
+            # Get start of month
+            start_of_month = today.replace(day=1)
+            if timezone.is_aware(now_dt):
+                tz = timezone.get_current_timezone()
+                start_dt = timezone.make_aware(datetime.combine(start_of_month, datetime.min.time()), tz)
+            else:
+                start_dt = datetime.combine(start_of_month, datetime.min.time())
+            # Get end of month
+            if start_of_month.month == 12:
+                end_of_month = start_of_month.replace(year=start_of_month.year + 1, month=1, day=1)
+            else:
+                end_of_month = start_of_month.replace(month=start_of_month.month + 1, day=1)
+            if timezone.is_aware(now_dt):
+                end_dt = timezone.make_aware(datetime.combine(end_of_month, datetime.min.time()), tz)
+            else:
+                end_dt = datetime.combine(end_of_month, datetime.min.time())
+            date_filter = Q(created_at__gte=start_dt, created_at__lt=end_dt)
+            period_label = 'monthly'
+        else:  # all-time
             date_filter = Q()  # No date filter for all time
             period_label = 'all_time'
         
@@ -1982,6 +2082,36 @@ class BalanceStatisticsAllTimeView(BalanceStatisticsView):
     
     def get(self, request):
         return super().get(request, period='all-time')
+
+
+class BalanceStatisticsWeeklyView(BalanceStatisticsView):
+    """
+    API khusus untuk statistik balance minggu ini
+    GET /api/accounts/balance-statistics/weekly/
+    """
+    
+    def get(self, request):
+        return super().get(request, period='weekly')
+
+
+class BalanceStatisticsMonthlyView(BalanceStatisticsView):
+    """
+    API khusus untuk statistik balance bulan ini
+    GET /api/accounts/balance-statistics/monthly/
+    """
+    
+    def get(self, request):
+        return super().get(request, period='monthly')
+
+
+class BalanceStatisticsYesterdayView(BalanceStatisticsView):
+    """
+    API khusus untuk statistik balance kemarin
+    GET /api/accounts/balance-statistics/yesterday/
+    """
+    
+    def get(self, request):
+        return super().get(request, period='yesterday')
 
 
 @method_decorator(csrf_exempt, name='dispatch')

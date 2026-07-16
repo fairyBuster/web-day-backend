@@ -1,5 +1,7 @@
 from rest_framework import serializers
 from .models import Product, Transaction, Investment, ProfitHolidaySettings
+from vouchers.models import Voucher
+from vouchers.serializers import VoucherSerializer
 from accounts.models import GeneralSetting
 from django.core.files.storage import default_storage
 from django.conf import settings
@@ -82,6 +84,7 @@ class TransactionSerializer(serializers.ModelSerializer):
     withdrawal_service_duration_hours = serializers.SerializerMethodField()
     withdrawal_service_fee_percent = serializers.SerializerMethodField()
     withdrawal_service_fee_fixed = serializers.SerializerMethodField()
+    voucher = serializers.SerializerMethodField()
     
     class Meta:
         model = Transaction
@@ -249,6 +252,14 @@ class TransactionSerializer(serializers.ModelSerializer):
             pass
         return None
 
+    def get_voucher(self, obj):
+        try:
+            if obj.voucher:
+                return VoucherSerializer(obj.voucher, context=self.context).data
+        except Exception:
+            pass
+        return None
+
 
 class InvestmentSerializer(serializers.ModelSerializer):
     user_phone = serializers.CharField(source='user.phone', read_only=True)
@@ -256,6 +267,7 @@ class InvestmentSerializer(serializers.ModelSerializer):
     product_price = serializers.DecimalField(source='product.price', max_digits=15, decimal_places=2, read_only=True)
     product_golongan = serializers.CharField(source='product.golongan', read_only=True, allow_null=True)
     product_specification = serializers.CharField(source='product.specifications', read_only=True, allow_blank=True)
+    product_description = serializers.CharField(source='product.description', read_only=True, allow_blank=True)
     transaction_id = serializers.CharField(source='transaction.trx_id', read_only=True)
     daily_profit = serializers.DecimalField(max_digits=15, decimal_places=2, read_only=True)
     total_potential_profit = serializers.DecimalField(max_digits=15, decimal_places=2, read_only=True)
@@ -390,9 +402,9 @@ class InvestmentSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = (
             'user', 'transaction', 'total_amount', 'profit_type', 'profit_rate', 
-            'profit_method', 'claim_reset_mode', 'duration_days', 'expires_at',
+            'profit_method', 'claim_reset_mode', 'claim_reset_hours', 'duration_days', 'expires_at',
             'last_claim_time', 'next_claim_time', 'total_claimed_profit', 'status',
-            'created_at', 'updated_at', 'user_phone', 'product_name', 'product_price', 'product_golongan', 'product_specification', 'transaction_id', 'daily_profit',
+            'created_at', 'updated_at', 'user_phone', 'product_name', 'product_price', 'product_golongan', 'product_specification', 'product_description', 'transaction_id', 'daily_profit',
             'total_potential_profit', 'remaining_profit', 'can_claim_today', 'can_claim_manually',
             'can_claim_principal', 'principal_claim_locked_reason',
             'next_claim_time_calculated', 'profit_random_min', 'profit_random_max'

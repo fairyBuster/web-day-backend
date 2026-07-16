@@ -355,6 +355,7 @@ class RankLevel(models.Model):
     """Konfigurasi syarat misi total untuk pencapaian rank tertentu."""
     rank = models.PositiveSmallIntegerField(unique=True)
     title = models.CharField(max_length=100, default='Rank')
+    description = models.TextField(blank=True, null=True, help_text='Deskripsi untuk rank ini.')
     missions_required_total = models.PositiveIntegerField(
         help_text=(
             'Ambang jumlah progres untuk rank ini. Jika basis=missions, ini adalah total misi selesai (distinct). '

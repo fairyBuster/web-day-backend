@@ -84,7 +84,7 @@ class UserAdmin(BaseUserAdmin):
         }),
     )
     
-    readonly_fields = ('created_at', 'updated_at', 'date_joined', 'last_login', 'last_login_ip', 'referral_code', 'downline_overview_link')
+    readonly_fields = ('updated_at', 'last_login', 'last_login_ip', 'referral_code', 'downline_overview_link')
     form = UserAdminForm
     
     def save_model(self, request, obj, form, change):
@@ -522,22 +522,22 @@ class GeneralSettingAdmin(admin.ModelAdmin):
 @admin.register(RankLevel)
 class RankLevelAdmin(admin.ModelAdmin):
     list_display = (
-        'rank', 'title', 'missions_required_total', 'downlines_total_required',
+        'rank', 'title', 'description', 'missions_required_total', 'downlines_total_required',
         'downlines_active_required', 'deposit_self_total_required',
         'team_deposit_level_1_total_required', 'created_at', 'updated_at'
     )
     list_editable = (
-        'title', 'missions_required_total', 'downlines_total_required',
+        'title', 'description', 'missions_required_total', 'downlines_total_required',
         'downlines_active_required', 'deposit_self_total_required',
         'team_deposit_level_1_total_required'
     )
     ordering = ('rank',)
-    search_fields = ('title',)
+    search_fields = ('title', 'description')
     readonly_fields = ('created_at', 'updated_at')
     fieldsets = (
         ('Konfigurasi Rank', {
             'fields': (
-                'rank', 'title', 'missions_required_total', 'downlines_total_required',
+                'rank', 'title', 'description', 'missions_required_total', 'downlines_total_required',
                 'downlines_active_required', 'deposit_self_total_required',
                 'team_deposit_level_1_total_required'
             ),

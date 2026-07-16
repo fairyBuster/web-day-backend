@@ -199,7 +199,7 @@ class ClaimVoucherView(APIView):
                 description=f'Voucher claim {voucher.code}',
                 status='COMPLETED',
                 wallet_type=voucher.balance_type,
-                voucher_id=voucher.id,
+                voucher=voucher,
                 voucher_code=voucher.code,
                 trx_id=trx_id,
             )

@@ -1,4 +1,5 @@
 from decimal import Decimal
+from datetime import timedelta
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
@@ -14,7 +15,7 @@ from .serializers import (
     MissionListResponseSerializer,
     ClaimMissionResponseSerializer,
 )
-from .utils import compute_mission_progress
+from .utils import compute_mission_progress, _get_period_bounds
 from products.models import Transaction
 from accounts.models import User
 from accounts.utils import update_user_rank
@@ -36,6 +37,21 @@ class MissionListView(APIView):
         state_map = {s.mission_id: s for s in states}
         groups = {}
         mission_by_id = {m.id: m for m in missions}
+        
+        # First pass: check and reset periods if needed
+        for mission in missions:
+            if mission.is_time_limited and mission.time_period_days:
+                state = state_map.get(mission.id)
+                if state:
+                    # Use _get_period_bounds to check if period is expired
+                    current_start, current_end = _get_period_bounds(mission, state, request.user)
+                    if current_start != state.period_start:
+                        # New period started, reset claimed count
+                        state.claimed_count = 0
+                        state.period_start = current_start
+                        state.save()
+                        state_map[mission.id] = state
+        
         for m in missions:
             lvls = [lvl for lvl in (m.referral_levels or []) if lvl in [1, 2, 3]]
             key = (m.type, tuple(lvls) if lvls else ('default',))
@@ -45,7 +61,11 @@ class MissionListView(APIView):
         for key, ids in groups.items():
             try:
                 sample = mission_by_id.get(ids[0])
-                val = compute_mission_progress(sample, request.user) if sample else 0
+                if sample:
+                    state = state_map.get(sample.id)
+                    val = compute_mission_progress(sample, request.user, state)
+                else:
+                    val = 0
             except Exception:
                 val = 0
             for mid in ids:
@@ -118,8 +138,18 @@ class ClaimMissionView(APIView):
             return Response({'error': 'Mission not found or inactive'}, status=status.HTTP_404_NOT_FOUND)
 
         user = request.user
-        progress = compute_mission_progress(mission, user)
         state, _ = MissionUserState.objects.get_or_create(user=user, mission=mission)
+        
+        # Check and reset period if needed
+        if mission.is_time_limited and mission.time_period_days:
+            current_start, current_end = _get_period_bounds(mission, state, user)
+            if current_start != state.period_start:
+                # New period started, reset claimed count
+                state.claimed_count = 0
+                state.period_start = current_start
+                state.save()
+        
+        progress = compute_mission_progress(mission, user, state)
         claimed = state.claimed_count
         available = (progress // mission.requirement) - claimed
 
@@ -147,6 +177,7 @@ class ClaimMissionView(APIView):
             # Create transaction record
             trx = Transaction.objects.create(
                 user=user,
+                product=None,
                 type='MISSIONS',
                 amount=reward_total,
                 description=f'Mission reward: {mission.description} (x{times})',

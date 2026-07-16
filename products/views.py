@@ -294,6 +294,7 @@ class ProductViewSet(viewsets.ModelViewSet):
                 profit_random_max=getattr(product, 'profit_random_max', None),
                 profit_method=product.profit_method,
                 claim_reset_mode=product.claim_reset_mode,
+                claim_reset_hours=getattr(product, 'claim_reset_hours', None),
                 duration_days=product.duration,
                 remaining_days=product.duration,
                 expires_at=expires_at,
@@ -557,7 +558,7 @@ class TransactionViewSet(viewsets.ModelViewSet):
             qs = Transaction.objects.all()
         else:
             qs = Transaction.objects.filter(user=user)
-        return qs.select_related('user', 'product', 'upline_user', 'related_transaction').prefetch_related(
+        return qs.select_related('user', 'product', 'upline_user', 'related_transaction', 'voucher').prefetch_related(
             'related_withdrawal__bank_account__bank',
             'related_withdrawal__withdrawal_service'
         )
@@ -888,52 +889,55 @@ class InvestmentViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         
         investment_id = serializer.validated_data['investment_id']
-        investment = Investment.objects.get(id=investment_id, user=request.user)
         
-        # Check if this is an automatic profit method investment
-        if investment.profit_method == 'auto':
-            return Response({
-                'error': 'Investasi ini menggunakan pemrosesan profit otomatis. Klaim manual tidak diperbolehkan.',
-                'profit_method': 'auto',
-                'message': 'Profit diproses otomatis setiap 5 menit oleh sistem.'
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
-        # Update remaining days first
-        investment.update_remaining_days()
-        
-        # Check if can claim
-        if not investment.can_claim_today():
-            reasons = []
-            if investment.status != 'ACTIVE':
-                reasons.append('Investasi tidak aktif')
-            if investment.remaining_days <= 0:
-                reasons.append('Investasi kedaluwarsa')
-            try:
-                from .models import ProfitHolidaySettings
-                if ProfitHolidaySettings.is_profit_blocked_today():
-                    reasons.append('Hari libur (profit dimatikan)')
-            except Exception:
-                pass
-            if investment.last_claim_time and not investment.can_claim_today():
-                reasons.append('Sudah klaim hari ini atau menunggu waktu klaim berikutnya')
-            
-            return Response({
-                'error': 'Tidak bisa klaim profit: ' + ', '.join(reasons),
-                'next_claim_time': investment.next_claim_time
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
-        # Calculate profit amount
-        daily_profit = investment.daily_profit
-        
-        if daily_profit <= 0:
-            return Response({
-                'error': 'Tidak ada profit yang bisa diklaim'
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
-        # Use database transaction for atomicity
         with transaction.atomic():
+            # Lock investment row AND user row to prevent double claims (race conditions)
+            from django.contrib.auth import get_user_model
+            User = get_user_model()
+            user = User.objects.select_for_update().get(id=request.user.id)
+            investment = Investment.objects.select_for_update().get(id=investment_id, user=user)
+            
+            # Check if this is an automatic profit method investment
+            if investment.profit_method == 'auto':
+                return Response({
+                    'error': 'Investasi ini menggunakan pemrosesan profit otomatis. Klaim manual tidak diperbolehkan.',
+                    'profit_method': 'auto',
+                    'message': 'Profit diproses otomatis setiap 5 menit oleh sistem.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Update remaining days first
+            investment.update_remaining_days()
+            
+            # Check if can claim
+            if not investment.can_claim_today():
+                reasons = []
+                if investment.status != 'ACTIVE':
+                    reasons.append('Investasi tidak aktif')
+                if investment.remaining_days <= 0:
+                    reasons.append('Investasi kedaluwarsa')
+                try:
+                    from .models import ProfitHolidaySettings
+                    if ProfitHolidaySettings.is_profit_blocked_today():
+                        reasons.append('Hari libur (profit dimatikan)')
+                except Exception:
+                    pass
+                if investment.last_claim_time and not investment.can_claim_today():
+                    reasons.append('Sudah klaim hari ini atau menunggu waktu klaim berikutnya')
+                
+                return Response({
+                    'error': 'Tidak bisa klaim profit: ' + ', '.join(reasons),
+                    'next_claim_time': investment.next_claim_time
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Calculate profit amount
+            daily_profit = investment.daily_profit
+            
+            if daily_profit <= 0:
+                return Response({
+                    'error': 'Tidak ada profit yang bisa diklaim'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
             # Interest/Income always goes to main balance (BALANCE wallet)
-            user = request.user
             current_balance = user.balance
             user.balance = current_balance + daily_profit
             user.save()

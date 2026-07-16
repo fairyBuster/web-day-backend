@@ -265,7 +265,7 @@ class Transaction(models.Model):
     related_transaction = models.ForeignKey('self', on_delete=models.SET_NULL, null=True, blank=True)
     
     # Voucher related
-    voucher_id = models.IntegerField(null=True, blank=True)
+    voucher = models.ForeignKey('vouchers.Voucher', on_delete=models.SET_NULL, null=True, blank=True)
     voucher_code = models.CharField(max_length=50, null=True, blank=True)
     
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
@@ -441,7 +441,8 @@ class Investment(models.Model):
     profit_random_max = models.DecimalField(max_digits=16, decimal_places=2, null=True, blank=True)
     profit_method = models.CharField(max_length=20, choices=PROFIT_METHOD_CHOICES)
     claim_reset_mode = models.CharField(max_length=20, choices=CLAIM_RESET_CHOICES)
-    
+    claim_reset_hours = models.IntegerField(null=True, blank=True)
+
     # Duration and timing
     duration_days = models.IntegerField(help_text='Investment duration in days')
     remaining_days = models.IntegerField(help_text='Days remaining until expiration')
@@ -589,10 +590,10 @@ class Investment(models.Model):
             base_time = self.last_claim_time if self.last_claim_time else self.created_at
             local_base = timezone.localtime(base_time) if timezone.is_aware(base_time) else base_time
             
-            # Get target hour from product setting (default 0 if not set)
+            # Get target hour from investment setting (default 0 if not set)
             target_hour = 0
-            if self.product.claim_reset_hours is not None:
-                target_hour = int(self.product.claim_reset_hours) % 24
+            if self.claim_reset_hours is not None:
+                target_hour = int(self.claim_reset_hours) % 24
             
             # Create target time for TODAY at specific hour
             # Note: We use the date of local_base initially

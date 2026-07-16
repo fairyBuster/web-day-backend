@@ -309,7 +309,7 @@ class TransactionAdmin(admin.ModelAdmin):
                    'status_display', 'wallet_type_display', 'product_display', 'created_at')
     search_fields = ('trx_id', 'user__phone', 'description')
     readonly_fields = ('trx_id', 'created_at')
-    autocomplete_fields = ('user', 'product', 'upline_user', 'related_transaction')
+    autocomplete_fields = ('user', 'product', 'upline_user', 'related_transaction', 'voucher')
     
     fieldsets = (
         (None, {
@@ -323,7 +323,7 @@ class TransactionAdmin(admin.ModelAdmin):
             'fields': ('upline_user', 'related_transaction')
         }),
         ('Voucher Details', {
-            'fields': ('voucher_id', 'voucher_code')
+            'fields': ('voucher', 'voucher_code')
         }),
         ('Timestamps', {
             'fields': ('created_at',),
