@@ -1,6 +1,7 @@
 from decimal import Decimal
 from rest_framework import serializers
 from django.db.models import Sum
+from django.utils import timezone
 from .models import Withdrawal, WithdrawalSettings, WithdrawalService
 from banks.models import UserBank, Bank
 from products.models import Transaction
@@ -102,13 +103,15 @@ class WithdrawalSerializer(serializers.ModelSerializer):
 
         max_withdrawal_count = int(getattr(settings_obj, 'max_withdrawal_count', 0) or 0)
         if max_withdrawal_count > 0:
-            active_withdrawal_count = Withdrawal.objects.filter(
+            today = timezone.now().date()
+            daily_withdrawal_count = Withdrawal.objects.filter(
                 user=user,
-                status__in=['PENDING', 'PROCESSING', 'COMPLETED']
+                status__in=['PENDING', 'PROCESSING', 'COMPLETED'],
+                created_at__date=today,
             ).count()
-            if active_withdrawal_count >= max_withdrawal_count:
+            if daily_withdrawal_count >= max_withdrawal_count:
                 raise serializers.ValidationError(
-                    f'Maksimal penarikan hanya {max_withdrawal_count} kali untuk akun ini.'
+                    f'Maksimal penarikan hanya {max_withdrawal_count} kali per hari untuk akun ini.'
                 )
 
         # Bank account requirement

@@ -1,7 +1,9 @@
 from decimal import Decimal
+from datetime import timedelta
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from banks.models import Bank, UserBank
@@ -83,9 +85,38 @@ class WithdrawalSettingsTest(TestCase):
         self.assertEqual(second_response.status_code, 400)
         self.assertEqual(
             second_response.data[0],
-            "Maksimal penarikan hanya 1 kali untuk akun ini.",
+            "Maksimal penarikan hanya 1 kali per hari untuk akun ini.",
         )
         self.assertEqual(Withdrawal.objects.filter(user=self.user).count(), 1)
+
+    def test_max_withdrawal_count_resets_next_day(self):
+        WithdrawalSettings.objects.create(
+            is_active=True,
+            require_bank_account=True,
+            balance_source="balance",
+            require_withdraw_service=False,
+            max_withdrawal_count=1,
+        )
+
+        first_response = self.client.post(
+            "/api/withdrawals/",
+            {"amount": "100.00", "bank_account_id": self.user_bank.id},
+            format="json",
+        )
+        self.assertEqual(first_response.status_code, 201)
+
+        first_withdrawal = Withdrawal.objects.get(user=self.user)
+        yesterday = timezone.now() - timedelta(days=1)
+        Withdrawal.objects.filter(pk=first_withdrawal.pk).update(created_at=yesterday)
+
+        second_response = self.client.post(
+            "/api/withdrawals/",
+            {"amount": "100.00", "bank_account_id": self.user_bank.id},
+            format="json",
+        )
+
+        self.assertEqual(second_response.status_code, 201)
+        self.assertEqual(Withdrawal.objects.filter(user=self.user).count(), 2)
 
 
 class PPayProsWithdrawalCallbackTest(TestCase):
