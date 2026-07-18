@@ -32,6 +32,11 @@ class Command(BaseCommand):
         jayapay_ph_mch_no = ''
         jayapay_ph_api_url = ''
 
+        ppaypros_api_url = 'https://pay.ppaypros.com'
+        ppaypros_mch_no = ''
+        ppaypros_app_id = ''
+        ppaypros_private_key = ''
+
         gs, gs_created = GatewaySettings.objects.get_or_create(id=1)
         if gs_created:
             gs.default_wallet_type = 'BALANCE'
@@ -42,6 +47,7 @@ class Command(BaseCommand):
         gs.max_deposit_amount = gs.max_deposit_amount or 0
         gs.usd_gateway_min_deposit_amount = gs.usd_gateway_min_deposit_amount or 0
         gs.usd_gateway_max_deposit_amount = gs.usd_gateway_max_deposit_amount or 0
+        gs.ppaypros_way_code = gs.ppaypros_way_code or '809'
 
         # Klikpay
         if not (gs.klikpay_public_key or "").strip():
@@ -81,6 +87,17 @@ class Command(BaseCommand):
         gs.jayapay_ph_default_method = gs.jayapay_ph_default_method or 'GCASH'
         gs.jayapay_ph_redirect_url = gs.jayapay_ph_redirect_url or ''
 
+        if not (gs.ppaypros_api_url or "").strip():
+            gs.ppaypros_api_url = ppaypros_api_url
+        if not (gs.ppaypros_mch_no or "").strip():
+            gs.ppaypros_mch_no = ppaypros_mch_no
+        if not (gs.ppaypros_app_id or "").strip():
+            gs.ppaypros_app_id = ppaypros_app_id
+        if not (gs.ppaypros_private_key or "").strip():
+            gs.ppaypros_private_key = ppaypros_private_key
+        gs.ppaypros_ext_param = gs.ppaypros_ext_param or ''
+        gs.ppaypros_return_url = gs.ppaypros_return_url or ''
+
         gs.save()
 
         ws, ws_created = WithdrawalSettings.objects.get_or_create(id=1)
@@ -116,6 +133,16 @@ class Command(BaseCommand):
         if not (ws.jayapay_ph_payout_api_url or "").strip():
             ws.jayapay_ph_payout_api_url = 'https://global-ph-openapi.jayapayment.com/sandbox/ph/disbursement/cash'
         ws.jayapay_ph_payout_fee_type = ws.jayapay_ph_payout_fee_type if ws.jayapay_ph_payout_fee_type in (0, 1) else 1
+
+        if not (ws.ppaypros_payout_api_url or "").strip():
+            ws.ppaypros_payout_api_url = ppaypros_api_url
+        if not (ws.ppaypros_payout_mch_no or "").strip():
+            ws.ppaypros_payout_mch_no = ppaypros_mch_no
+        if not (ws.ppaypros_payout_app_id or "").strip():
+            ws.ppaypros_payout_app_id = ppaypros_app_id
+        if not (ws.ppaypros_payout_private_key or "").strip():
+            ws.ppaypros_payout_private_key = ppaypros_private_key
+        ws.ppaypros_payout_entry_type = ws.ppaypros_payout_entry_type or 'BANK_CARD'
 
         ws.save()
 

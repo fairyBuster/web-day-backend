@@ -13,7 +13,7 @@ from rest_framework.views import APIView
 from django.http import HttpResponse
 
 from .integrations.jayapay import build_params, sign_params_legacy, send_cash_request
-from .models import JayapayWithdrawal, JayapayPhPayoutWithdrawal, UsdPayoutWithdrawal
+from .models import JayapayWithdrawal, JayapayPhPayoutWithdrawal, UsdPayoutWithdrawal, PPayProsWithdrawal
 from products.models import Transaction
 from products.serializers import TransactionSerializer
 from django.db.models import Q
@@ -24,6 +24,8 @@ import json
 import requests
 
 from .integrations.usd_payout import build_payload as usd_build_payload, sign_hmac_sha256, sign_hmac_sha256_then_rsa_base64, send_single_order
+from .integrations.ppaypros import build_payout_payload as ppaypros_build_payout_payload, map_payout_state as ppaypros_map_payout_state, normalize_amount as ppaypros_normalize_amount
+from deposits.integrations.ppaypros import amount_to_points as ppaypros_amount_to_points, generate_sign as ppaypros_generate_sign, parse_data_field as ppaypros_parse_data_field, post_json as ppaypros_post_json, verify_sign as ppaypros_verify_sign
 from deposits.utils import verify_jayapay_signature
 from .integrations.jayapay_ph_banks import JAYAPAY_PH_PAYOUT_BANKS
 
@@ -39,6 +41,30 @@ def _resolve_app_domain(gs: WithdrawalSettings | None) -> str:
         return (getattr(ggs, "app_domain", "") or "").strip() if ggs else ""
     except Exception:
         return ""
+
+
+def _ppaypros_collect_payload(request):
+    payload = {}
+    for source in [request.query_params, request.data]:
+        if not source:
+            continue
+        if hasattr(source, "lists"):
+            for key, values in source.lists():
+                if values:
+                    payload[key] = values[-1]
+        elif isinstance(source, dict):
+            for key, value in source.items():
+                payload[key] = value
+    return payload
+
+
+def _ppaypros_store_trace(trace: PPayProsWithdrawal | None, payload: dict):
+    if not trace:
+        return
+    current = trace.response_payload if isinstance(trace.response_payload, dict) else {}
+    current.update(payload or {})
+    trace.response_payload = current
+    trace.save(update_fields=["response_payload"])
 
 class WithdrawalSettingsView(generics.RetrieveAPIView):
     permission_classes = [permissions.AllowAny]
@@ -733,6 +759,194 @@ class JayapayPhPayoutBanksView(APIView):
                 if q in str(it.get("bankCode") or "").lower() or q in str(it.get("bankName") or "").lower()
             ]
         return Response({"count": len(items), "results": items})
+
+
+class PPayProsPayoutInitiateView(APIView):
+    permission_classes = [permissions.IsAdminUser]
+    throttle_scope = "withdraw_admin_initiate"
+
+    @extend_schema(summary="Inisiasi withdraw otomatis via PPay Pros (admin)")
+    def post(self, request, pk: int):
+        gs = WithdrawalSettings.objects.order_by("-updated_at").first()
+        enabled = bool(gs and gs.ppaypros_payout_enabled)
+        api_url = (gs.ppaypros_payout_api_url or "").strip() if gs else ""
+        mch_no = (gs.ppaypros_payout_mch_no or "").strip() if gs else ""
+        app_id = (gs.ppaypros_payout_app_id or "").strip() if gs else ""
+        private_key = (gs.ppaypros_payout_private_key or "").strip() if gs else ""
+        entry_type_default = (gs.ppaypros_payout_entry_type or "BANK_CARD").strip() if gs else "BANK_CARD"
+        app_domain = _resolve_app_domain(gs)
+
+        if not enabled:
+            return Response({"detail": "PPay Pros payout tidak aktif"}, status=status.HTTP_400_BAD_REQUEST)
+        if not api_url or not mch_no or not app_id or not private_key:
+            return Response({"detail": "Konfigurasi PPay Pros payout belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
+        if not app_domain:
+            return Response({"detail": "Konfigurasi domain untuk callback belum diisi"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            wd = Withdrawal.objects.select_related("user", "bank_account__bank", "transaction").get(pk=pk)
+        except Withdrawal.DoesNotExist:
+            return Response({"detail": "Withdrawal tidak ditemukan"}, status=status.HTTP_404_NOT_FOUND)
+
+        if wd.status not in ("PENDING", "PROCESSING"):
+            return Response({"detail": "Status withdrawal tidak valid untuk inisiasi"}, status=status.HTTP_400_BAD_REQUEST)
+
+        entry_type = (request.data.get("entryType") or entry_type_default or "BANK_CARD").strip().upper()
+        account_code = (request.data.get("accountCode") or getattr(getattr(wd, "bank_account", None), "bank", None) and wd.bank_account.bank.code or "").strip()
+        account_no = (request.data.get("accountNo") or getattr(wd.bank_account, "account_number", "") or "").strip()
+        account_name = (request.data.get("accountName") or getattr(wd.bank_account, "account_name", "") or "").strip()
+        account_email = (request.data.get("accountEmail") or getattr(wd.user, "email", "") or f"user{wd.user_id}@example.com").strip()
+        account_phone = (request.data.get("accountPhone") or getattr(wd.bank_account, "phone", "") or getattr(wd.user, "phone", "") or "").strip()
+        if not account_code or not account_no or not account_name:
+            return Response({"detail": "accountCode, accountNo, accountName wajib diisi"}, status=status.HTTP_400_BAD_REQUEST)
+
+        amount_raw = request.data.get("amount")
+        try:
+            amount = ppaypros_normalize_amount(amount_raw) if amount_raw is not None else ppaypros_normalize_amount(wd.net_amount or wd.amount)
+            if amount <= 0:
+                raise InvalidOperation()
+        except Exception:
+            return Response({"detail": "amount tidak valid"}, status=status.HTTP_400_BAD_REQUEST)
+
+        mch_order_no = getattr(getattr(wd, "transaction", None), "trx_id", None) or f"WPP{wd.pk}{int(pytime.time())}"
+        notify_url = f"https://{app_domain}/api/withdrawals/ppaypros/callback/"
+        bank_name = getattr(getattr(wd, "bank_account", None), "bank", None)
+        payload = ppaypros_build_payout_payload(
+            mch_no=mch_no,
+            app_id=app_id,
+            mch_order_no=mch_order_no,
+            amount_points=ppaypros_amount_to_points(amount),
+            entry_type=entry_type,
+            account_no=account_no,
+            account_code=account_code,
+            account_name=account_name,
+            account_email=account_email[:64],
+            account_phone=account_phone[:16],
+            notify_url=notify_url,
+            bank_name=getattr(bank_name, "name", "")[:64],
+            ext_param=f"withdrawal:{wd.pk}",
+        )
+        payload["sign"] = ppaypros_generate_sign(payload, private_key)
+
+        trace, _ = PPayProsWithdrawal.objects.get_or_create(withdrawal=wd, defaults={"request_params": payload})
+        if trace and not trace.request_params:
+            trace.request_params = payload
+            trace.save(update_fields=["request_params"])
+
+        response_payload = ppaypros_post_json(f"{api_url.rstrip('/')}/api/payout/pay", payload)
+        if response_payload.get("sign"):
+            response_payload["_sign_valid"] = ppaypros_verify_sign(response_payload, private_key)
+        _ppaypros_store_trace(trace, {"initiate": response_payload})
+
+        if str(response_payload.get("code")) == "0":
+            data = ppaypros_parse_data_field(response_payload)
+            mapped_status = ppaypros_map_payout_state(data.get("state"))
+            if mapped_status:
+                wd.status = mapped_status
+                wd.save(update_fields=["status"])
+            else:
+                wd.status = "PROCESSING"
+                wd.save(update_fields=["status"])
+            return Response({"gateway": response_payload, "provider_data": data}, status=status.HTTP_200_OK)
+
+        wd.status = "REJECTED"
+        wd.save(update_fields=["status"])
+        return Response({"detail": response_payload.get("msg") or "Payout gagal", "gateway": response_payload}, status=status.HTTP_400_BAD_REQUEST)
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class PPayProsPayoutCallbackView(generics.GenericAPIView):
+    permission_classes = [permissions.AllowAny]
+    throttle_scope = "gateway_callback"
+
+    @extend_schema(summary="Callback PPay Pros untuk update status withdraw")
+    def post(self, request, *args, **kwargs):
+        gs = WithdrawalSettings.objects.order_by("-updated_at").first()
+        private_key = (gs.ppaypros_payout_private_key or "").strip() if gs else ""
+        payload = _ppaypros_collect_payload(request)
+        order_num = str(payload.get("mchOrderNo") or "").strip()
+        if not order_num:
+            return HttpResponse("success", content_type="text/plain")
+
+        trx = Transaction.objects.filter(trx_id=order_num).first()
+        withdrawal = Withdrawal.objects.filter(transaction=trx).first() if trx else None
+        if not withdrawal:
+            ext_param = str(payload.get("extParam") or "").strip().lower()
+            if ext_param.startswith("withdrawal:"):
+                try:
+                    withdrawal_id = int(ext_param.split(":", 1)[1])
+                except Exception:
+                    withdrawal_id = None
+                if withdrawal_id:
+                    withdrawal = Withdrawal.objects.filter(pk=withdrawal_id).first()
+        if not withdrawal:
+            return HttpResponse("success", content_type="text/plain")
+
+        trace = PPayProsWithdrawal.objects.filter(withdrawal=withdrawal).first()
+        signature_valid = ppaypros_verify_sign(payload, private_key) if private_key else False
+        _ppaypros_store_trace(trace, {"callback": {**payload, "_sign_valid": signature_valid}})
+        if not signature_valid:
+            return HttpResponse("success", content_type="text/plain")
+
+        mapped_status = ppaypros_map_payout_state(payload.get("state"))
+        if mapped_status:
+            withdrawal.status = mapped_status
+            withdrawal.save(update_fields=["status"])
+        return HttpResponse("success", content_type="text/plain")
+
+
+class PPayProsPayoutQueryView(APIView):
+    permission_classes = [permissions.IsAdminUser]
+    throttle_scope = "withdraw_admin_initiate"
+
+    @extend_schema(summary="Query status withdraw PPay Pros")
+    def post(self, request, pk: int):
+        gs = WithdrawalSettings.objects.order_by("-updated_at").first()
+        enabled = bool(gs and gs.ppaypros_payout_enabled)
+        api_url = (gs.ppaypros_payout_api_url or "").strip() if gs else ""
+        mch_no = (gs.ppaypros_payout_mch_no or "").strip() if gs else ""
+        app_id = (gs.ppaypros_payout_app_id or "").strip() if gs else ""
+        private_key = (gs.ppaypros_payout_private_key or "").strip() if gs else ""
+        if not enabled:
+            return Response({"detail": "PPay Pros payout tidak aktif"}, status=status.HTTP_400_BAD_REQUEST)
+        if not api_url or not mch_no or not app_id or not private_key:
+            return Response({"detail": "Konfigurasi PPay Pros payout belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            wd = Withdrawal.objects.select_related("transaction").get(pk=pk)
+        except Withdrawal.DoesNotExist:
+            return Response({"detail": "Withdrawal tidak ditemukan"}, status=status.HTTP_404_NOT_FOUND)
+
+        trace = PPayProsWithdrawal.objects.filter(withdrawal=wd).first()
+        transfer_id = (request.data.get("transferId") or "").strip()
+        mch_order_no = (request.data.get("mchOrderNo") or getattr(getattr(wd, "transaction", None), "trx_id", None) or "").strip()
+        if not transfer_id and trace and isinstance(trace.response_payload, dict):
+            initiate_payload = trace.response_payload.get("initiate")
+            initiate_data = ppaypros_parse_data_field(initiate_payload) if isinstance(initiate_payload, dict) else {}
+            transfer_id = str(initiate_data.get("transferId") or "").strip()
+
+        payload = {"mchNo": mch_no, "appId": app_id}
+        if transfer_id:
+            payload["transferId"] = transfer_id
+        if mch_order_no:
+            payload["mchOrderNo"] = mch_order_no
+        if "transferId" not in payload and "mchOrderNo" not in payload:
+            return Response({"detail": "transferId atau mchOrderNo wajib tersedia"}, status=status.HTTP_400_BAD_REQUEST)
+        payload["sign"] = ppaypros_generate_sign(payload, private_key)
+
+        response_payload = ppaypros_post_json(f"{api_url.rstrip('/')}/api/payout/query", payload)
+        if response_payload.get("sign"):
+            response_payload["_sign_valid"] = ppaypros_verify_sign(response_payload, private_key)
+        _ppaypros_store_trace(trace, {"query": response_payload})
+
+        data = ppaypros_parse_data_field(response_payload)
+        if str(response_payload.get("code")) == "0":
+            mapped_status = ppaypros_map_payout_state(data.get("state"))
+            if mapped_status:
+                wd.status = mapped_status
+                wd.save(update_fields=["status"])
+
+        return Response({"local_status": wd.status, "gateway": response_payload, "provider_data": data}, status=status.HTTP_200_OK)
 
 
 class WithdrawalTransactionsListView(APIView):

@@ -186,4 +186,89 @@
       </div>
     </form>
   </div>
+
+  <div class="module" style="margin-top: 2rem;">
+    <h2>Process via PPay Pros</h2>
+    {% if not ppaypros_enabled %}
+      <p style="color:#b00;">PPay Pros payout tidak aktif. Aktifkan di WithdrawalSettings dan isi konfigurasi mchNo/appId/private key.</p>
+    {% endif %}
+
+    <form method="post" action="{{ process_ppaypros_url }}" novalidate>
+      {% csrf_token %}
+      <fieldset class="module aligned">
+        <div class="form-row">
+          <div>
+            <label for="id_pp_entryType">Entry Type</label>
+            <input type="text" id="id_pp_entryType" name="entryType" value="{{ ppaypros_initial.entryType }}" required />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div>
+            <label for="id_pp_accountCode">Account Code</label>
+            <select id="id_pp_accountCode" name="accountCode" required>
+              <option value="">-- pilih account code --</option>
+              {% if ppaypros_wallet_codes %}
+                <optgroup label="Wallet">
+                  {% for b in ppaypros_wallet_codes %}
+                    <option value="{{ b.code }}" {% if ppaypros_initial.accountCode == b.code %}selected{% endif %}>
+                      {{ b.code }} - {{ b.name }}
+                    </option>
+                  {% endfor %}
+                </optgroup>
+              {% endif %}
+              {% if ppaypros_bank_codes %}
+                <optgroup label="Bank">
+                  {% for b in ppaypros_bank_codes %}
+                    <option value="{{ b.code }}" {% if ppaypros_initial.accountCode == b.code %}selected{% endif %}>
+                      {{ b.code }} - {{ b.name }}
+                    </option>
+                  {% endfor %}
+                </optgroup>
+              {% endif %}
+            </select>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div>
+            <label for="id_pp_accountNo">Account Number</label>
+            <input type="text" id="id_pp_accountNo" name="accountNo" value="{{ ppaypros_initial.accountNo }}" required />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div>
+            <label for="id_pp_accountName">Account Name</label>
+            <input type="text" id="id_pp_accountName" name="accountName" value="{{ ppaypros_initial.accountName }}" required />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div>
+            <label for="id_pp_accountEmail">Email</label>
+            <input type="text" id="id_pp_accountEmail" name="accountEmail" value="{{ ppaypros_initial.accountEmail }}" />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div>
+            <label for="id_pp_accountPhone">Phone</label>
+            <input type="text" id="id_pp_accountPhone" name="accountPhone" value="{{ ppaypros_initial.accountPhone }}" />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div>
+            <label for="id_pp_amount">Amount</label>
+            <input type="number" step="0.01" id="id_pp_amount" name="amount" value="{{ ppaypros_initial.amount }}" required />
+          </div>
+        </div>
+      </fieldset>
+
+      <div class="submit-row">
+        <button type="submit" class="default">Submit to PPay Pros</button>
+      </div>
+    </form>
+  </div>
 {% endblock %}

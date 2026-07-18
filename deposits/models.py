@@ -17,6 +17,7 @@ class GatewaySettings(models.Model):
     jayapay_enabled = models.BooleanField(default=True)
     klikpay_enabled = models.BooleanField(default=False)
     usd_gateway_enabled = models.BooleanField(default=False)
+    ppaypros_enabled = models.BooleanField(default=False)
 
     # Jayapay config
     jayapay_merchant_code = models.CharField(max_length=100, blank=True, default='')
@@ -54,6 +55,15 @@ class GatewaySettings(models.Model):
     usd_gateway_max_deposit_amount = models.DecimalField(max_digits=15, decimal_places=2, default=0, help_text='Maksimal nominal deposit USD (0 = tidak dibatasi)')
     usd_gateway_bank_code = models.CharField(max_length=100, blank=True, default='', help_text='Override bankCode/IP yang dikirim ke provider (kosong = pakai IP client dari request)')
 
+    # PPay Pros pay-in
+    ppaypros_api_url = models.CharField(max_length=255, blank=True, default='https://pay.ppaypros.com')
+    ppaypros_mch_no = models.CharField(max_length=100, blank=True, default='')
+    ppaypros_app_id = models.CharField(max_length=100, blank=True, default='')
+    ppaypros_private_key = models.CharField(max_length=255, blank=True, default='', help_text='Private key/sign key untuk MD5 signature')
+    ppaypros_way_code = models.CharField(max_length=32, blank=True, default='809', help_text='wayCode default, contoh: 808 (bank) atau 809 (e-wallet)')
+    ppaypros_ext_param = models.CharField(max_length=64, blank=True, default='', help_text='Kode bank/wallet default, contoh: BRI, BNI, dana, gopay')
+    ppaypros_return_url = models.CharField(max_length=512, blank=True, default='', help_text='URL redirect setelah pembayaran selesai')
+
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
@@ -77,6 +87,7 @@ class Deposit(models.Model):
         ('JAYAPAY_PH', 'Jayapay Philippines'),
         ('KLIKPAY', 'Klikpay'),
         ('USD_GATEWAY', 'USD Gateway'),
+        ('PPAYPROS', 'PPay Pros'),
     ]
     WALLET_CHOICES = [
         ('BALANCE', 'Balance'),

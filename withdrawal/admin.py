@@ -3,11 +3,14 @@ from django.conf import settings
 from django.urls import path, reverse
 from django.shortcuts import redirect
 from django.template.response import TemplateResponse
-from .models import Withdrawal, WithdrawalSettings, WithdrawalJayapay, WithdrawalService, UsdPayoutWithdrawal, JayapayPhPayoutWithdrawal
+from .models import Withdrawal, WithdrawalSettings, WithdrawalJayapay, WithdrawalService, UsdPayoutWithdrawal, JayapayPhPayoutWithdrawal, PPayProsWithdrawal
 from .integrations.jayapay import build_params, sign_params, sign_params_legacy, send_cash_request
 from .integrations.jayapay_banks import JAYAPAY_BANKS
 from .integrations.jayapay_ph_banks import JAYAPAY_PH_PAYOUT_BANKS
+from .integrations.ppaypros_bank_codes import PPAYPROS_PAYOUT_CODES
 from .integrations.usd_payout import build_payload as usd_build_payload, sign_hmac_sha256_then_rsa_base64, send_single_order
+from .integrations.ppaypros import build_payout_payload as ppaypros_build_payout_payload, map_payout_state as ppaypros_map_payout_state
+from deposits.integrations.ppaypros import amount_to_points as ppaypros_amount_to_points, generate_sign as ppaypros_generate_sign, parse_data_field as ppaypros_parse_data_field, post_json as ppaypros_post_json, verify_sign as ppaypros_verify_sign
 from django.utils.html import format_html
 import json
 import logging
@@ -43,6 +46,9 @@ def _redact_for_log(value):
     if isinstance(value, list):
         return [_redact_for_log(v) for v in value]
     return value
+
+
+PPAYPROS_PAYOUT_CODE_SET = {item["code"] for item in PPAYPROS_PAYOUT_CODES if item.get("code")}
 
 
 @admin.register(Withdrawal)
@@ -97,6 +103,11 @@ class WithdrawalAdmin(admin.ModelAdmin):
                 '<int:pk>/process-usd-payout/',
                 self.admin_site.admin_view(self.process_usd_payout_view),
                 name='withdrawal_withdrawal_process_usd_payout',
+            ),
+            path(
+                '<int:pk>/process-ppaypros/',
+                self.admin_site.admin_view(self.process_ppaypros_view),
+                name='withdrawal_withdrawal_process_ppaypros',
             ),
         ]
         return custom + urls
@@ -472,6 +483,104 @@ class WithdrawalAdmin(admin.ModelAdmin):
 
         return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
 
+    def process_ppaypros_view(self, request, pk: int):
+        try:
+            wd = Withdrawal.objects.select_related('bank_account__bank', 'user', 'transaction').get(pk=pk)
+        except Withdrawal.DoesNotExist:
+            self.message_user(request, 'Withdrawal tidak ditemukan', level=messages.ERROR)
+            return redirect(reverse('admin:withdrawal_withdrawal_changelist'))
+
+        gs = WithdrawalSettings.objects.order_by("-updated_at").first()
+        enabled = bool(gs and getattr(gs, "ppaypros_payout_enabled", False))
+        api_url = (getattr(gs, "ppaypros_payout_api_url", "") or "").strip() if gs else ""
+        mch_no = (getattr(gs, "ppaypros_payout_mch_no", "") or "").strip() if gs else ""
+        app_id = (getattr(gs, "ppaypros_payout_app_id", "") or "").strip() if gs else ""
+        private_key = (getattr(gs, "ppaypros_payout_private_key", "") or "").strip() if gs else ""
+        entry_type_default = (getattr(gs, "ppaypros_payout_entry_type", "") or "BANK_CARD").strip() if gs else "BANK_CARD"
+        app_domain = (getattr(gs, "app_domain", "") or "").strip() if gs else ""
+        if not app_domain:
+            try:
+                from deposits.models import GatewaySettings
+                ggs = GatewaySettings.objects.order_by("-updated_at").first()
+                app_domain = (getattr(ggs, "app_domain", "") or "").strip() if ggs else ""
+            except Exception:
+                app_domain = ""
+
+        if not enabled:
+            self.message_user(request, 'PPay Pros payout tidak aktif', level=messages.ERROR)
+            return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+        if not api_url or not mch_no or not app_id or not private_key or not app_domain:
+            self.message_user(request, 'Konfigurasi PPay Pros payout belum lengkap', level=messages.ERROR)
+            return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+
+        if request.method == "POST":
+            entry_type = (request.POST.get("entryType") or entry_type_default or "BANK_CARD").strip().upper()
+            account_code = (request.POST.get("accountCode") or (wd.bank_account.bank.code if wd.bank_account and wd.bank_account.bank else "")).strip()
+            account_no = (request.POST.get("accountNo") or (wd.bank_account.account_number if wd.bank_account else "")).strip()
+            account_name = (request.POST.get("accountName") or (wd.bank_account.account_name if wd.bank_account else "")).strip()
+            account_email = (request.POST.get("accountEmail") or getattr(wd.user, 'email', '') or f"user{wd.user_id}@example.com").strip()
+            account_phone = (request.POST.get("accountPhone") or getattr(wd.bank_account, 'phone', '') or getattr(wd.user, 'phone', '') or '').strip()
+            amount_raw = (request.POST.get("amount") or '').strip() or str(wd.net_amount or wd.amount)
+
+            if not account_code or not account_no or not account_name or not amount_raw:
+                self.message_user(request, 'entry/accountCode/accountNo/accountName/amount wajib diisi', level=messages.ERROR)
+                return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+            if PPAYPROS_PAYOUT_CODE_SET and account_code not in PPAYPROS_PAYOUT_CODE_SET:
+                self.message_user(request, 'Account Code tidak valid untuk PPay Pros', level=messages.ERROR)
+                return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+
+            try:
+                amount = Decimal(str(amount_raw)).quantize(Decimal("0.01"))
+                if amount <= 0:
+                    raise InvalidOperation()
+            except Exception:
+                self.message_user(request, 'Amount tidak valid', level=messages.ERROR)
+                return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+
+            mch_order_no = wd.transaction.trx_id if wd.transaction else f"WPP{wd.id}{int(time.time())}"
+            payload = ppaypros_build_payout_payload(
+                mch_no=mch_no,
+                app_id=app_id,
+                mch_order_no=mch_order_no,
+                amount_points=ppaypros_amount_to_points(amount),
+                entry_type=entry_type,
+                account_no=account_no,
+                account_code=account_code,
+                account_name=account_name,
+                account_email=account_email[:64],
+                account_phone=account_phone[:16],
+                notify_url=f"https://{app_domain}/api/withdrawals/ppaypros/callback/",
+                bank_name=(wd.bank_account.bank.name if wd.bank_account and wd.bank_account.bank else "")[:64],
+                ext_param=f"withdrawal:{wd.id}",
+            )
+            payload["sign"] = ppaypros_generate_sign(payload, private_key)
+
+            trace, _ = PPayProsWithdrawal.objects.get_or_create(withdrawal=wd, defaults={"request_params": payload})
+            if trace and not trace.request_params:
+                trace.request_params = payload
+                trace.save(update_fields=["request_params"])
+
+            response_payload = ppaypros_post_json(f"{api_url.rstrip('/')}/api/payout/pay", payload)
+            if response_payload.get("sign"):
+                response_payload["_sign_valid"] = ppaypros_verify_sign(response_payload, private_key)
+            trace.response_payload = {"initiate": _redact_for_log(response_payload)}
+            trace.save(update_fields=["response_payload"])
+
+            if str(response_payload.get("code")) == "0":
+                data = ppaypros_parse_data_field(response_payload)
+                mapped = ppaypros_map_payout_state(data.get("state"))
+                wd.status = mapped or 'PROCESSING'
+                wd.save(update_fields=['status'])
+                self.message_user(request, f"Withdrawal #{wd.id} dikirim ke PPay Pros", level=messages.SUCCESS)
+                return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+
+            wd.status = 'REJECTED'
+            wd.save(update_fields=['status'])
+            self.message_user(request, f"PPay Pros gagal: {response_payload.get('msg') or response_payload}", level=messages.ERROR)
+            return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+
+        return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+
     def render_change_form(self, request, context, add=False, change=False, form_url='', obj=None):
         if obj:
             gs = WithdrawalSettings.objects.order_by("-updated_at").first()
@@ -479,6 +588,9 @@ class WithdrawalAdmin(admin.ModelAdmin):
             ph_bank_code_default = obj.bank_account.bank.code if obj.bank_account else ""
             if ph_allowed_codes and ph_bank_code_default not in ph_allowed_codes:
                 ph_bank_code_default = "GCASH"
+            ppaypros_code_default = obj.bank_account.bank.code if obj.bank_account and obj.bank_account.bank else ""
+            if PPAYPROS_PAYOUT_CODE_SET and ppaypros_code_default not in PPAYPROS_PAYOUT_CODE_SET:
+                ppaypros_code_default = ""
             initial = {
                 'bankCode': obj.bank_account.bank.code if obj.bank_account else '',
                 'accountNumber': obj.bank_account.account_number if obj.bank_account else '',
@@ -501,6 +613,19 @@ class WithdrawalAdmin(admin.ModelAdmin):
                 },
                 'jayapay_ph_banks': JAYAPAY_PH_PAYOUT_BANKS,
                 'process_jayapay_ph_url': reverse('admin:withdrawal_withdrawal_process_jayapay_ph', args=(obj.id,)),
+                'ppaypros_enabled': bool(gs and getattr(gs, "ppaypros_payout_enabled", False)),
+                'ppaypros_initial': {
+                    'entryType': (getattr(gs, "ppaypros_payout_entry_type", "") or 'BANK_CARD') if gs else 'BANK_CARD',
+                    'accountCode': ppaypros_code_default,
+                    'accountNo': obj.bank_account.account_number if obj.bank_account else '',
+                    'accountName': obj.bank_account.account_name if obj.bank_account else '',
+                    'accountEmail': getattr(obj.user, 'email', '') or f"user{obj.user_id}@example.com",
+                    'accountPhone': (getattr(obj.bank_account, 'phone', '') or getattr(obj.user, 'phone', '') or '').strip(),
+                    'amount': str(obj.net_amount or obj.amount),
+                },
+                'ppaypros_wallet_codes': [item for item in PPAYPROS_PAYOUT_CODES if item.get('category') == 'wallet'],
+                'ppaypros_bank_codes': [item for item in PPAYPROS_PAYOUT_CODES if item.get('category') == 'bank'],
+                'process_ppaypros_url': reverse('admin:withdrawal_withdrawal_process_ppaypros', args=(obj.id,)),
                 'usd_payout_initial': {
                     'bankCode': '',
                     'accNo': obj.bank_account.account_number if obj.bank_account else '',
@@ -591,6 +716,7 @@ class WithdrawalSettingsAdmin(admin.ModelAdmin):
         'require_withdraw_service',
         'jayapay_enabled',
         'jayapay_ph_payout_enabled',
+        'ppaypros_payout_enabled',
         'updated_at',
     )
     list_filter = ('is_active',)
@@ -637,6 +763,16 @@ class WithdrawalSettingsAdmin(admin.ModelAdmin):
                 'jayapay_ph_payout_public_key',
                 'jayapay_ph_payout_api_url',
                 'jayapay_ph_payout_fee_type',
+            )
+        }),
+        ('PPay Pros Payout', {
+            'fields': (
+                'ppaypros_payout_enabled',
+                'ppaypros_payout_api_url',
+                'ppaypros_payout_mch_no',
+                'ppaypros_payout_app_id',
+                'ppaypros_payout_private_key',
+                'ppaypros_payout_entry_type',
             )
         }),
     )

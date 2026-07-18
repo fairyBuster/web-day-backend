@@ -5,12 +5,12 @@ from .models import GatewaySettings, Deposit
 @admin.register(GatewaySettings)
 class GatewaySettingsAdmin(admin.ModelAdmin):
     list_display = (
-        'default_wallet_type', 'app_domain', 'min_deposit_amount', 'max_deposit_amount', 'usd_gateway_min_deposit_amount', 'usd_gateway_max_deposit_amount', 'jayapay_enabled', 'jayapay_ph_enabled', 'klikpay_enabled', 'usd_gateway_enabled', 'updated_at'
+        'default_wallet_type', 'app_domain', 'min_deposit_amount', 'max_deposit_amount', 'usd_gateway_min_deposit_amount', 'usd_gateway_max_deposit_amount', 'jayapay_enabled', 'jayapay_ph_enabled', 'klikpay_enabled', 'usd_gateway_enabled', 'ppaypros_enabled', 'updated_at'
     )
     readonly_fields = ('updated_at',)
     fieldsets = (
         ('Global', {
-            'fields': ('default_wallet_type', 'app_domain', 'min_deposit_amount', 'max_deposit_amount', 'jayapay_enabled', 'jayapay_ph_enabled', 'klikpay_enabled', 'usd_gateway_enabled')
+            'fields': ('default_wallet_type', 'app_domain', 'min_deposit_amount', 'max_deposit_amount', 'jayapay_enabled', 'jayapay_ph_enabled', 'klikpay_enabled', 'usd_gateway_enabled', 'ppaypros_enabled')
         }),
         ('Jayapay', {
             'fields': (
@@ -58,6 +58,18 @@ class GatewaySettingsAdmin(admin.ModelAdmin):
                 'usd_gateway_max_deposit_amount',
             ),
             'description': 'Konfigurasi gateway USD (createOrder). Redirect URL digunakan sebagai pageUrl.',
+        }),
+        ('PPay Pros', {
+            'fields': (
+                'ppaypros_api_url',
+                'ppaypros_mch_no',
+                'ppaypros_app_id',
+                'ppaypros_private_key',
+                'ppaypros_way_code',
+                'ppaypros_ext_param',
+                'ppaypros_return_url',
+            ),
+            'description': 'Konfigurasi PPay Pros untuk payin/deposit. Callback memakai app_domain dan endpoint statis.',
         }),
     )
 

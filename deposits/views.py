@@ -22,6 +22,15 @@ from urllib.parse import urlparse, parse_qs
 from products.models import Transaction
 from products.serializers import TransactionSerializer
 from .models import GatewaySettings, Deposit
+from .integrations.ppaypros import (
+    amount_to_points as ppaypros_amount_to_points,
+    extract_payment_data as ppaypros_extract_payment_data,
+    generate_sign as ppaypros_generate_sign,
+    parse_data_field as ppaypros_parse_data_field,
+    points_to_amount as ppaypros_points_to_amount,
+    post_json as ppaypros_post_json,
+    verify_sign as ppaypros_verify_sign,
+)
 from withdrawal.integrations.jayapay import sign_params_legacy
 from .integrations.klikpay import build_params as klikpay_build_params, sign_params as klikpay_sign_params, send_prepaid_request as klikpay_send_prepaid
 from .utils import verify_jayapay_signature
@@ -1753,6 +1762,400 @@ class UsdGatewayDepositCallbackView(APIView):
         return HttpResponse('SUCCESS', content_type='text/plain')
 
 
+def _ppaypros_collect_payload(request):
+    payload = {}
+    sources = [request.query_params, request.data]
+    for source in sources:
+        if not source:
+            continue
+        if hasattr(source, "lists"):
+            iterator = source.lists()
+            for key, values in iterator:
+                if values:
+                    payload[key] = values[-1]
+        elif isinstance(source, dict):
+            for key, value in source.items():
+                payload[key] = value
+    return payload
+
+
+def _ppaypros_mark_deposit_failed(trx: Transaction, dep: Deposit | None, reason: str = ""):
+    if trx.status not in ("PENDING", "PROCESSING"):
+        return
+    update_fields = ["status"]
+    trx.status = "FAILED"
+    if reason:
+        trx.description = ((trx.description or "").strip() + f" [{reason}]").strip()
+        update_fields.append("description")
+    trx.save(update_fields=update_fields)
+    if dep:
+        dep.status = "FAILED"
+        dep.save(update_fields=["status"])
+
+
+def _ppaypros_complete_deposit(trx: Transaction, dep: Deposit | None, paid_amount: Decimal | None = None):
+    if trx.status == "COMPLETED":
+        return
+
+    expected_amount = Decimal(str(trx.amount or 0)).quantize(Decimal("0.01"))
+    if paid_amount is not None and paid_amount > 0 and paid_amount != expected_amount:
+        _ppaypros_mark_deposit_failed(trx, dep, reason="Amount mismatch")
+        return
+
+    from django.contrib.auth import get_user_model
+
+    wallet_field = "balance" if trx.wallet_type == "BALANCE" else "balance_deposit"
+    credited_amount = expected_amount
+    currency_code = (trx.currency_code or "IDR").strip().upper() or "IDR"
+    UserModel = get_user_model()
+
+    with db_transaction.atomic():
+        trx_locked = Transaction.objects.select_for_update().select_related("user").get(pk=trx.pk)
+        if trx_locked.status == "COMPLETED":
+            return
+        user_locked = UserModel.objects.select_for_update().get(pk=trx_locked.user_id)
+        current_balance = getattr(user_locked, wallet_field)
+        setattr(user_locked, wallet_field, current_balance + credited_amount)
+        user_locked.save(update_fields=[wallet_field])
+
+        trx_locked.status = "COMPLETED"
+        trx_locked.currency_code = currency_code
+        trx_locked.amount = credited_amount
+        trx_locked.save(update_fields=["status", "currency_code", "amount"])
+
+        if dep:
+            dep.status = "COMPLETED"
+            dep.credited_amount = credited_amount
+            dep.credited_currency_code = currency_code
+            if not dep.amount_currency_code:
+                dep.amount_currency_code = currency_code
+            dep.save(update_fields=["status", "credited_amount", "credited_currency_code", "amount_currency_code"])
+
+    try:
+        _grant_deposit_cashback(trx.user, trx, credited_amount=credited_amount, currency_code=currency_code)
+    except Exception:
+        pass
+
+
+def _ppaypros_apply_payin_state(trx: Transaction, dep: Deposit | None, state_value, amount_points=None):
+    try:
+        state_int = int(state_value)
+    except Exception:
+        state_int = None
+
+    paid_amount = None
+    if amount_points not in (None, ""):
+        try:
+            paid_amount = ppaypros_points_to_amount(amount_points)
+        except Exception:
+            paid_amount = None
+
+    if state_int == 2:
+        _ppaypros_complete_deposit(trx, dep, paid_amount=paid_amount)
+    elif state_int in (3, 4, 6):
+        _ppaypros_mark_deposit_failed(trx, dep)
+    elif state_int in (0, 1, 7):
+        if trx.status == "PENDING":
+            trx.status = "PROCESSING"
+            trx.save(update_fields=["status"])
+        if dep and dep.status == "PENDING":
+            dep.status = "PROCESSING"
+            dep.save(update_fields=["status"])
+
+
+class PPayProsDepositInitiateView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_scope = "deposit_initiate"
+
+    @extend_schema(
+        summary="Inisiasi deposit via PPay Pros",
+        request={
+            "application/json": {
+                "type": "object",
+                "properties": {
+                    "amount": {"type": "number", "example": 100000},
+                    "wallet_type": {"type": "string", "enum": ["BALANCE", "BALANCE_DEPOSIT"], "example": "BALANCE"},
+                    "wayCode": {"type": "string", "example": "809"},
+                    "extParam": {"type": "string", "example": "DANA"},
+                },
+                "required": ["amount"],
+            }
+        },
+    )
+    def post(self, request):
+        gs = GatewaySettings.objects.order_by("-updated_at").first()
+        enabled = bool(gs and gs.ppaypros_enabled)
+        api_url = (gs.ppaypros_api_url or "").strip() if gs else ""
+        mch_no = (gs.ppaypros_mch_no or "").strip() if gs else ""
+        app_id = (gs.ppaypros_app_id or "").strip() if gs else ""
+        private_key = (gs.ppaypros_private_key or "").strip() if gs else ""
+        app_domain = (gs.app_domain or "").strip() if gs else ""
+        default_way_code = (gs.ppaypros_way_code or "").strip() if gs else ""
+        default_ext_param = (gs.ppaypros_ext_param or "").strip() if gs else ""
+        return_url = (gs.ppaypros_return_url or "").strip() if gs else ""
+        min_deposit_amount = (gs.min_deposit_amount or Decimal("0")) if gs else Decimal("0")
+        max_deposit_amount = (gs.max_deposit_amount or Decimal("0")) if gs else Decimal("0")
+
+        if not enabled:
+            return Response({"detail": "PPay Pros tidak aktif"}, status=status.HTTP_400_BAD_REQUEST)
+        if not api_url or not mch_no or not app_id or not private_key:
+            return Response({"detail": "Konfigurasi PPay Pros belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
+        if not app_domain:
+            return Response({"detail": "Konfigurasi domain untuk callback belum diisi"}, status=status.HTTP_400_BAD_REQUEST)
+
+        wallet_type = (request.data.get("wallet_type") or gs.default_wallet_type or "BALANCE").strip().upper()
+        if wallet_type not in ("BALANCE", "BALANCE_DEPOSIT"):
+            return Response({"detail": "wallet_type tidak valid"}, status=status.HTTP_400_BAD_REQUEST)
+
+        amount_raw = request.data.get("amount")
+        try:
+            amount = Decimal(str(amount_raw)).quantize(Decimal("0.01"))
+            if amount <= 0:
+                raise InvalidOperation()
+        except Exception:
+            return Response({"detail": "amount tidak valid"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if min_deposit_amount and min_deposit_amount > 0 and amount < min_deposit_amount:
+            return Response({"detail": f"Minimal deposit adalah {min_deposit_amount}"}, status=status.HTTP_400_BAD_REQUEST)
+        if max_deposit_amount and max_deposit_amount > 0 and amount > max_deposit_amount:
+            return Response({"detail": f"Maksimal deposit adalah {max_deposit_amount}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = request.user
+        order_num = f"DPP{_now_wib().strftime('%y%m%d%H%M%S')}{uuid.uuid4().hex[:8].upper()}"
+        way_code = (request.data.get("wayCode") or default_way_code or "").strip()
+        ext_param = (request.data.get("extParam") or default_ext_param or "").strip()
+        notify_url = f"https://{app_domain}/api/deposits/ppaypros/callback/"
+
+        trx = Transaction.objects.create(
+            user=user,
+            product=None,
+            type="DEPOSIT",
+            amount=amount,
+            currency_code="IDR",
+            description=f"Deposit via PPay Pros ({wallet_type})",
+            status="PENDING",
+            wallet_type=wallet_type,
+            trx_id=order_num,
+        )
+
+        payload = {
+            "mchNo": mch_no,
+            "appId": app_id,
+            "mchOrderNo": order_num,
+            "amount": ppaypros_amount_to_points(amount),
+            "customerName": (user.full_name or user.username or f"User {user.pk}")[:64],
+            "customerEmail": (getattr(user, "email", "") or f"user{user.pk}@example.com")[:64],
+            "customerPhone": (getattr(user, "phone", "") or "")[:64],
+            "notifyUrl": notify_url,
+        }
+        if way_code:
+            payload["wayCode"] = way_code
+        if ext_param:
+            payload["extParam"] = ext_param
+        if return_url:
+            payload["returnUrl"] = return_url
+        payload["sign"] = ppaypros_generate_sign(payload, private_key)
+
+        logger.warning(
+            "PPAYPROS payin request: order=%s mchNo=***%s appId=***%s amount_points=%s wayCode=%s extParam=%s notifyUrl=%s payload=%s",
+            order_num,
+            mch_no[-6:] if mch_no else "",
+            app_id[-6:] if app_id else "",
+            payload.get("amount"),
+            payload.get("wayCode") or "",
+            payload.get("extParam") or "",
+            notify_url,
+            json.dumps(_redact_provider_payload_for_log(payload), ensure_ascii=False),
+        )
+
+        dep = Deposit.objects.create(
+            user=user,
+            gateway="PPAYPROS",
+            order_num=order_num,
+            amount=amount,
+            amount_currency_code="IDR",
+            wallet_type=wallet_type,
+            status="PENDING",
+            transaction=trx,
+            request_params=payload,
+        )
+
+        response_payload = ppaypros_post_json(f"{api_url.rstrip('/')}/api/pay/pay", payload)
+        sign_valid = None
+        if response_payload.get("sign"):
+            sign_valid = ppaypros_verify_sign(response_payload, private_key)
+            response_payload["_sign_valid"] = sign_valid
+
+        logger.warning(
+            "PPAYPROS payin response: order=%s code=%s msg=%s body=%s",
+            order_num,
+            response_payload.get("code"),
+            response_payload.get("msg"),
+            json.dumps(_redact_provider_payload_for_log(response_payload), ensure_ascii=False),
+        )
+
+        dep.response_payload = response_payload
+        dep.save(update_fields=["response_payload"])
+
+        if str(response_payload.get("code")) == "0":
+            data = ppaypros_parse_data_field(response_payload)
+            pay_data_type, pay_data, pay_order_id = ppaypros_extract_payment_data(data)
+            payment_url, _path = _extract_payment_url({"payData": pay_data, **data})
+            if payment_url:
+                dep.payment_url = payment_url
+                dep.save(update_fields=["payment_url"])
+            return Response(
+                {
+                    "order_num": order_num,
+                    "payment_url": payment_url or None,
+                    "pay_order_id": pay_order_id or None,
+                    "pay_data_type": pay_data_type or None,
+                    "pay_data": pay_data or None,
+                    "provider": response_payload,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        _ppaypros_mark_deposit_failed(trx, dep)
+        logger.warning(
+            "PPAYPROS payin rejected locally: order=%s detail=%s provider=%s",
+            order_num,
+            response_payload.get("msg") or "PPay Pros payin gagal",
+            json.dumps(_redact_provider_payload_for_log(response_payload), ensure_ascii=False),
+        )
+        return Response(
+            {"detail": response_payload.get("msg") or "PPay Pros payin gagal", "provider": response_payload},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class PPayProsDepositCallbackView(APIView):
+    permission_classes = [permissions.AllowAny]
+    throttle_scope = "gateway_callback"
+
+    def post(self, request):
+        gs = GatewaySettings.objects.order_by("-updated_at").first()
+        private_key = (gs.ppaypros_private_key or "").strip() if gs else ""
+        payload = _ppaypros_collect_payload(request)
+        order_num = str(payload.get("mchOrderNo") or "").strip()
+        if not order_num:
+            return HttpResponse("success", content_type="text/plain")
+
+        trx = Transaction.objects.filter(trx_id=order_num).first()
+        if not trx:
+            return HttpResponse("success", content_type="text/plain")
+
+        dep = Deposit.objects.filter(order_num=order_num, gateway="PPAYPROS").first()
+        sign_valid = ppaypros_verify_sign(payload, private_key) if private_key else False
+        if dep:
+            callback_payload = dict(payload)
+            callback_payload["_sign_valid"] = sign_valid
+            dep.callback_payload = callback_payload
+            dep.callback_at = timezone.now()
+            dep.save(update_fields=["callback_payload", "callback_at"])
+
+        if not sign_valid:
+            return HttpResponse("success", content_type="text/plain")
+
+        _ppaypros_apply_payin_state(
+            trx,
+            dep,
+            payload.get("state") or payload.get("orderState"),
+            amount_points=payload.get("amount"),
+        )
+        return HttpResponse("success", content_type="text/plain")
+
+
+class PPayProsDepositQueryView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_scope = "deposit_initiate"
+
+    @extend_schema(
+        summary="Query status deposit PPay Pros",
+        request={
+            "application/json": {
+                "type": "object",
+                "properties": {
+                    "order_num": {"type": "string", "example": "DPP260716123456ABCD1234"},
+                    "payOrderId": {"type": "string", "example": "P1234567890"},
+                },
+            }
+        },
+    )
+    def post(self, request):
+        gs = GatewaySettings.objects.order_by("-updated_at").first()
+        enabled = bool(gs and gs.ppaypros_enabled)
+        api_url = (gs.ppaypros_api_url or "").strip() if gs else ""
+        mch_no = (gs.ppaypros_mch_no or "").strip() if gs else ""
+        app_id = (gs.ppaypros_app_id or "").strip() if gs else ""
+        private_key = (gs.ppaypros_private_key or "").strip() if gs else ""
+        if not enabled:
+            return Response({"detail": "PPay Pros tidak aktif"}, status=status.HTTP_400_BAD_REQUEST)
+        if not api_url or not mch_no or not app_id or not private_key:
+            return Response({"detail": "Konfigurasi PPay Pros belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
+
+        order_num = (request.data.get("order_num") or request.data.get("mchOrderNo") or "").strip()
+        pay_order_id = (request.data.get("payOrderId") or "").strip()
+        if not order_num and not pay_order_id:
+            return Response({"detail": "order_num atau payOrderId wajib diisi"}, status=status.HTTP_400_BAD_REQUEST)
+        if not request.user.is_staff and not order_num:
+            return Response({"detail": "User biasa wajib mengirim order_num"}, status=status.HTTP_400_BAD_REQUEST)
+
+        dep = None
+        if order_num:
+            dep_qs = Deposit.objects.filter(order_num=order_num, gateway="PPAYPROS")
+            if not request.user.is_staff:
+                dep_qs = dep_qs.filter(user=request.user)
+            dep = dep_qs.select_related("transaction").first()
+            if not dep:
+                return Response({"detail": "Deposit tidak ditemukan"}, status=status.HTTP_404_NOT_FOUND)
+
+        payload = {"mchNo": mch_no, "appId": app_id}
+        if pay_order_id:
+            payload["payOrderId"] = pay_order_id
+        if order_num:
+            payload["mchOrderNo"] = order_num
+        payload["sign"] = ppaypros_generate_sign(payload, private_key)
+
+        response_payload = ppaypros_post_json(f"{api_url.rstrip('/')}/api/pay/query", payload)
+        if response_payload.get("sign"):
+            response_payload["_sign_valid"] = ppaypros_verify_sign(response_payload, private_key)
+        data = ppaypros_parse_data_field(response_payload)
+
+        if not dep:
+            remote_order_num = str(data.get("mchOrderNo") or "").strip()
+            dep_qs = Deposit.objects.filter(order_num=remote_order_num, gateway="PPAYPROS")
+            if not request.user.is_staff:
+                dep_qs = dep_qs.filter(user=request.user)
+            dep = dep_qs.select_related("transaction").first()
+            if not dep:
+                return Response({"detail": "Deposit tidak ditemukan"}, status=status.HTTP_404_NOT_FOUND)
+
+        dep.response_payload = {
+            **(dep.response_payload if isinstance(dep.response_payload, dict) else {}),
+            "_last_query": response_payload,
+        }
+        dep.save(update_fields=["response_payload"])
+
+        if str(response_payload.get("code")) == "0":
+            _ppaypros_apply_payin_state(
+                dep.transaction,
+                dep,
+                data.get("state") or data.get("orderState"),
+                amount_points=data.get("amount"),
+            )
+
+        return Response(
+            {
+                "local_status": dep.status,
+                "order_num": dep.order_num,
+                "provider": response_payload,
+                "provider_data": data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
 class DepositTransactionsListView(APIView):
     permission_classes = [permissions.IsAuthenticated]
     throttle_scope = 'transactions'
@@ -1764,7 +2167,7 @@ class DepositTransactionsListView(APIView):
             OpenApiParameter(name='wallet_type', type=str, description='Filter wallet (BALANCE/BALANCE_DEPOSIT)'),
             OpenApiParameter(name='start_date', type=str, description='Tanggal mulai (YYYY-MM-DD)'),
             OpenApiParameter(name='end_date', type=str, description='Tanggal akhir (YYYY-MM-DD)'),
-            OpenApiParameter(name='gateway', type=str, description='Filter gateway (JAYAPAY/KLIKPAY/USD_GATEWAY)'),
+            OpenApiParameter(name='gateway', type=str, description='Filter gateway (JAYAPAY/KLIKPAY/USD_GATEWAY/PPAYPROS)'),
             OpenApiParameter(name='order_num', type=str, description='Filter berdasarkan nomor order'),
             OpenApiParameter(name='page', type=int, description='A page number within the paginated result set.'),
         ],

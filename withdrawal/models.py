@@ -40,6 +40,13 @@ class WithdrawalSettings(models.Model):
     jayapay_ph_payout_api_url = models.CharField(max_length=255, blank=True, default='')
     jayapay_ph_payout_fee_type = models.PositiveSmallIntegerField(default=1, help_text='0: fee deduct in order; 1: handling fee calculated separately')
 
+    ppaypros_payout_enabled = models.BooleanField(default=False)
+    ppaypros_payout_api_url = models.CharField(max_length=255, blank=True, default='https://pay.ppaypros.com')
+    ppaypros_payout_mch_no = models.CharField(max_length=100, blank=True, default='')
+    ppaypros_payout_app_id = models.CharField(max_length=100, blank=True, default='')
+    ppaypros_payout_private_key = models.CharField(max_length=255, blank=True, default='', help_text='Private key/sign key untuk MD5 signature')
+    ppaypros_payout_entry_type = models.CharField(max_length=32, blank=True, default='BANK_CARD', help_text='Default entryType payout, contoh: BANK_CARD')
+
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -201,6 +208,21 @@ class UsdPayoutWithdrawal(models.Model):
 
     def __str__(self):
         return f"USD payout for Withdrawal #{self.withdrawal.pk}"
+
+
+class PPayProsWithdrawal(models.Model):
+    withdrawal = models.OneToOneField(Withdrawal, on_delete=models.CASCADE, related_name='ppaypros_withdrawal')
+    request_params = models.JSONField(default=dict)
+    response_payload = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'withdrawal_ppaypros'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"PPay Pros payout for Withdrawal #{self.withdrawal.pk}"
 
 
 class WithdrawalJayapay(Withdrawal):
