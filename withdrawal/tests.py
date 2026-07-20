@@ -7,6 +7,7 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from banks.models import Bank, UserBank
+from deposits.integrations.atpay import sign_payload as atpay_sign_payload
 from deposits.integrations.ppaypros import generate_sign
 from products.models import Transaction
 from .models import Withdrawal, WithdrawalSettings
@@ -187,6 +188,88 @@ class PPayProsWithdrawalCallbackTest(TestCase):
         payload["sign"] = generate_sign(payload, "SECRET123")
 
         response = self.client.post("/api/withdrawals/ppaypros/callback/", payload)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content.decode().strip(), "success")
+
+        withdrawal.refresh_from_db()
+        trx.refresh_from_db()
+
+        self.assertEqual(withdrawal.status, "COMPLETED")
+        self.assertEqual(trx.status, "COMPLETED")
+
+
+class AtpayWithdrawalCallbackTest(TestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.user = User.objects.create_user(
+            username="wd-atpay",
+            phone="81110000010",
+            email="wd-atpay@example.com",
+            password="pass123",
+        )
+        self.bank = Bank.objects.create(
+            code="BCA",
+            name="BCA",
+            min_withdrawal=Decimal("0"),
+            max_withdrawal=Decimal("0"),
+            withdrawal_fee=Decimal("0"),
+            withdrawal_fee_fixed=Decimal("0"),
+        )
+        self.user_bank = UserBank.objects.create(
+            user=self.user,
+            bank=self.bank,
+            account_name="Payout User",
+            account_number="1234567890",
+            is_default=True,
+        )
+        self.settings = WithdrawalSettings.objects.create(
+            is_active=True,
+            require_bank_account=True,
+            balance_source="balance",
+            require_withdraw_service=False,
+            atpay_payout_enabled=True,
+            atpay_payout_api_url="https://test.wowpay.biz",
+            atpay_payout_merchant_no="M123",
+            atpay_payout_sign_type="MD5",
+            atpay_payout_secret_key="ATPAYSECRET",
+        )
+        self.client = APIClient()
+
+    def test_callback_updates_withdrawal_status(self):
+        trx = Transaction.objects.create(
+            user=self.user,
+            product=None,
+            upline_user=None,
+            trx_id="WD-ATPAY12345",
+            type="WITHDRAW",
+            amount=Decimal("50.00"),
+            description="Withdrawal request",
+            status="PENDING",
+            wallet_type="BALANCE",
+        )
+        withdrawal = Withdrawal.objects.create(
+            user=self.user,
+            bank_account=self.user_bank,
+            amount=Decimal("50.00"),
+            fee=Decimal("0.00"),
+            net_amount=Decimal("50.00"),
+            status="PENDING",
+            transaction=trx,
+        )
+
+        payload = {
+            "merchant_no": "M123",
+            "out_trade_sn": trx.trx_id,
+            "order_sn": "ATP-PAYOUT-001",
+            "amount": "50.00",
+            "pay_time": "2026-07-20 01:41:26",
+            "trade_status": "success",
+            "sign_type": "MD5",
+        }
+        payload["sign"] = atpay_sign_payload(payload, "MD5", secret_key="ATPAYSECRET")
+
+        response = self.client.post("/api/withdrawals/atpay/callback/", payload)
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.content.decode().strip(), "success")

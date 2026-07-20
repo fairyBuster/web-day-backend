@@ -3,7 +3,7 @@ from django.conf import settings
 from django.urls import path, reverse
 from django.shortcuts import redirect
 from django.template.response import TemplateResponse
-from .models import Withdrawal, WithdrawalSettings, WithdrawalJayapay, WithdrawalService, UsdPayoutWithdrawal, JayapayPhPayoutWithdrawal, PPayProsWithdrawal
+from .models import Withdrawal, WithdrawalSettings, WithdrawalJayapay, WithdrawalService, UsdPayoutWithdrawal, JayapayPhPayoutWithdrawal, PPayProsWithdrawal, AtpayWithdrawal
 from .integrations.jayapay import build_params, sign_params, sign_params_legacy, send_cash_request
 from .integrations.jayapay_banks import JAYAPAY_BANKS
 from .integrations.jayapay_ph_banks import JAYAPAY_PH_PAYOUT_BANKS
@@ -11,6 +11,7 @@ from .integrations.ppaypros_bank_codes import PPAYPROS_PAYOUT_CODES
 from .integrations.usd_payout import build_payload as usd_build_payload, sign_hmac_sha256_then_rsa_base64, send_single_order
 from .integrations.ppaypros import build_payout_payload as ppaypros_build_payout_payload, map_payout_state as ppaypros_map_payout_state
 from deposits.integrations.ppaypros import amount_to_points as ppaypros_amount_to_points, generate_sign as ppaypros_generate_sign, parse_data_field as ppaypros_parse_data_field, post_json as ppaypros_post_json, verify_sign as ppaypros_verify_sign
+from deposits.integrations.atpay import build_bank_code_payload as atpay_build_bank_code_payload, build_payout_payload as atpay_build_payout_payload, build_payout_query_payload as atpay_build_payout_query_payload, map_payout_trade_status as atpay_map_payout_trade_status, normalize_amount as atpay_normalize_amount, normalize_sign_type as atpay_normalize_sign_type, post_json as atpay_post_json, sign_payload as atpay_sign_payload, verify_payload as atpay_verify_payload
 from django.utils.html import format_html
 import json
 import logging
@@ -49,6 +50,38 @@ def _redact_for_log(value):
 
 
 PPAYPROS_PAYOUT_CODE_SET = {item["code"] for item in PPAYPROS_PAYOUT_CODES if item.get("code")}
+
+
+def _fetch_atpay_bank_codes(gs):
+    enabled = bool(gs and getattr(gs, "atpay_payout_enabled", False))
+    api_url = (getattr(gs, "atpay_payout_api_url", "") or "").strip() if gs else ""
+    merchant_no = (getattr(gs, "atpay_payout_merchant_no", "") or "").strip() if gs else ""
+    sign_type = atpay_normalize_sign_type((getattr(gs, "atpay_payout_sign_type", "") or "MD5").strip() if gs else "MD5")
+    secret_key = (getattr(gs, "atpay_payout_secret_key", "") or "").strip() if gs else ""
+    private_key = (getattr(gs, "atpay_payout_private_key", "") or "").strip() if gs else ""
+    if not enabled or not api_url or not merchant_no:
+        return [], ""
+    if sign_type == "MD5" and not secret_key:
+        return [], "Secret key ATPAY payout belum diisi"
+    if sign_type == "MD5withRsa" and not private_key:
+        return [], "Private key ATPAY payout belum diisi"
+    try:
+        payload = atpay_build_bank_code_payload(merchant_no=merchant_no, sign_type=sign_type)
+        payload["sign"] = atpay_sign_payload(payload, sign_type, secret_key=secret_key, private_key=private_key)
+        response_payload = atpay_post_json(f"{api_url.rstrip('/')}/gw-api/bank-code", payload)
+        if str(response_payload.get("code") or "").strip() != "100":
+            return [], str(response_payload.get("message") or "Gagal mengambil bank code ATPAY")
+        items = response_payload.get("data") if isinstance(response_payload.get("data"), list) else []
+        results = []
+        for item in items:
+            bank_code = str(item.get("bank_code") or "").strip()
+            bank_name = str(item.get("bank_name") or "").strip()
+            if bank_code:
+                results.append({"bank_code": bank_code, "bank_name": bank_name})
+        return results, ""
+    except Exception as exc:
+        logger.warning("Failed to fetch ATPAY bank codes: %s", exc, exc_info=True)
+        return [], str(exc)
 
 
 @admin.register(Withdrawal)
@@ -108,6 +141,11 @@ class WithdrawalAdmin(admin.ModelAdmin):
                 '<int:pk>/process-ppaypros/',
                 self.admin_site.admin_view(self.process_ppaypros_view),
                 name='withdrawal_withdrawal_process_ppaypros',
+            ),
+            path(
+                '<int:pk>/process-atpay/',
+                self.admin_site.admin_view(self.process_atpay_view),
+                name='withdrawal_withdrawal_process_atpay',
             ),
         ]
         return custom + urls
@@ -581,9 +619,135 @@ class WithdrawalAdmin(admin.ModelAdmin):
 
         return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
 
+    def process_atpay_view(self, request, pk: int):
+        try:
+            wd = Withdrawal.objects.select_related('bank_account__bank', 'user', 'transaction').get(pk=pk)
+        except Withdrawal.DoesNotExist:
+            self.message_user(request, 'Withdrawal tidak ditemukan', level=messages.ERROR)
+            return redirect(reverse('admin:withdrawal_withdrawal_changelist'))
+
+        gs = WithdrawalSettings.objects.order_by("-updated_at").first()
+        enabled = bool(gs and getattr(gs, "atpay_payout_enabled", False))
+        api_url = (getattr(gs, "atpay_payout_api_url", "") or "").strip() if gs else ""
+        merchant_no = (getattr(gs, "atpay_payout_merchant_no", "") or "").strip() if gs else ""
+        sign_type = atpay_normalize_sign_type((getattr(gs, "atpay_payout_sign_type", "") or "MD5").strip() if gs else "MD5")
+        secret_key = (getattr(gs, "atpay_payout_secret_key", "") or "").strip() if gs else ""
+        private_key = (getattr(gs, "atpay_payout_private_key", "") or "").strip() if gs else ""
+        public_key = (getattr(gs, "atpay_payout_public_key", "") or "").strip() if gs else ""
+        app_domain = (getattr(gs, "app_domain", "") or "").strip() if gs else ""
+        if not app_domain:
+            try:
+                from deposits.models import GatewaySettings
+                ggs = GatewaySettings.objects.order_by("-updated_at").first()
+                app_domain = (getattr(ggs, "app_domain", "") or "").strip() if ggs else ""
+            except Exception:
+                app_domain = ""
+
+        if not enabled:
+            self.message_user(request, 'ATPAY payout tidak aktif', level=messages.ERROR)
+            return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+        if not api_url or not merchant_no or not app_domain:
+            self.message_user(request, 'Konfigurasi ATPAY payout belum lengkap', level=messages.ERROR)
+            return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+        if sign_type == "MD5" and not secret_key:
+            self.message_user(request, 'Secret key ATPAY payout belum diisi', level=messages.ERROR)
+            return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+        if sign_type == "MD5withRsa" and (not private_key or not public_key):
+            self.message_user(request, 'Private/Public key ATPAY payout belum lengkap', level=messages.ERROR)
+            return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+
+        if request.method == "POST":
+            atpay_bank_codes, atpay_bank_codes_error = _fetch_atpay_bank_codes(gs)
+            atpay_bank_code_set = {
+                item["bank_code"]
+                for item in atpay_bank_codes
+                if item.get("bank_code")
+            }
+            trade_account = (request.POST.get("tradeAccount") or (wd.bank_account.account_name if wd.bank_account else "")).strip()
+            trade_number = (request.POST.get("tradeNumber") or (wd.bank_account.account_number if wd.bank_account else "")).strip()
+            bank_code = (request.POST.get("bankCode") or (wd.bank_account.bank.code if wd.bank_account and wd.bank_account.bank else "")).strip()
+            mobile = (request.POST.get("mobile") or getattr(wd.bank_account, 'phone', '') or getattr(wd.user, 'phone', '') or '').strip()
+            email = (request.POST.get("email") or getattr(wd.user, 'email', '') or f"user{wd.user_id}@example.com").strip()
+            identity = (request.POST.get("identity") or '').strip()
+            amount_raw = (request.POST.get("amount") or '').strip() or str(wd.net_amount or wd.amount)
+            attach = (request.POST.get("attach") or f"withdrawal:{wd.id}").strip()
+
+            if not trade_account or not trade_number or not amount_raw:
+                self.message_user(request, 'tradeAccount, tradeNumber, amount wajib diisi', level=messages.ERROR)
+                return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+            if atpay_bank_code_set and not bank_code:
+                self.message_user(request, 'Bank Code ATPAY wajib dipilih', level=messages.ERROR)
+                return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+            if atpay_bank_code_set and bank_code not in atpay_bank_code_set:
+                self.message_user(request, 'Bank Code ATPAY tidak valid', level=messages.ERROR)
+                return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+            if atpay_bank_codes_error and not atpay_bank_codes and bank_code:
+                self.message_user(request, f'Gagal validasi daftar bank ATPAY: {atpay_bank_codes_error}', level=messages.ERROR)
+                return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+
+            try:
+                amount = atpay_normalize_amount(amount_raw)
+                if amount <= 0:
+                    raise InvalidOperation()
+            except Exception:
+                self.message_user(request, 'Amount tidak valid', level=messages.ERROR)
+                return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+
+            out_trade_sn = wd.transaction.trx_id if wd.transaction else f"WAT{wd.id}{int(time.time())}"
+            payload = atpay_build_payout_payload(
+                merchant_no=merchant_no,
+                out_trade_sn=out_trade_sn[:50],
+                amount=amount,
+                trade_account=trade_account,
+                trade_number=trade_number,
+                bank_code=bank_code,
+                mobile=mobile,
+                email=email,
+                identity=identity,
+                attach=attach,
+                notify_url=f"https://{app_domain}/api/withdrawals/atpay/callback/",
+                sign_type=sign_type,
+            )
+            payload["sign"] = atpay_sign_payload(payload, sign_type, secret_key=secret_key, private_key=private_key)
+
+            trace, _ = AtpayWithdrawal.objects.get_or_create(withdrawal=wd, defaults={"request_params": payload})
+            if trace and not trace.request_params:
+                trace.request_params = payload
+                trace.save(update_fields=["request_params"])
+
+            response_payload = atpay_post_json(f"{api_url.rstrip('/')}/gw-api/payout/create", payload)
+            if response_payload.get("sign"):
+                response_payload["_sign_valid"] = atpay_verify_payload(
+                    response_payload,
+                    response_payload.get("sign_type") or sign_type,
+                    secret_key=secret_key,
+                    public_key=public_key,
+                )
+            trace.response_payload = {"initiate": _redact_for_log(response_payload)}
+            trace.save(update_fields=["response_payload"])
+
+            if str(response_payload.get("code") or "").strip() == "100":
+                wd.status = 'PROCESSING'
+                wd.save(update_fields=['status'])
+                self.message_user(request, f"Withdrawal #{wd.id} dikirim ke ATPAY", level=messages.SUCCESS)
+                return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+
+            wd.status = 'REJECTED'
+            wd.save(update_fields=['status'])
+            self.message_user(request, f"ATPAY gagal: {response_payload.get('message') or response_payload}", level=messages.ERROR)
+            return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+
+        return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+
     def render_change_form(self, request, context, add=False, change=False, form_url='', obj=None):
         if obj:
             gs = WithdrawalSettings.objects.order_by("-updated_at").first()
+            atpay_bank_codes, atpay_bank_codes_error = _fetch_atpay_bank_codes(gs)
+            atpay_bank_code_set = {
+                item["bank_code"]
+                for item in atpay_bank_codes
+                if item.get("bank_code")
+            }
             ph_allowed_codes = {b.get("bankCode") for b in (JAYAPAY_PH_PAYOUT_BANKS or []) if b.get("bankCode")}
             ph_bank_code_default = obj.bank_account.bank.code if obj.bank_account else ""
             if ph_allowed_codes and ph_bank_code_default not in ph_allowed_codes:
@@ -591,6 +755,9 @@ class WithdrawalAdmin(admin.ModelAdmin):
             ppaypros_code_default = obj.bank_account.bank.code if obj.bank_account and obj.bank_account.bank else ""
             if PPAYPROS_PAYOUT_CODE_SET and ppaypros_code_default not in PPAYPROS_PAYOUT_CODE_SET:
                 ppaypros_code_default = ""
+            atpay_code_default = obj.bank_account.bank.code if obj.bank_account and obj.bank_account.bank else ""
+            if atpay_bank_code_set and atpay_code_default not in atpay_bank_code_set:
+                atpay_code_default = ""
             initial = {
                 'bankCode': obj.bank_account.bank.code if obj.bank_account else '',
                 'accountNumber': obj.bank_account.account_number if obj.bank_account else '',
@@ -626,6 +793,20 @@ class WithdrawalAdmin(admin.ModelAdmin):
                 'ppaypros_wallet_codes': [item for item in PPAYPROS_PAYOUT_CODES if item.get('category') == 'wallet'],
                 'ppaypros_bank_codes': [item for item in PPAYPROS_PAYOUT_CODES if item.get('category') == 'bank'],
                 'process_ppaypros_url': reverse('admin:withdrawal_withdrawal_process_ppaypros', args=(obj.id,)),
+                'atpay_enabled': bool(gs and getattr(gs, "atpay_payout_enabled", False)),
+                'atpay_initial': {
+                    'bankCode': atpay_code_default,
+                    'tradeNumber': obj.bank_account.account_number if obj.bank_account else '',
+                    'tradeAccount': obj.bank_account.account_name if obj.bank_account else '',
+                    'mobile': (getattr(obj.bank_account, 'phone', '') or getattr(obj.user, 'phone', '') or '').strip(),
+                    'email': getattr(obj.user, 'email', '') or f"user{obj.user_id}@example.com",
+                    'identity': '',
+                    'amount': str(obj.net_amount or obj.amount),
+                    'attach': f"withdrawal:{obj.id}",
+                },
+                'atpay_bank_codes': atpay_bank_codes,
+                'atpay_bank_codes_error': atpay_bank_codes_error,
+                'process_atpay_url': reverse('admin:withdrawal_withdrawal_process_atpay', args=(obj.id,)),
                 'usd_payout_initial': {
                     'bankCode': '',
                     'accNo': obj.bank_account.account_number if obj.bank_account else '',
@@ -717,6 +898,7 @@ class WithdrawalSettingsAdmin(admin.ModelAdmin):
         'jayapay_enabled',
         'jayapay_ph_payout_enabled',
         'ppaypros_payout_enabled',
+        'atpay_payout_enabled',
         'updated_at',
     )
     list_filter = ('is_active',)
@@ -773,6 +955,17 @@ class WithdrawalSettingsAdmin(admin.ModelAdmin):
                 'ppaypros_payout_app_id',
                 'ppaypros_payout_private_key',
                 'ppaypros_payout_entry_type',
+            )
+        }),
+        ('ATPAY Payout', {
+            'fields': (
+                'atpay_payout_enabled',
+                'atpay_payout_api_url',
+                'atpay_payout_merchant_no',
+                'atpay_payout_sign_type',
+                'atpay_payout_secret_key',
+                'atpay_payout_private_key',
+                'atpay_payout_public_key',
             )
         }),
     )

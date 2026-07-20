@@ -5,12 +5,12 @@ from .models import GatewaySettings, Deposit
 @admin.register(GatewaySettings)
 class GatewaySettingsAdmin(admin.ModelAdmin):
     list_display = (
-        'default_wallet_type', 'app_domain', 'min_deposit_amount', 'max_deposit_amount', 'usd_gateway_min_deposit_amount', 'usd_gateway_max_deposit_amount', 'jayapay_enabled', 'jayapay_ph_enabled', 'klikpay_enabled', 'usd_gateway_enabled', 'ppaypros_enabled', 'updated_at'
+        'default_wallet_type', 'app_domain', 'min_deposit_amount', 'max_deposit_amount', 'usd_gateway_min_deposit_amount', 'usd_gateway_max_deposit_amount', 'jayapay_enabled', 'jayapay_ph_enabled', 'klikpay_enabled', 'usd_gateway_enabled', 'ppaypros_enabled', 'clienthub_enabled', 'sitransferhub_enabled', 'atpay_enabled', 'updated_at'
     )
     readonly_fields = ('updated_at',)
     fieldsets = (
         ('Global', {
-            'fields': ('default_wallet_type', 'app_domain', 'min_deposit_amount', 'max_deposit_amount', 'jayapay_enabled', 'jayapay_ph_enabled', 'klikpay_enabled', 'usd_gateway_enabled', 'ppaypros_enabled')
+            'fields': ('default_wallet_type', 'app_domain', 'min_deposit_amount', 'max_deposit_amount', 'jayapay_enabled', 'jayapay_ph_enabled', 'klikpay_enabled', 'usd_gateway_enabled', 'ppaypros_enabled', 'clienthub_enabled', 'sitransferhub_enabled', 'atpay_enabled')
         }),
         ('Jayapay', {
             'fields': (
@@ -70,6 +70,38 @@ class GatewaySettingsAdmin(admin.ModelAdmin):
                 'ppaypros_return_url',
             ),
             'description': 'Konfigurasi PPay Pros untuk payin/deposit. Callback memakai app_domain dan endpoint statis.',
+        }),
+        ('ClientHub', {
+            'fields': (
+                'clienthub_base_url',
+                'clienthub_client_id',
+                'clienthub_secret_key',
+                'clienthub_method',
+                'clienthub_return_url',
+                'clienthub_expired_minutes',
+            ),
+            'description': 'Konfigurasi ClientHub/Tripay Hub. Signature request dan callback memakai HMAC SHA256 sesuai `clienthub.md`.',
+        }),
+        ('SiTransfer Hub', {
+            'fields': (
+                'sitransferhub_base_url',
+                'sitransferhub_client_id',
+                'sitransferhub_secret_key',
+                'sitransferhub_channel',
+            ),
+            'description': 'Konfigurasi SiTransfer Hub. Signature request dan callback memakai HMAC SHA256 sesuai `clienthubqris.md`.',
+        }),
+        ('ATPAY', {
+            'fields': (
+                'atpay_api_url',
+                'atpay_merchant_no',
+                'atpay_sign_type',
+                'atpay_secret_key',
+                'atpay_private_key',
+                'atpay_public_key',
+                'atpay_return_url',
+            ),
+            'description': 'Konfigurasi ATPAY untuk deposit. Pilih `MD5` atau `MD5withRsa` sesuai kredensial merchant.',
         }),
     )
 

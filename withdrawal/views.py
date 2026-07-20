@@ -13,7 +13,7 @@ from rest_framework.views import APIView
 from django.http import HttpResponse
 
 from .integrations.jayapay import build_params, sign_params_legacy, send_cash_request
-from .models import JayapayWithdrawal, JayapayPhPayoutWithdrawal, UsdPayoutWithdrawal, PPayProsWithdrawal
+from .models import JayapayWithdrawal, JayapayPhPayoutWithdrawal, UsdPayoutWithdrawal, PPayProsWithdrawal, AtpayWithdrawal
 from products.models import Transaction
 from products.serializers import TransactionSerializer
 from django.db.models import Q
@@ -26,6 +26,17 @@ import requests
 from .integrations.usd_payout import build_payload as usd_build_payload, sign_hmac_sha256, sign_hmac_sha256_then_rsa_base64, send_single_order
 from .integrations.ppaypros import build_payout_payload as ppaypros_build_payout_payload, map_payout_state as ppaypros_map_payout_state, normalize_amount as ppaypros_normalize_amount
 from deposits.integrations.ppaypros import amount_to_points as ppaypros_amount_to_points, generate_sign as ppaypros_generate_sign, parse_data_field as ppaypros_parse_data_field, post_json as ppaypros_post_json, verify_sign as ppaypros_verify_sign
+from deposits.integrations.atpay import (
+    build_bank_code_payload as atpay_build_bank_code_payload,
+    build_payout_payload as atpay_build_payout_payload,
+    build_payout_query_payload as atpay_build_payout_query_payload,
+    map_payout_trade_status as atpay_map_payout_trade_status,
+    normalize_amount as atpay_normalize_amount,
+    normalize_sign_type as atpay_normalize_sign_type,
+    post_json as atpay_post_json,
+    sign_payload as atpay_sign_payload,
+    verify_payload as atpay_verify_payload,
+)
 from deposits.utils import verify_jayapay_signature
 from .integrations.jayapay_ph_banks import JAYAPAY_PH_PAYOUT_BANKS
 
@@ -759,6 +770,244 @@ class JayapayPhPayoutBanksView(APIView):
                 if q in str(it.get("bankCode") or "").lower() or q in str(it.get("bankName") or "").lower()
             ]
         return Response({"count": len(items), "results": items})
+
+
+def _atpay_store_trace(trace: AtpayWithdrawal | None, payload: dict):
+    if not trace:
+        return
+    current = trace.response_payload if isinstance(trace.response_payload, dict) else {}
+    current.update(payload or {})
+    trace.response_payload = current
+    trace.save(update_fields=["response_payload"])
+
+
+class AtpayPayoutInitiateView(APIView):
+    permission_classes = [permissions.IsAdminUser]
+    throttle_scope = "withdraw_admin_initiate"
+
+    @extend_schema(summary="Inisiasi withdraw otomatis via ATPAY (admin)")
+    def post(self, request, pk: int):
+        gs = WithdrawalSettings.objects.order_by("-updated_at").first()
+        enabled = bool(gs and gs.atpay_payout_enabled)
+        api_url = (gs.atpay_payout_api_url or "").strip() if gs else ""
+        merchant_no = (gs.atpay_payout_merchant_no or "").strip() if gs else ""
+        sign_type = atpay_normalize_sign_type((gs.atpay_payout_sign_type or "MD5").strip() if gs else "MD5")
+        secret_key = (gs.atpay_payout_secret_key or "").strip() if gs else ""
+        private_key = (gs.atpay_payout_private_key or "").strip() if gs else ""
+        public_key = (gs.atpay_payout_public_key or "").strip() if gs else ""
+        app_domain = _resolve_app_domain(gs)
+
+        if not enabled:
+            return Response({"detail": "ATPAY payout tidak aktif"}, status=status.HTTP_400_BAD_REQUEST)
+        if not api_url or not merchant_no:
+            return Response({"detail": "Konfigurasi ATPAY payout belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
+        if sign_type == "MD5" and not secret_key:
+            return Response({"detail": "Secret key ATPAY payout belum diisi"}, status=status.HTTP_400_BAD_REQUEST)
+        if sign_type == "MD5withRsa" and (not private_key or not public_key):
+            return Response({"detail": "Private/Public key ATPAY payout belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
+        if not app_domain:
+            return Response({"detail": "Konfigurasi domain untuk callback belum diisi"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            wd = Withdrawal.objects.select_related("user", "bank_account__bank", "transaction").get(pk=pk)
+        except Withdrawal.DoesNotExist:
+            return Response({"detail": "Withdrawal tidak ditemukan"}, status=status.HTTP_404_NOT_FOUND)
+
+        if wd.status not in ("PENDING", "PROCESSING"):
+            return Response({"detail": "Status withdrawal tidak valid untuk inisiasi"}, status=status.HTTP_400_BAD_REQUEST)
+
+        trade_account = (request.data.get("tradeAccount") or getattr(wd.bank_account, "account_name", "") or "").strip()
+        trade_number = (request.data.get("tradeNumber") or getattr(wd.bank_account, "account_number", "") or "").strip()
+        bank_code = (request.data.get("bankCode") or getattr(getattr(wd, "bank_account", None), "bank", None) and wd.bank_account.bank.code or "").strip()
+        mobile = (request.data.get("mobile") or getattr(wd.bank_account, "phone", "") or getattr(wd.user, "phone", "") or "").strip()
+        email = (request.data.get("email") or getattr(wd.user, "email", "") or f"user{wd.user_id}@example.com").strip()
+        identity = (request.data.get("identity") or "").strip()
+        attach = (request.data.get("attach") or f"withdrawal:{wd.pk}").strip()
+        ifsc = (request.data.get("ifsc") or "").strip()
+        pix = (request.data.get("pix") or "").strip()
+        pix_type = (request.data.get("pixType") or "").strip()
+
+        if not trade_account or not trade_number:
+            return Response({"detail": "tradeAccount dan tradeNumber wajib diisi"}, status=status.HTTP_400_BAD_REQUEST)
+
+        amount_raw = request.data.get("amount")
+        try:
+            amount = atpay_normalize_amount(amount_raw) if amount_raw is not None else atpay_normalize_amount(wd.net_amount or wd.amount)
+            if amount <= 0:
+                raise InvalidOperation()
+        except Exception:
+            return Response({"detail": "amount tidak valid"}, status=status.HTTP_400_BAD_REQUEST)
+
+        out_trade_sn = getattr(getattr(wd, "transaction", None), "trx_id", None) or f"WAT{wd.pk}{int(pytime.time())}"
+        payload = atpay_build_payout_payload(
+            merchant_no=merchant_no,
+            out_trade_sn=out_trade_sn[:50],
+            amount=amount,
+            trade_account=trade_account,
+            trade_number=trade_number,
+            bank_code=bank_code,
+            mobile=mobile,
+            email=email,
+            identity=identity,
+            attach=attach,
+            pix=pix,
+            pix_type=pix_type,
+            ifsc=ifsc,
+            notify_url=f"https://{app_domain}/api/withdrawals/atpay/callback/",
+            sign_type=sign_type,
+        )
+        payload["sign"] = atpay_sign_payload(payload, sign_type, secret_key=secret_key, private_key=private_key)
+
+        trace, _ = AtpayWithdrawal.objects.get_or_create(withdrawal=wd, defaults={"request_params": payload})
+        if trace and not trace.request_params:
+            trace.request_params = payload
+            trace.save(update_fields=["request_params"])
+
+        response_payload = atpay_post_json(f"{api_url.rstrip('/')}/gw-api/payout/create", payload)
+        if response_payload.get("sign"):
+            response_payload["_sign_valid"] = atpay_verify_payload(
+                response_payload,
+                response_payload.get("sign_type") or sign_type,
+                secret_key=secret_key,
+                public_key=public_key,
+            )
+        _atpay_store_trace(trace, {"initiate": response_payload})
+
+        if str(response_payload.get("code") or "").strip() == "100":
+            wd.status = "PROCESSING"
+            wd.save(update_fields=["status"])
+            return Response({"gateway": response_payload, "provider_data": response_payload.get("data") or {}}, status=status.HTTP_200_OK)
+
+        wd.status = "REJECTED"
+        wd.save(update_fields=["status"])
+        return Response({"detail": response_payload.get("message") or "Payout gagal", "gateway": response_payload}, status=status.HTTP_400_BAD_REQUEST)
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class AtpayPayoutCallbackView(generics.GenericAPIView):
+    permission_classes = [permissions.AllowAny]
+    throttle_scope = "gateway_callback"
+
+    @extend_schema(summary="Callback ATPAY untuk update status withdraw")
+    def post(self, request, *args, **kwargs):
+        gs = WithdrawalSettings.objects.order_by("-updated_at").first()
+        secret_key = (gs.atpay_payout_secret_key or "").strip() if gs else ""
+        public_key = (gs.atpay_payout_public_key or "").strip() if gs else ""
+        payload = request.data if isinstance(request.data, dict) else {}
+        order_num = str(payload.get("out_trade_sn") or "").strip()
+        if not order_num:
+            return HttpResponse("success", content_type="text/plain")
+
+        trx = Transaction.objects.filter(trx_id=order_num).first()
+        withdrawal = Withdrawal.objects.filter(transaction=trx).first() if trx else None
+        if not withdrawal:
+            return HttpResponse("success", content_type="text/plain")
+
+        trace = AtpayWithdrawal.objects.filter(withdrawal=withdrawal).first()
+        sign_type = payload.get("sign_type") or (gs.atpay_payout_sign_type if gs else "MD5")
+        signature_valid = atpay_verify_payload(payload, sign_type, secret_key=secret_key, public_key=public_key)
+        _atpay_store_trace(trace, {"callback": {**payload, "_sign_valid": signature_valid}})
+        if not signature_valid:
+            return HttpResponse("success", content_type="text/plain")
+
+        mapped_status = atpay_map_payout_trade_status(payload.get("trade_status"))
+        if mapped_status:
+            withdrawal.status = mapped_status
+            withdrawal.save(update_fields=["status"])
+        return HttpResponse("success", content_type="text/plain")
+
+
+class AtpayPayoutQueryView(APIView):
+    permission_classes = [permissions.IsAdminUser]
+    throttle_scope = "withdraw_admin_initiate"
+
+    @extend_schema(summary="Query status withdraw ATPAY")
+    def post(self, request, pk: int):
+        gs = WithdrawalSettings.objects.order_by("-updated_at").first()
+        enabled = bool(gs and gs.atpay_payout_enabled)
+        api_url = (gs.atpay_payout_api_url or "").strip() if gs else ""
+        merchant_no = (gs.atpay_payout_merchant_no or "").strip() if gs else ""
+        sign_type = atpay_normalize_sign_type((gs.atpay_payout_sign_type or "MD5").strip() if gs else "MD5")
+        secret_key = (gs.atpay_payout_secret_key or "").strip() if gs else ""
+        private_key = (gs.atpay_payout_private_key or "").strip() if gs else ""
+        public_key = (gs.atpay_payout_public_key or "").strip() if gs else ""
+        if not enabled:
+            return Response({"detail": "ATPAY payout tidak aktif"}, status=status.HTTP_400_BAD_REQUEST)
+        if not api_url or not merchant_no:
+            return Response({"detail": "Konfigurasi ATPAY payout belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            wd = Withdrawal.objects.select_related("transaction").get(pk=pk)
+        except Withdrawal.DoesNotExist:
+            return Response({"detail": "Withdrawal tidak ditemukan"}, status=status.HTTP_404_NOT_FOUND)
+
+        trace = AtpayWithdrawal.objects.filter(withdrawal=wd).first()
+        order_sn = (request.data.get("orderSn") or "").strip()
+        out_trade_sn = (request.data.get("outTradeSn") or getattr(getattr(wd, "transaction", None), "trx_id", None) or "").strip()
+        if not order_sn and trace and isinstance(trace.response_payload, dict):
+            initiate_payload = trace.response_payload.get("initiate")
+            initiate_data = initiate_payload.get("data") if isinstance(initiate_payload, dict) and isinstance(initiate_payload.get("data"), dict) else {}
+            order_sn = str(initiate_data.get("order_sn") or "").strip()
+        if not out_trade_sn or not order_sn:
+            return Response({"detail": "outTradeSn dan orderSn wajib tersedia"}, status=status.HTTP_400_BAD_REQUEST)
+
+        payload = atpay_build_payout_query_payload(
+            merchant_no=merchant_no,
+            out_trade_sn=out_trade_sn,
+            order_sn=order_sn,
+            sign_type=sign_type,
+        )
+        payload["sign"] = atpay_sign_payload(payload, sign_type, secret_key=secret_key, private_key=private_key)
+
+        response_payload = atpay_post_json(f"{api_url.rstrip('/')}/gw-api/payout/query", payload)
+        if response_payload.get("sign"):
+            response_payload["_sign_valid"] = atpay_verify_payload(
+                response_payload,
+                response_payload.get("sign_type") or sign_type,
+                secret_key=secret_key,
+                public_key=public_key,
+            )
+        _atpay_store_trace(trace, {"query": response_payload})
+
+        data = response_payload.get("data") if isinstance(response_payload.get("data"), dict) else {}
+        if str(response_payload.get("code") or "").strip() == "100":
+            mapped_status = atpay_map_payout_trade_status(data.get("trade_status"))
+            if mapped_status:
+                wd.status = mapped_status
+                wd.save(update_fields=["status"])
+
+        return Response({"local_status": wd.status, "gateway": response_payload, "provider_data": data}, status=status.HTTP_200_OK)
+
+
+class AtpayPayoutBanksView(APIView):
+    permission_classes = [permissions.IsAdminUser]
+    throttle_scope = "withdraw_admin_initiate"
+
+    @extend_schema(summary="Ambil daftar bank code ATPAY untuk admin")
+    def get(self, request):
+        gs = WithdrawalSettings.objects.order_by("-updated_at").first()
+        enabled = bool(gs and gs.atpay_payout_enabled)
+        api_url = (gs.atpay_payout_api_url or "").strip() if gs else ""
+        merchant_no = (gs.atpay_payout_merchant_no or "").strip() if gs else ""
+        sign_type = atpay_normalize_sign_type((gs.atpay_payout_sign_type or "MD5").strip() if gs else "MD5")
+        secret_key = (gs.atpay_payout_secret_key or "").strip() if gs else ""
+        private_key = (gs.atpay_payout_private_key or "").strip() if gs else ""
+
+        if not enabled:
+            return Response({"detail": "ATPAY payout tidak aktif"}, status=status.HTTP_400_BAD_REQUEST)
+        if not api_url or not merchant_no:
+            return Response({"detail": "Konfigurasi ATPAY payout belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
+
+        payload = atpay_build_bank_code_payload(merchant_no=merchant_no, sign_type=sign_type)
+        payload["sign"] = atpay_sign_payload(payload, sign_type, secret_key=secret_key, private_key=private_key)
+        response_payload = atpay_post_json(f"{api_url.rstrip('/')}/gw-api/bank-code", payload)
+        items = response_payload.get("data") if isinstance(response_payload.get("data"), list) else []
+        results = [
+            {"bank_code": str(item.get("bank_code") or "").strip(), "bank_name": str(item.get("bank_name") or "").strip()}
+            for item in items
+            if str(item.get("bank_code") or "").strip()
+        ]
+        return Response({"count": len(results), "results": results, "provider": response_payload}, status=status.HTTP_200_OK)
 
 
 class PPayProsPayoutInitiateView(APIView):

@@ -47,6 +47,14 @@ class WithdrawalSettings(models.Model):
     ppaypros_payout_private_key = models.CharField(max_length=255, blank=True, default='', help_text='Private key/sign key untuk MD5 signature')
     ppaypros_payout_entry_type = models.CharField(max_length=32, blank=True, default='BANK_CARD', help_text='Default entryType payout, contoh: BANK_CARD')
 
+    atpay_payout_enabled = models.BooleanField(default=False)
+    atpay_payout_api_url = models.CharField(max_length=255, blank=True, default='https://test.wowpay.biz')
+    atpay_payout_merchant_no = models.CharField(max_length=100, blank=True, default='')
+    atpay_payout_sign_type = models.CharField(max_length=20, blank=True, default='MD5', help_text='MD5 atau MD5withRsa')
+    atpay_payout_secret_key = models.CharField(max_length=255, blank=True, default='', help_text='Dipakai jika sign_type=MD5')
+    atpay_payout_private_key = models.TextField(blank=True, default='', help_text='Dipakai jika sign_type=MD5withRsa')
+    atpay_payout_public_key = models.TextField(blank=True, default='', help_text='Public key ATPAY untuk verifikasi callback MD5withRsa')
+
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -223,6 +231,21 @@ class PPayProsWithdrawal(models.Model):
 
     def __str__(self):
         return f"PPay Pros payout for Withdrawal #{self.withdrawal.pk}"
+
+
+class AtpayWithdrawal(models.Model):
+    withdrawal = models.OneToOneField(Withdrawal, on_delete=models.CASCADE, related_name='atpay_withdrawal')
+    request_params = models.JSONField(default=dict)
+    response_payload = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'withdrawal_atpay'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"ATPAY payout for Withdrawal #{self.withdrawal.pk}"
 
 
 class WithdrawalJayapay(Withdrawal):

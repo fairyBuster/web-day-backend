@@ -18,6 +18,9 @@ class GatewaySettings(models.Model):
     klikpay_enabled = models.BooleanField(default=False)
     usd_gateway_enabled = models.BooleanField(default=False)
     ppaypros_enabled = models.BooleanField(default=False)
+    clienthub_enabled = models.BooleanField(default=False)
+    sitransferhub_enabled = models.BooleanField(default=False)
+    atpay_enabled = models.BooleanField(default=False)
 
     # Jayapay config
     jayapay_merchant_code = models.CharField(max_length=100, blank=True, default='')
@@ -64,6 +67,29 @@ class GatewaySettings(models.Model):
     ppaypros_ext_param = models.CharField(max_length=64, blank=True, default='', help_text='Kode bank/wallet default, contoh: BRI, BNI, dana, gopay')
     ppaypros_return_url = models.CharField(max_length=512, blank=True, default='', help_text='URL redirect setelah pembayaran selesai')
 
+    # ClientHub pay-in
+    clienthub_base_url = models.CharField(max_length=255, blank=True, default='', help_text='Contoh: https://api.totc.site')
+    clienthub_client_id = models.CharField(max_length=100, blank=True, default='')
+    clienthub_secret_key = models.CharField(max_length=255, blank=True, default='', help_text='Secret key untuk HMAC request/callback')
+    clienthub_method = models.CharField(max_length=50, blank=True, default='BRIVA')
+    clienthub_return_url = models.CharField(max_length=512, blank=True, default='', help_text='URL redirect setelah pembayaran selesai')
+    clienthub_expired_minutes = models.PositiveIntegerField(default=60, help_text='Masa berlaku invoice dalam menit')
+
+    # SiTransfer Hub pay-in
+    sitransferhub_base_url = models.CharField(max_length=255, blank=True, default='', help_text='Contoh: https://api.totc.site')
+    sitransferhub_client_id = models.CharField(max_length=100, blank=True, default='')
+    sitransferhub_secret_key = models.CharField(max_length=255, blank=True, default='', help_text='Secret key untuk HMAC request/callback')
+    sitransferhub_channel = models.CharField(max_length=20, blank=True, default='QRIS', help_text='Channel default: QRIS atau DANA')
+
+    # ATPAY pay-in
+    atpay_api_url = models.CharField(max_length=255, blank=True, default='https://test.wowpay.biz')
+    atpay_merchant_no = models.CharField(max_length=100, blank=True, default='')
+    atpay_sign_type = models.CharField(max_length=20, blank=True, default='MD5', help_text='MD5 atau MD5withRsa')
+    atpay_secret_key = models.CharField(max_length=255, blank=True, default='', help_text='Dipakai jika sign_type=MD5')
+    atpay_private_key = models.TextField(blank=True, default='', help_text='Dipakai jika sign_type=MD5withRsa')
+    atpay_public_key = models.TextField(blank=True, default='', help_text='Public key ATPAY untuk verifikasi callback MD5withRsa')
+    atpay_return_url = models.CharField(max_length=512, blank=True, default='', help_text='URL redirect setelah pembayaran selesai')
+
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
@@ -88,6 +114,9 @@ class Deposit(models.Model):
         ('KLIKPAY', 'Klikpay'),
         ('USD_GATEWAY', 'USD Gateway'),
         ('PPAYPROS', 'PPay Pros'),
+        ('CLIENTHUB', 'ClientHub'),
+        ('SITRANSFERHUB', 'SiTransfer Hub'),
+        ('ATPAY', 'ATPAY'),
     ]
     WALLET_CHOICES = [
         ('BALANCE', 'Balance'),

@@ -271,4 +271,86 @@
       </div>
     </form>
   </div>
+
+  <div class="module" style="margin-top: 2rem;">
+    <h2>Process via ATPAY</h2>
+    {% if not atpay_enabled %}
+      <p style="color:#b00;">ATPAY payout tidak aktif. Aktifkan di WithdrawalSettings dan isi konfigurasi merchant/sign.</p>
+    {% endif %}
+
+    <form method="post" action="{{ process_atpay_url }}" novalidate>
+      {% csrf_token %}
+      <fieldset class="module aligned">
+        <div class="form-row">
+          <div>
+            <label for="id_at_bankCode">Bank Code</label>
+            <select id="id_at_bankCode" name="bankCode" {% if atpay_bank_codes %}required{% endif %}>
+              <option value="">-- pilih bankCode --</option>
+              {% for b in atpay_bank_codes %}
+                <option value="{{ b.bank_code }}" {% if atpay_initial.bankCode == b.bank_code %}selected{% endif %}>
+                  {{ b.bank_code }} - {{ b.bank_name }}
+                </option>
+              {% endfor %}
+            </select>
+            {% if atpay_bank_codes_error %}
+              <p style="color:#b00; margin-top: 6px;">Gagal mengambil daftar bank ATPAY: {{ atpay_bank_codes_error }}</p>
+            {% endif %}
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div>
+            <label for="id_at_tradeNumber">Account Number</label>
+            <input type="text" id="id_at_tradeNumber" name="tradeNumber" value="{{ atpay_initial.tradeNumber }}" required />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div>
+            <label for="id_at_tradeAccount">Account Name</label>
+            <input type="text" id="id_at_tradeAccount" name="tradeAccount" value="{{ atpay_initial.tradeAccount }}" required />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div>
+            <label for="id_at_mobile">Phone</label>
+            <input type="text" id="id_at_mobile" name="mobile" value="{{ atpay_initial.mobile }}" />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div>
+            <label for="id_at_email">Email</label>
+            <input type="text" id="id_at_email" name="email" value="{{ atpay_initial.email }}" />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div>
+            <label for="id_at_identity">Identity</label>
+            <input type="text" id="id_at_identity" name="identity" value="{{ atpay_initial.identity }}" />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div>
+            <label for="id_at_attach">Attach</label>
+            <input type="text" id="id_at_attach" name="attach" value="{{ atpay_initial.attach }}" />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div>
+            <label for="id_at_amount">Amount</label>
+            <input type="number" step="0.01" id="id_at_amount" name="amount" value="{{ atpay_initial.amount }}" required />
+          </div>
+        </div>
+      </fieldset>
+
+      <div class="submit-row">
+        <button type="submit" class="default">Submit to ATPAY</button>
+      </div>
+    </form>
+  </div>
 {% endblock %}

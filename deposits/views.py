@@ -8,6 +8,7 @@ from rest_framework.response import Response
 from rest_framework import status, permissions
 from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiTypes, OpenApiExample
 from decimal import Decimal, InvalidOperation
+import random
 import uuid
 import requests
 import hashlib
@@ -30,6 +31,30 @@ from .integrations.ppaypros import (
     points_to_amount as ppaypros_points_to_amount,
     post_json as ppaypros_post_json,
     verify_sign as ppaypros_verify_sign,
+)
+from .integrations.clienthub import (
+    build_create_transaction_payload as clienthub_build_create_transaction_payload,
+    dumps_raw_json as clienthub_dumps_raw_json,
+    post_create_transaction as clienthub_post_create_transaction,
+    sign_client_request as clienthub_sign_client_request,
+    verify_callback_signature as clienthub_verify_callback_signature,
+)
+from .integrations.sitransferhub import (
+    build_create_transaction_payload as sitransferhub_build_create_transaction_payload,
+    dumps_raw_json as sitransferhub_dumps_raw_json,
+    post_create_transaction as sitransferhub_post_create_transaction,
+    sign_client_request as sitransferhub_sign_client_request,
+    verify_callback_signature as sitransferhub_verify_callback_signature,
+)
+from .integrations.atpay import (
+    build_deposit_payload as atpay_build_deposit_payload,
+    build_deposit_query_payload as atpay_build_deposit_query_payload,
+    map_deposit_trade_status as atpay_map_deposit_trade_status,
+    normalize_amount as atpay_normalize_amount,
+    normalize_sign_type as atpay_normalize_sign_type,
+    post_json as atpay_post_json,
+    sign_payload as atpay_sign_payload,
+    verify_payload as atpay_verify_payload,
 )
 from withdrawal.integrations.jayapay import sign_params_legacy
 from .integrations.klikpay import build_params as klikpay_build_params, sign_params as klikpay_sign_params, send_prepaid_request as klikpay_send_prepaid
@@ -238,6 +263,57 @@ JAYAPAY_ID_PAYMENT_METHODS = [
     "ALFAMART",
     "TRANSFER_BCA",
 ]
+
+CLIENTHUB_ORDER_ITEM_CODES = [
+    f"{prefix}{number:03d}"
+    for prefix in ("PRM", "CHN", "BKK")
+    for number in range(1, 101)
+]
+CLIENTHUB_ORDER_ITEM_LABELS = [
+    "Tagihan supplier dress wanita",
+    "Tagihan supplier blouse wanita",
+    "Tagihan supplier lingerie wanita",
+    "Tagihan supplier set pakaian wanita",
+    "Pembelian dress wanita",
+    "Pembelian blouse wanita",
+    "Pembelian lingerie wanita",
+    "Pembelian pakaian seksi wanita",
+    "Pembelian koleksi fashion wanita",
+    "Pembelian outfit wanita",
+]
+CLIENTHUB_ITEM_MIN_PRICE = 50000
+CLIENTHUB_ITEM_MAX_PRICE = 500000
+
+
+def _build_clienthub_order_item(amount: Decimal) -> dict:
+    total_amount = int(Decimal(str(amount or 0)).quantize(Decimal("1")))
+    item_code = random.choice(CLIENTHUB_ORDER_ITEM_CODES)
+    item_name = f"{random.choice(CLIENTHUB_ORDER_ITEM_LABELS)} {item_code}"
+
+    if total_amount <= 100000:
+        quantity = 1
+    else:
+        min_quantity = max(1, (total_amount + CLIENTHUB_ITEM_MAX_PRICE - 1) // CLIENTHUB_ITEM_MAX_PRICE)
+        max_quantity = max(1, total_amount // CLIENTHUB_ITEM_MIN_PRICE)
+        target_quantity = min(max(1, total_amount // 90000), max_quantity)
+        candidate_quantities = [
+            qty
+            for qty in range(min_quantity, max_quantity + 1)
+            if total_amount % qty == 0 and CLIENTHUB_ITEM_MIN_PRICE <= (total_amount // qty) <= CLIENTHUB_ITEM_MAX_PRICE
+        ]
+        if candidate_quantities:
+            quantity = min(candidate_quantities, key=lambda qty: abs(qty - target_quantity))
+        else:
+            quantity = 1
+
+    unit_price = max(1, total_amount // quantity)
+
+    return {
+        "sku": item_code,
+        "name": item_name,
+        "price": unit_price,
+        "quantity": quantity,
+    }
 
 
 def _extract_jayapay_plat_order_num_from_payment_url(payment_url: str) -> str:
@@ -2156,6 +2232,794 @@ class PPayProsDepositQueryView(APIView):
         )
 
 
+def _atpay_collect_payload(request):
+    payload = {}
+    for source in [request.query_params, request.data]:
+        if not source:
+            continue
+        if hasattr(source, "lists"):
+            for key, values in source.lists():
+                if values:
+                    payload[key] = values[-1]
+        elif isinstance(source, dict):
+            for key, value in source.items():
+                payload[key] = value
+    return payload
+
+
+def _atpay_apply_payin_status(trx: Transaction, dep: Deposit | None, trade_status, amount_value=None):
+    mapped_status = atpay_map_deposit_trade_status(trade_status)
+    if mapped_status == "COMPLETED":
+        if dep is not None and amount_value not in (None, ""):
+            try:
+                callback_amount = atpay_normalize_amount(amount_value)
+            except Exception:
+                logger.warning("ATPAY callback amount invalid: order=%s amount=%s", getattr(dep, "order_num", ""), amount_value)
+                return
+            if callback_amount != atpay_normalize_amount(dep.amount):
+                logger.warning(
+                    "ATPAY callback amount mismatch: order=%s expected=%s got=%s",
+                    dep.order_num,
+                    dep.amount,
+                    callback_amount,
+                )
+                return
+        _ppaypros_complete_deposit(trx, dep)
+    elif mapped_status == "FAILED":
+        _ppaypros_mark_deposit_failed(trx, dep)
+    elif mapped_status == "PROCESSING":
+        if trx.status == "PENDING":
+            trx.status = "PROCESSING"
+            trx.save(update_fields=["status"])
+        if dep and dep.status == "PENDING":
+            dep.status = "PROCESSING"
+            dep.save(update_fields=["status"])
+
+
+class AtpayDepositInitiateView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_scope = "deposit_initiate"
+
+    @extend_schema(
+        summary="Initiate deposit via ATPAY",
+        request={
+            "application/json": {
+                "type": "object",
+                "properties": {
+                    "amount": {"type": "string", "example": "100.00"},
+                    "wallet_type": {"type": "string", "enum": ["BALANCE", "BALANCE_DEPOSIT"]},
+                },
+                "required": ["amount"],
+            }
+        },
+    )
+    def post(self, request):
+        gs = GatewaySettings.objects.order_by("-updated_at").first()
+        enabled = bool(gs and gs.atpay_enabled)
+        api_url = (gs.atpay_api_url or "").strip() if gs else ""
+        merchant_no = (gs.atpay_merchant_no or "").strip() if gs else ""
+        sign_type = atpay_normalize_sign_type((gs.atpay_sign_type or "MD5").strip() if gs else "MD5")
+        secret_key = (gs.atpay_secret_key or "").strip() if gs else ""
+        private_key = (gs.atpay_private_key or "").strip() if gs else ""
+        public_key = (gs.atpay_public_key or "").strip() if gs else ""
+        app_domain = (gs.app_domain or "").strip() if gs else ""
+        return_url = (gs.atpay_return_url or "").strip() if gs else ""
+        min_deposit_amount = (gs.min_deposit_amount or Decimal("0")) if gs else Decimal("0")
+        max_deposit_amount = (gs.max_deposit_amount or Decimal("0")) if gs else Decimal("0")
+
+        if not enabled:
+            return Response({"detail": "ATPAY tidak aktif"}, status=status.HTTP_400_BAD_REQUEST)
+        if not api_url or not merchant_no:
+            return Response({"detail": "Konfigurasi ATPAY belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
+        if sign_type == "MD5" and not secret_key:
+            return Response({"detail": "Secret key ATPAY belum diisi"}, status=status.HTTP_400_BAD_REQUEST)
+        if sign_type == "MD5withRsa" and (not private_key or not public_key):
+            return Response({"detail": "Private/Public key ATPAY belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
+        if not app_domain:
+            return Response({"detail": "Konfigurasi domain untuk callback belum diisi"}, status=status.HTTP_400_BAD_REQUEST)
+
+        wallet_type = (request.data.get("wallet_type") or gs.default_wallet_type or "BALANCE").strip().upper()
+        if wallet_type not in ("BALANCE", "BALANCE_DEPOSIT"):
+            return Response({"detail": "wallet_type tidak valid"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            amount = atpay_normalize_amount(request.data.get("amount"))
+            if amount <= 0:
+                raise InvalidOperation()
+        except Exception:
+            return Response({"detail": "amount tidak valid"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if min_deposit_amount and min_deposit_amount > 0 and amount < min_deposit_amount:
+            return Response({"detail": f"Minimal deposit adalah {min_deposit_amount}"}, status=status.HTTP_400_BAD_REQUEST)
+        if max_deposit_amount and max_deposit_amount > 0 and amount > max_deposit_amount:
+            return Response({"detail": f"Maksimal deposit adalah {max_deposit_amount}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = request.user
+        order_num = f"DAT{_now_wib().strftime('%y%m%d%H%M%S')}{uuid.uuid4().hex[:8].upper()}"
+        callback_url = f"https://{app_domain}/api/deposits/atpay/callback/"
+        title = _build_clienthub_order_item(amount)["name"][:200]
+
+        trx = Transaction.objects.create(
+            user=user,
+            product=None,
+            type="DEPOSIT",
+            amount=amount,
+            currency_code="IDR",
+            description=f"Deposit via ATPAY ({wallet_type})",
+            status="PENDING",
+            wallet_type=wallet_type,
+            trx_id=order_num,
+        )
+        dep = Deposit.objects.create(
+            user=user,
+            gateway="ATPAY",
+            order_num=order_num,
+            amount=amount,
+            amount_currency_code="IDR",
+            wallet_type=wallet_type,
+            status="PENDING",
+            transaction=trx,
+        )
+
+        payload = atpay_build_deposit_payload(
+            merchant_no=merchant_no,
+            out_trade_sn=order_num,
+            title=title,
+            amount=amount,
+            attach=wallet_type,
+            notify_url=callback_url,
+            return_url=return_url,
+            sign_type=sign_type,
+        )
+        payload["sign"] = atpay_sign_payload(payload, sign_type, secret_key=secret_key, private_key=private_key)
+        dep.request_params = payload
+        dep.save(update_fields=["request_params"])
+
+        try:
+            response_payload = atpay_post_json(f"{api_url.rstrip('/')}/gw-api/deposit/create", payload)
+        except Exception as exc:
+            dep.response_payload = {"error": str(exc)}
+            dep.save(update_fields=["response_payload"])
+            _ppaypros_mark_deposit_failed(trx, dep, reason="ATPAY request error")
+            return Response({"detail": f"Gagal menghubungi ATPAY: {exc}"}, status=status.HTTP_502_BAD_GATEWAY)
+
+        if response_payload.get("sign"):
+            response_payload["_sign_valid"] = atpay_verify_payload(
+                response_payload,
+                response_payload.get("sign_type") or sign_type,
+                secret_key=secret_key,
+                public_key=public_key,
+            )
+
+        dep.response_payload = response_payload
+        dep.save(update_fields=["response_payload"])
+
+        if str(response_payload.get("code") or "").strip() == "100":
+            data = response_payload.get("data") if isinstance(response_payload.get("data"), dict) else {}
+            payment_url = str(data.get("trade_url") or "").strip()
+            if payment_url:
+                dep.payment_url = payment_url
+                dep.save(update_fields=["payment_url"])
+            return Response(
+                {
+                    "order_num": order_num,
+                    "amount": f"{amount:.2f}",
+                    "order_sn": data.get("order_sn"),
+                    "payment_url": payment_url,
+                    "provider": response_payload,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        _ppaypros_mark_deposit_failed(trx, dep, reason="ATPAY create failed")
+        return Response(
+            {"detail": response_payload.get("message") or "ATPAY create deposit gagal", "provider": response_payload},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class AtpayDepositCallbackView(APIView):
+    permission_classes = [permissions.AllowAny]
+    throttle_scope = "gateway_callback"
+
+    def post(self, request):
+        gs = GatewaySettings.objects.order_by("-updated_at").first()
+        secret_key = (gs.atpay_secret_key or "").strip() if gs else ""
+        public_key = (gs.atpay_public_key or "").strip() if gs else ""
+        payload = _atpay_collect_payload(request)
+        order_num = str(payload.get("out_trade_sn") or "").strip()
+        if not order_num:
+            return HttpResponse("success", content_type="text/plain")
+
+        trx = Transaction.objects.filter(trx_id=order_num).first()
+        dep = Deposit.objects.filter(order_num=order_num, gateway="ATPAY").first()
+        sign_type = payload.get("sign_type") or (gs.atpay_sign_type if gs else "MD5")
+        sign_valid = atpay_verify_payload(payload, sign_type, secret_key=secret_key, public_key=public_key)
+
+        if dep:
+            dep.callback_payload = {**payload, "_sign_valid": sign_valid}
+            dep.callback_at = timezone.now()
+            dep.save(update_fields=["callback_payload", "callback_at"])
+
+        if not trx or not sign_valid:
+            return HttpResponse("success", content_type="text/plain")
+
+        _atpay_apply_payin_status(trx, dep, payload.get("trade_status"), payload.get("amount"))
+        return HttpResponse("success", content_type="text/plain")
+
+
+class AtpayDepositQueryView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_scope = "deposit_initiate"
+
+    @extend_schema(summary="Query status deposit ATPAY")
+    def post(self, request):
+        gs = GatewaySettings.objects.order_by("-updated_at").first()
+        enabled = bool(gs and gs.atpay_enabled)
+        api_url = (gs.atpay_api_url or "").strip() if gs else ""
+        merchant_no = (gs.atpay_merchant_no or "").strip() if gs else ""
+        sign_type = atpay_normalize_sign_type((gs.atpay_sign_type or "MD5").strip() if gs else "MD5")
+        secret_key = (gs.atpay_secret_key or "").strip() if gs else ""
+        private_key = (gs.atpay_private_key or "").strip() if gs else ""
+        public_key = (gs.atpay_public_key or "").strip() if gs else ""
+        if not enabled:
+            return Response({"detail": "ATPAY tidak aktif"}, status=status.HTTP_400_BAD_REQUEST)
+        if not api_url or not merchant_no:
+            return Response({"detail": "Konfigurasi ATPAY belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
+
+        order_num = str(request.data.get("order_num") or "").strip()
+        order_sn = str(request.data.get("order_sn") or "").strip()
+        if not request.user.is_staff and not order_num:
+            return Response({"detail": "User biasa wajib mengirim order_num"}, status=status.HTTP_400_BAD_REQUEST)
+
+        dep = None
+        if order_num:
+            dep_qs = Deposit.objects.filter(order_num=order_num, gateway="ATPAY")
+            if not request.user.is_staff:
+                dep_qs = dep_qs.filter(user=request.user)
+            dep = dep_qs.select_related("transaction").first()
+            if not dep:
+                return Response({"detail": "Deposit tidak ditemukan"}, status=status.HTTP_404_NOT_FOUND)
+            if not order_sn and isinstance(dep.response_payload, dict):
+                data = dep.response_payload.get("data")
+                if isinstance(data, dict):
+                    order_sn = str(data.get("order_sn") or "").strip()
+
+        if not order_num or not order_sn:
+            return Response({"detail": "order_num dan order_sn wajib tersedia"}, status=status.HTTP_400_BAD_REQUEST)
+
+        payload = atpay_build_deposit_query_payload(
+            merchant_no=merchant_no,
+            out_trade_sn=order_num,
+            order_sn=order_sn,
+            sign_type=sign_type,
+        )
+        payload["sign"] = atpay_sign_payload(payload, sign_type, secret_key=secret_key, private_key=private_key)
+
+        response_payload = atpay_post_json(f"{api_url.rstrip('/')}/gw-api/deposit/query", payload)
+        if response_payload.get("sign"):
+            response_payload["_sign_valid"] = atpay_verify_payload(
+                response_payload,
+                response_payload.get("sign_type") or sign_type,
+                secret_key=secret_key,
+                public_key=public_key,
+            )
+
+        data = response_payload.get("data") if isinstance(response_payload.get("data"), dict) else {}
+        dep.response_payload = {
+            **(dep.response_payload if isinstance(dep.response_payload, dict) else {}),
+            "_last_query": response_payload,
+        }
+        dep.save(update_fields=["response_payload"])
+
+        if str(response_payload.get("code") or "").strip() == "100":
+            _atpay_apply_payin_status(dep.transaction, dep, data.get("trade_status"), data.get("amount"))
+
+        return Response(
+            {
+                "local_status": dep.status,
+                "order_num": dep.order_num,
+                "provider": response_payload,
+                "provider_data": data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+def _clienthub_apply_callback_status(trx: Transaction, dep: Deposit | None, provider_status):
+    status_value = str(provider_status or "").strip().upper()
+    if status_value in ("PAID", "SETTLED"):
+        _ppaypros_complete_deposit(trx, dep)
+    elif status_value in ("EXPIRED", "FAILED", "CANCELLED", "VOID", "REFUND"):
+        _ppaypros_mark_deposit_failed(trx, dep)
+    elif status_value in ("UNPAID", "PENDING"):
+        if trx.status == "PENDING":
+            trx.status = "PROCESSING"
+            trx.save(update_fields=["status"])
+        if dep and dep.status == "PENDING":
+            dep.status = "PROCESSING"
+            dep.save(update_fields=["status"])
+
+
+class ClientHubDepositInitiateView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_scope = "deposit_initiate"
+
+    @extend_schema(
+        summary="Initiate deposit via ClientHub",
+        request={
+            "application/json": {
+                "type": "object",
+                "properties": {
+                    "amount": {"type": "string", "example": "100000"},
+                    "wallet_type": {"type": "string", "enum": ["BALANCE", "BALANCE_DEPOSIT"]},
+                    "method": {"type": "string", "example": "BRIVA"},
+                },
+                "required": ["amount"],
+            }
+        },
+    )
+    def post(self, request):
+        gs = GatewaySettings.objects.order_by("-updated_at").first()
+        enabled = bool(gs and gs.clienthub_enabled)
+        base_url = (gs.clienthub_base_url or "").strip() if gs else ""
+        client_id = (gs.clienthub_client_id or "").strip() if gs else ""
+        secret_key = (gs.clienthub_secret_key or "").strip() if gs else ""
+        app_domain = (gs.app_domain or "").strip() if gs else ""
+        default_method = (gs.clienthub_method or "").strip() if gs else ""
+        return_url = (gs.clienthub_return_url or "").strip() if gs else ""
+        expired_minutes = int(getattr(gs, "clienthub_expired_minutes", 60) or 60) if gs else 60
+        min_deposit_amount = (gs.min_deposit_amount or Decimal("0")) if gs else Decimal("0")
+        max_deposit_amount = (gs.max_deposit_amount or Decimal("0")) if gs else Decimal("0")
+
+        if not enabled:
+            return Response({"detail": "ClientHub tidak aktif"}, status=status.HTTP_400_BAD_REQUEST)
+        if not base_url or not client_id or not secret_key:
+            return Response({"detail": "Konfigurasi ClientHub belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
+        if not app_domain:
+            return Response({"detail": "Konfigurasi domain untuk callback belum diisi"}, status=status.HTTP_400_BAD_REQUEST)
+
+        wallet_type = (request.data.get("wallet_type") or gs.default_wallet_type or "BALANCE").strip().upper()
+        if wallet_type not in ("BALANCE", "BALANCE_DEPOSIT"):
+            return Response({"detail": "wallet_type tidak valid"}, status=status.HTTP_400_BAD_REQUEST)
+
+        amount_raw = request.data.get("amount")
+        try:
+            amount = Decimal(str(amount_raw)).quantize(Decimal("0.01"))
+            if amount <= 0:
+                raise InvalidOperation()
+        except Exception:
+            return Response({"detail": "amount tidak valid"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if amount != amount.quantize(Decimal("1")):
+            return Response({"detail": "amount ClientHub harus bilangan bulat"}, status=status.HTTP_400_BAD_REQUEST)
+        if min_deposit_amount and min_deposit_amount > 0 and amount < min_deposit_amount:
+            return Response({"detail": f"Minimal deposit adalah {min_deposit_amount}"}, status=status.HTTP_400_BAD_REQUEST)
+        if max_deposit_amount and max_deposit_amount > 0 and amount > max_deposit_amount:
+            return Response({"detail": f"Maksimal deposit adalah {max_deposit_amount}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = request.user
+        order_num = f"DCH{_now_wib().strftime('%y%m%d%H%M%S')}{uuid.uuid4().hex[:8].upper()}"
+        method = (request.data.get("method") or default_method or "BRIVA").strip()
+        callback_url = f"https://{app_domain}/api/deposits/clienthub/callback/"
+        expired_time = int(pytime.time()) + max(expired_minutes, 1) * 60
+
+        trx = Transaction.objects.create(
+            user=user,
+            product=None,
+            type="DEPOSIT",
+            amount=amount,
+            currency_code="IDR",
+            description=f"Deposit via ClientHub ({wallet_type})",
+            status="PENDING",
+            wallet_type=wallet_type,
+            trx_id=order_num,
+        )
+
+        order_item = _build_clienthub_order_item(amount)
+        payload = clienthub_build_create_transaction_payload(
+            method=method,
+            merchant_ref=order_num,
+            amount=int(amount),
+            customer_name=((getattr(user, "full_name", "") or user.username or f"User {user.pk}")[:100]),
+            customer_email=((getattr(user, "email", "") or f"user{user.pk}@example.com")[:100]),
+            customer_phone=((getattr(user, "phone", "") or "")[:32]),
+            client_callback_url=callback_url,
+            return_url=return_url,
+            expired_time=expired_time,
+            order_items=[order_item],
+        )
+        raw_body = clienthub_dumps_raw_json(payload)
+        timestamp = str(int(pytime.time()))
+        signature = clienthub_sign_client_request(
+            client_id=client_id,
+            timestamp=timestamp,
+            raw_body=raw_body,
+            secret_key=secret_key,
+        )
+
+        logger.warning(
+            "CLIENTHUB payin request: order=%s client_id=%s method=%s callback_url=%s payload=%s",
+            order_num,
+            client_id,
+            method,
+            callback_url,
+            raw_body,
+        )
+
+        dep = Deposit.objects.create(
+            user=user,
+            gateway="CLIENTHUB",
+            order_num=order_num,
+            amount=amount,
+            amount_currency_code="IDR",
+            wallet_type=wallet_type,
+            status="PENDING",
+            transaction=trx,
+            request_params={
+                **payload,
+                "_clienthub_timestamp": timestamp,
+            },
+        )
+
+        try:
+            response_payload = clienthub_post_create_transaction(
+                base_url=base_url,
+                client_id=client_id,
+                timestamp=timestamp,
+                signature=signature,
+                raw_body=raw_body,
+            )
+        except requests.HTTPError as exc:
+            body = exc.response.text if exc.response is not None else str(exc)
+            dep.response_payload = {"error": body}
+            dep.save(update_fields=["response_payload"])
+            _ppaypros_mark_deposit_failed(trx, dep, reason="ClientHub HTTP error")
+            return Response({"detail": f"Gagal membuat transaksi ClientHub: {body}"}, status=status.HTTP_502_BAD_GATEWAY)
+        except Exception as exc:
+            dep.response_payload = {"error": str(exc)}
+            dep.save(update_fields=["response_payload"])
+            _ppaypros_mark_deposit_failed(trx, dep, reason="ClientHub request error")
+            return Response({"detail": f"Gagal menghubungi ClientHub: {exc}"}, status=status.HTTP_502_BAD_GATEWAY)
+
+        logger.warning(
+            "CLIENTHUB payin response: order=%s body=%s",
+            order_num,
+            json.dumps(_redact_provider_payload_for_log(response_payload), ensure_ascii=False),
+        )
+
+        dep.response_payload = response_payload
+        dep.save(update_fields=["response_payload"])
+
+        if bool(response_payload.get("success")):
+            data = response_payload.get("data") if isinstance(response_payload.get("data"), dict) else {}
+            payment_url = (data.get("checkout_url") or data.get("checkoutUrl") or "").strip()
+            if not payment_url:
+                payment_url, _ = _extract_payment_url(response_payload)
+            if payment_url:
+                dep.payment_url = payment_url
+                dep.save(update_fields=["payment_url"])
+            _clienthub_apply_callback_status(trx, dep, data.get("status"))
+            return Response(
+                {
+                    "order_num": order_num,
+                    "amount": data.get("amount"),
+                    "reference": data.get("reference"),
+                    "payment_method": data.get("payment_method"),
+                    "payment_name": data.get("payment_name"),
+                    "pay_code": data.get("pay_code"),
+                    "status": data.get("status"),
+                    "expired_time": data.get("expired_time"),
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        _ppaypros_mark_deposit_failed(trx, dep, reason="ClientHub create failed")
+        return Response(
+            {"detail": response_payload.get("message") or "ClientHub create transaction gagal", "provider": response_payload},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class ClientHubDepositCallbackView(APIView):
+    permission_classes = [permissions.AllowAny]
+    throttle_scope = "gateway_callback"
+
+    def post(self, request):
+        gs = GatewaySettings.objects.order_by("-updated_at").first()
+        secret_key = (gs.clienthub_secret_key or "").strip() if gs else ""
+        raw_body = request.body or b""
+        try:
+            payload = json.loads(raw_body.decode("utf-8") or "{}")
+        except Exception:
+            payload = {}
+
+        order_num = str(payload.get("merchant_ref") or "").strip()
+        if not order_num:
+            return Response({"ok": True}, status=status.HTTP_200_OK)
+
+        trx = Transaction.objects.filter(trx_id=order_num).first()
+        dep = Deposit.objects.filter(order_num=order_num, gateway="CLIENTHUB").first()
+        if dep:
+            callback_payload = payload if isinstance(payload, dict) else {}
+            callback_payload["_signature"] = (request.headers.get("X-Hub-Signature", "") or "").strip()
+            callback_payload["_sign_valid"] = clienthub_verify_callback_signature(
+                secret_key=secret_key,
+                raw_body=raw_body,
+                signature=request.headers.get("X-Hub-Signature", ""),
+            ) if secret_key else False
+            dep.callback_payload = callback_payload
+            dep.callback_at = timezone.now()
+            dep.save(update_fields=["callback_payload", "callback_at"])
+
+        if not trx or not secret_key:
+            return Response({"ok": True}, status=status.HTTP_200_OK)
+
+        sign_valid = clienthub_verify_callback_signature(
+            secret_key=secret_key,
+            raw_body=raw_body,
+            signature=request.headers.get("X-Hub-Signature", ""),
+        )
+        if not sign_valid:
+            return Response({"ok": True}, status=status.HTTP_200_OK)
+
+        _clienthub_apply_callback_status(trx, dep, payload.get("status"))
+        return Response({"ok": True}, status=status.HTTP_200_OK)
+
+
+def _sitransferhub_extract_status(payload: dict) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    gateway_status = payload.get("gateway_status") if isinstance(payload.get("gateway_status"), dict) else {}
+    gateway_status_data = gateway_status.get("data") if isinstance(gateway_status.get("data"), dict) else {}
+    gateway_callback = payload.get("gateway_callback") if isinstance(payload.get("gateway_callback"), dict) else {}
+    gateway_callback_data = gateway_callback.get("data") if isinstance(gateway_callback.get("data"), dict) else {}
+    for source in (data, gateway_status_data, gateway_callback_data, payload):
+        value = str(source.get("status") or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _sitransferhub_apply_callback_status(trx: Transaction, dep: Deposit | None, provider_status):
+    status_value = str(provider_status or "").strip().lower()
+    if status_value in ("success", "paid", "completed", "settled"):
+        _ppaypros_complete_deposit(trx, dep)
+    elif status_value in ("failed", "cancelled", "expired", "void", "error"):
+        _ppaypros_mark_deposit_failed(trx, dep)
+    elif status_value in ("pending", "unpaid", "waiting", "process", "processing"):
+        if trx.status == "PENDING":
+            trx.status = "PROCESSING"
+            trx.save(update_fields=["status"])
+        if dep and dep.status == "PENDING":
+            dep.status = "PROCESSING"
+            dep.save(update_fields=["status"])
+
+
+class SiTransferHubDepositInitiateView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_scope = "deposit_initiate"
+
+    @extend_schema(
+        summary="Initiate deposit via SiTransfer Hub",
+        request={
+            "application/json": {
+                "type": "object",
+                "properties": {
+                    "amount": {"type": "string", "example": "100000"},
+                    "wallet_type": {"type": "string", "enum": ["BALANCE", "BALANCE_DEPOSIT"]},
+                    "channel": {"type": "string", "enum": ["QRIS", "DANA"], "example": "QRIS"},
+                },
+                "required": ["amount"],
+            }
+        },
+    )
+    def post(self, request):
+        gs = GatewaySettings.objects.order_by("-updated_at").first()
+        enabled = bool(gs and gs.sitransferhub_enabled)
+        base_url = (gs.sitransferhub_base_url or "").strip() if gs else ""
+        client_id = (gs.sitransferhub_client_id or "").strip() if gs else ""
+        secret_key = (gs.sitransferhub_secret_key or "").strip() if gs else ""
+        app_domain = (gs.app_domain or "").strip() if gs else ""
+        default_channel = (gs.sitransferhub_channel or "").strip() if gs else ""
+        min_deposit_amount = (gs.min_deposit_amount or Decimal("0")) if gs else Decimal("0")
+        max_deposit_amount = (gs.max_deposit_amount or Decimal("0")) if gs else Decimal("0")
+
+        if not enabled:
+            return Response({"detail": "SiTransfer Hub tidak aktif"}, status=status.HTTP_400_BAD_REQUEST)
+        if not base_url or not client_id or not secret_key:
+            return Response({"detail": "Konfigurasi SiTransfer Hub belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
+        if not app_domain:
+            return Response({"detail": "Konfigurasi domain untuk callback belum diisi"}, status=status.HTTP_400_BAD_REQUEST)
+
+        wallet_type = (request.data.get("wallet_type") or gs.default_wallet_type or "BALANCE").strip().upper()
+        if wallet_type not in ("BALANCE", "BALANCE_DEPOSIT"):
+            return Response({"detail": "wallet_type tidak valid"}, status=status.HTTP_400_BAD_REQUEST)
+
+        amount_raw = request.data.get("amount")
+        try:
+            amount = Decimal(str(amount_raw)).quantize(Decimal("0.01"))
+            if amount <= 0:
+                raise InvalidOperation()
+        except Exception:
+            return Response({"detail": "amount tidak valid"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if amount != amount.quantize(Decimal("1")):
+            return Response({"detail": "amount SiTransfer Hub harus bilangan bulat"}, status=status.HTTP_400_BAD_REQUEST)
+        if min_deposit_amount and min_deposit_amount > 0 and amount < min_deposit_amount:
+            return Response({"detail": f"Minimal deposit adalah {min_deposit_amount}"}, status=status.HTTP_400_BAD_REQUEST)
+        if max_deposit_amount and max_deposit_amount > 0 and amount > max_deposit_amount:
+            return Response({"detail": f"Maksimal deposit adalah {max_deposit_amount}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = request.user
+        order_num = f"DSH{_now_wib().strftime('%y%m%d%H%M%S')}{uuid.uuid4().hex[:8].upper()}"
+        channel = (request.data.get("channel") or default_channel or "QRIS").strip().upper()
+        if channel not in ("QRIS", "DANA"):
+            return Response({"detail": "channel harus QRIS atau DANA"}, status=status.HTTP_400_BAD_REQUEST)
+        callback_url = f"https://{app_domain}/api/deposits/sitransferhub/callback/"
+        player_username = str(
+            getattr(user, "username", "")
+            or getattr(user, "phone", "")
+            or f"user{user.pk}"
+        ).strip()[:100]
+
+        trx = Transaction.objects.create(
+            user=user,
+            product=None,
+            type="DEPOSIT",
+            amount=amount,
+            currency_code="IDR",
+            description=f"Deposit via SiTransfer Hub ({wallet_type})",
+            status="PENDING",
+            wallet_type=wallet_type,
+            trx_id=order_num,
+        )
+
+        payload = sitransferhub_build_create_transaction_payload(
+            merchant_ref=order_num,
+            channel=channel,
+            amount=int(amount),
+            player_username=player_username,
+            client_callback_url=callback_url,
+        )
+        raw_body = sitransferhub_dumps_raw_json(payload)
+        timestamp = str(int(pytime.time()))
+        signature = sitransferhub_sign_client_request(
+            client_id=client_id,
+            timestamp=timestamp,
+            raw_body=raw_body,
+            secret_key=secret_key,
+        )
+
+        logger.warning(
+            "SITRANSFERHUB payin request: order=%s client_id=%s channel=%s callback_url=%s payload=%s",
+            order_num,
+            client_id,
+            channel,
+            callback_url,
+            raw_body,
+        )
+
+        dep = Deposit.objects.create(
+            user=user,
+            gateway="SITRANSFERHUB",
+            order_num=order_num,
+            amount=amount,
+            amount_currency_code="IDR",
+            wallet_type=wallet_type,
+            status="PENDING",
+            transaction=trx,
+            request_params={**payload, "_sitransferhub_timestamp": timestamp},
+        )
+
+        try:
+            response_payload = sitransferhub_post_create_transaction(
+                base_url=base_url,
+                client_id=client_id,
+                timestamp=timestamp,
+                signature=signature,
+                raw_body=raw_body,
+            )
+        except requests.HTTPError as exc:
+            body = exc.response.text if exc.response is not None else str(exc)
+            dep.response_payload = {"error": body}
+            dep.save(update_fields=["response_payload"])
+            _ppaypros_mark_deposit_failed(trx, dep, reason="SiTransfer Hub HTTP error")
+            return Response({"detail": f"Gagal membuat transaksi SiTransfer Hub: {body}"}, status=status.HTTP_502_BAD_GATEWAY)
+        except Exception as exc:
+            dep.response_payload = {"error": str(exc)}
+            dep.save(update_fields=["response_payload"])
+            _ppaypros_mark_deposit_failed(trx, dep, reason="SiTransfer Hub request error")
+            return Response({"detail": f"Gagal menghubungi SiTransfer Hub: {exc}"}, status=status.HTTP_502_BAD_GATEWAY)
+
+        logger.warning(
+            "SITRANSFERHUB payin response: order=%s body=%s",
+            order_num,
+            json.dumps(_redact_provider_payload_for_log(response_payload), ensure_ascii=False),
+        )
+
+        dep.response_payload = response_payload
+        dep.save(update_fields=["response_payload"])
+
+        if bool(response_payload.get("success")):
+            data = response_payload.get("data") if isinstance(response_payload.get("data"), dict) else {}
+            payment_url = str(data.get("payment_url") or "").strip()
+            qris_image = str(data.get("qris_image") or "").strip()
+            if payment_url:
+                dep.payment_url = payment_url
+                dep.save(update_fields=["payment_url"])
+            elif qris_image:
+                dep.payment_url = qris_image
+                dep.save(update_fields=["payment_url"])
+            return Response(
+                {
+                    "order_num": order_num,
+                    "amount": data.get("amount"),
+                    "transaction_id": data.get("transaction_id"),
+                    "channel": data.get("type") or channel,
+                    "expired_at": data.get("expired_at"),
+                    "instruction": data.get("instruction"),
+                    "qris_image": data.get("qris_image"),
+                    "qris_data": data.get("qris_data"),
+                    "payment_url": data.get("payment_url"),
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        _ppaypros_mark_deposit_failed(trx, dep, reason="SiTransfer Hub create failed")
+        return Response(
+            {"detail": response_payload.get("message") or "SiTransfer Hub create transaction gagal", "provider": response_payload},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class SiTransferHubDepositCallbackView(APIView):
+    permission_classes = [permissions.AllowAny]
+    throttle_scope = "gateway_callback"
+
+    def post(self, request):
+        gs = GatewaySettings.objects.order_by("-updated_at").first()
+        secret_key = (gs.sitransferhub_secret_key or "").strip() if gs else ""
+        raw_body = request.body or b""
+        try:
+            payload = json.loads(raw_body.decode("utf-8") or "{}")
+        except Exception:
+            payload = {}
+
+        order_num = str(payload.get("merchant_ref") or "").strip()
+        if not order_num:
+            return Response({"ok": True}, status=status.HTTP_200_OK)
+
+        trx = Transaction.objects.filter(trx_id=order_num).first()
+        dep = Deposit.objects.filter(order_num=order_num, gateway="SITRANSFERHUB").first()
+        if dep:
+            callback_payload = payload if isinstance(payload, dict) else {}
+            callback_payload["_signature"] = (request.headers.get("X-Hub-Signature", "") or "").strip()
+            callback_payload["_sign_valid"] = sitransferhub_verify_callback_signature(
+                secret_key=secret_key,
+                raw_body=raw_body,
+                signature=request.headers.get("X-Hub-Signature", ""),
+            ) if secret_key else False
+            dep.callback_payload = callback_payload
+            dep.callback_at = timezone.now()
+            dep.save(update_fields=["callback_payload", "callback_at"])
+
+        if not trx or not secret_key:
+            return Response({"ok": True}, status=status.HTTP_200_OK)
+
+        sign_valid = sitransferhub_verify_callback_signature(
+            secret_key=secret_key,
+            raw_body=raw_body,
+            signature=request.headers.get("X-Hub-Signature", ""),
+        )
+        if not sign_valid:
+            return Response({"ok": True}, status=status.HTTP_200_OK)
+
+        _sitransferhub_apply_callback_status(trx, dep, _sitransferhub_extract_status(payload))
+        return Response({"ok": True}, status=status.HTTP_200_OK)
+
+
 class DepositTransactionsListView(APIView):
     permission_classes = [permissions.IsAuthenticated]
     throttle_scope = 'transactions'
@@ -2167,7 +3031,7 @@ class DepositTransactionsListView(APIView):
             OpenApiParameter(name='wallet_type', type=str, description='Filter wallet (BALANCE/BALANCE_DEPOSIT)'),
             OpenApiParameter(name='start_date', type=str, description='Tanggal mulai (YYYY-MM-DD)'),
             OpenApiParameter(name='end_date', type=str, description='Tanggal akhir (YYYY-MM-DD)'),
-            OpenApiParameter(name='gateway', type=str, description='Filter gateway (JAYAPAY/KLIKPAY/USD_GATEWAY/PPAYPROS)'),
+            OpenApiParameter(name='gateway', type=str, description='Filter gateway (JAYAPAY/KLIKPAY/USD_GATEWAY/PPAYPROS/CLIENTHUB)'),
             OpenApiParameter(name='order_num', type=str, description='Filter berdasarkan nomor order'),
             OpenApiParameter(name='page', type=int, description='A page number within the paginated result set.'),
         ],
