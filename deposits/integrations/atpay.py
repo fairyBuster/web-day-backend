@@ -382,56 +382,31 @@ def fetch_wowpayidr_va(
             "available_methods": valid,
         }
 
-    # 2) Select method — try multiple possible endpoints with session cookies
+    # 2) Select method — wowpayidr accepts POST to checkout base with method+step
+    # The /select endpoint is 404 (BAD_REQUEST), so POST directly to checkout_base
     select_headers = {
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json",
         "Referer": checkout_base,
         "Origin": domain,
     }
-    select_body = {"method": method_upper}
 
-    select_urls = [
-        f"{checkout_base}/select",
-        checkout_base,
-        f"{domain}/api/cash-in/select/{checkout_uuid}",
+    # Try all known select payload variations
+    select_payloads = [
+        {"method": method_upper},
+        {"method": method_upper, "step": "TO_SELECT_METHOD"},
+        {"method": method_upper, "selectedMethod": method_upper},
+        {"selectedMethod": method_upper, "step": "TO_SELECT_METHOD"},
     ]
-    selected = False
 
-    for sel_url in select_urls:
-        _logger.info(f"ATPAY VA: trying select POST {sel_url}")
+    for payload in select_payloads:
+        _logger.info(f"ATPAY VA: trying POST {checkout_base} with payload={payload}")
         try:
-            r2 = session.post(sel_url, json=select_body, headers=select_headers, timeout=timeout)
-            _logger.info(f"ATPAY VA: select POST {sel_url} → HTTP {r2.status_code}, body={r2.text[:300]}")
-            if r2.status_code < 400 and r2.status_code != 404:
-                selected = True
-                break
+            r2 = session.post(checkout_base, json=payload, headers=select_headers, timeout=timeout)
+            _logger.info(f"ATPAY VA: POST {checkout_base} → HTTP {r2.status_code}, body={r2.text[:300]}")
         except Exception as e:
-            _logger.info(f"ATPAY VA: select POST {sel_url} error: {str(e)}")
-
-    if not selected:
-        # Try with step parameter
-        for sel_url in select_urls[:2]:
-            try:
-                r2 = session.post(sel_url, json={"method": method_upper, "step": "TO_PAY"}, headers=select_headers, timeout=timeout)
-                _logger.info(f"ATPAY VA: select POST with step {sel_url} → HTTP {r2.status_code}, body={r2.text[:300]}")
-                if r2.status_code < 400 and r2.status_code != 404:
-                    selected = True
-                    break
-            except Exception as e:
-                _logger.info(f"ATPAY VA: select POST with step {sel_url} error: {str(e)}")
-
-    if not selected:
-        # Try PUT
-        for sel_url in select_urls[:2]:
-            try:
-                r2 = session.put(sel_url, json=select_body, headers=select_headers, timeout=timeout)
-                _logger.info(f"ATPAY VA: select PUT {sel_url} → HTTP {r2.status_code}, body={r2.text[:300]}")
-                if r2.status_code < 400 and r2.status_code != 404:
-                    selected = True
-                    break
-            except Exception as e:
-                _logger.info(f"ATPAY VA: select PUT {sel_url} error: {str(e)}")
+            _logger.info(f"ATPAY VA: POST error: {str(e)}")
+            continue
 
     # 3) GET checkout again to retrieve VA
     try:
