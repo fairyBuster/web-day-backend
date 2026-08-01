@@ -55,7 +55,7 @@ class PhoneOTPAdmin(admin.ModelAdmin):
 class UserAdmin(BaseUserAdmin):
     """Admin configuration for custom User model."""
     
-    list_display = ('phone', 'email', 'full_name', 'telegram', 'balance_display', 'balance_deposit_display', 'balance_hold_display', 'balance_cashback_display',
+    list_display = ('phone', 'username', 'email', 'full_name', 'telegram', 'balance_display', 'balance_deposit_display', 'balance_hold_display', 'balance_cashback_display',
                    'banned_status_display', 'rank', 'referral_code', 'referral_by_display', 
                    'account_status_display', 'last_login_ip', 'created_at')
     # Optimization: prefetch related fields to avoid N+1 queries
@@ -66,7 +66,7 @@ class UserAdmin(BaseUserAdmin):
     
     fieldsets = (
         (None, {'fields': ('username', 'email', 'password')}),
-        ('Personal Info', {'fields': ('full_name', 'phone', 'telegram', 'withdraw_pin_raw')}),
+        ('Personal Info', {'fields': ('full_name', 'phone', 'telegram', 'avatar', 'withdraw_pin_raw')}),
         ('Balance', {'fields': ('balance', 'balance_deposit', 'balance_hold', 'balance_cashback')}),
         ('Referral System', {'fields': ('referral_code', 'referral_by', 'rank', 'downline_overview_link')}),
         ('Account Status', {
@@ -454,7 +454,7 @@ class UserAdmin(BaseUserAdmin):
 class GeneralSettingAdmin(admin.ModelAdmin):
     list_display = (
         'referral_code_case', 'referral_code_length', 'exclude_similar_chars',
-        'referral_code_pattern', 'referral_daily_invite_limit', 'auto_login_on_register', 'registration_bonus_enabled', 'registration_bonus_amount', 'registration_bonus_wallet', 'deposit_cashback_enabled', 'deposit_cashback_percent', 'currency_code', 'rank_logic', 'rank_count_levels_upto', 'frontend_url', 'updated_at'
+        'referral_code_pattern', 'referral_daily_invite_limit', 'auto_login_on_register', 'registration_bonus_enabled', 'registration_bonus_amount', 'registration_bonus_wallet', 'require_referral_code_on_register', 'bypass_otp_on_register', 'deposit_cashback_enabled', 'deposit_cashback_percent', 'currency_code', 'rank_logic', 'rank_count_levels_upto', 'frontend_url', 'updated_at'
     )
     readonly_fields = ('created_at', 'updated_at')
     fieldsets = (
@@ -468,13 +468,13 @@ class GeneralSettingAdmin(admin.ModelAdmin):
             'fields': ('referral_code_case', 'referral_code_length', 'exclude_similar_chars', 'referral_code_pattern', 'referral_daily_invite_limit')
         }),
         ('Autentikasi', {
-            'fields': ('auto_login_on_register', 'registration_bonus_enabled', 'registration_bonus_amount', 'registration_bonus_wallet', 'require_withdraw_pin_on_register', 'require_withdraw_pin_on_purchase')
+            'fields': ('auto_login_on_register', 'registration_bonus_enabled', 'registration_bonus_amount', 'registration_bonus_wallet', 'require_withdraw_pin_on_register', 'require_withdraw_pin_on_purchase', 'require_referral_code_on_register')
         }),
         ('Deposit Cashback', {
             'fields': ('deposit_cashback_enabled', 'deposit_cashback_percent')
         }),
         ('WhatsApp OTP', {
-            'fields': ('otp_enabled', 'otp_provider', 'verifynow_customer_id', 'verifynow_api_key', 'fazpass_merchant_key', 'fazpass_gateway_key', 'verifyway_api_key'),
+            'fields': ('otp_enabled', 'otp_provider', 'verifynow_customer_id', 'verifynow_api_key', 'fazpass_merchant_key', 'fazpass_gateway_key', 'verifyway_api_key', 'bypass_otp_on_register'),
             'description': 'Konfigurasi OTP via WhatsApp (VerifyNow atau Legacy VerifyWay). Jika VerifyNow credentials diisi, sistem akan memprioritaskannya.'
         }),
         ('WhatsApp Number Check (Backup)', {

@@ -4,10 +4,11 @@ from .models import RoulettePrize
 
 class RoulettePrizeSerializer(serializers.ModelSerializer):
     probability_percent = serializers.SerializerMethodField()
+    image = serializers.ImageField(read_only=True)
 
     class Meta:
         model = RoulettePrize
-        fields = ("id", "name", "description", "prize_type", "amount", "probability_percent")
+        fields = ("id", "name", "image", "description", "prize_type", "amount", "probability_percent")
 
     def get_probability_percent(self, obj):
         total_weight = self.context.get("total_weight") or 0

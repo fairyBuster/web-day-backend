@@ -404,6 +404,18 @@ def update_user_rank(user):
         
     try:
         b = calculate_user_rank_progress_breakdown(user)
+
+        # Jika semua progress masih 0, jangan assign rank (user baru)
+        progress_values = [
+            b.get('missions', 0) or 0,
+            b.get('downlines_total', 0) or 0,
+            b.get('downlines_active', 0) or 0,
+            b.get('deposit_self_total', 0) or 0,
+            b.get('team_deposit_level_1_total', 0) or 0,
+        ]
+        if not any(v > 0 for v in progress_values):
+            return user.rank
+
         target = get_highest_eligible_rank_level(user, progress_breakdown=b)
         
         if target:

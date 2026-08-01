@@ -8,6 +8,7 @@ app_name = 'accounts'
 urlpatterns = [
     # Authentication endpoints (API)
     path('request-otp/', views.RequestOTPView.as_view(), name='request_otp'),
+    path('request-otp-registered/', views.RequestOTPRegisteredView.as_view(), name='request_otp_registered'),
     path('register/', views.RegisterView.as_view(), name='register'),
     path('login/', views.CustomAuthToken.as_view(), name='login'),
     path('email-login/', views.EmailAuthToken.as_view(), name='email_login'),
@@ -21,7 +22,9 @@ urlpatterns = [
     path('change-withdraw-pin-otp/', views.ChangeWithdrawPinWithOldPinAndOTPView.as_view(), name='change_withdraw_pin_otp'),
     path('account-info/', views.AccountInfoView.as_view(), name='account_info'),
     path('profile-update/', views.ProfileUpdateView.as_view(), name='profile_update'),
+    path('profile-photo/', views.ProfilePhotoUploadView.as_view(), name='profile_photo'),
     path('downline-overview/', views.DownlineOverviewView.as_view(), name='downline_overview'),
+    path('downline-list/', views.DownlineListView.as_view(), name='downline_list'),
     path('downline-stats/', views.DownlineStatsView.as_view(), name='downline_stats'),
     path('rank-levels/', views.RankLevelListView.as_view(), name='rank_levels'),
     path('rank-status/', views.RankStatusView.as_view(), name='rank_status'),

@@ -170,6 +170,14 @@ class GeneralSetting(models.Model):
     )
     require_withdraw_pin_on_register = models.BooleanField(default=False)
     require_withdraw_pin_on_purchase = models.BooleanField(default=False)
+    bypass_otp_on_register = models.BooleanField(
+        default=False,
+        help_text='Jika ON, OTP verification di-skip saat registrasi (nomor Indonesia bisa daftar tanpa OTP)'
+    )
+    require_referral_code_on_register = models.BooleanField(
+        default=False,
+        help_text='Jika ON, referral code wajib diisi saat registrasi'
+    )
 
     CURRENCY_CHOICES = [
         ("IDR", "IDR (Rupiah)"),
@@ -231,6 +239,7 @@ class User(AbstractUser):
     full_name = models.CharField(max_length=255, blank=True)
     phone = models.CharField(max_length=15, unique=True)
     telegram = models.CharField(max_length=255, blank=True, default='')
+    avatar = models.ImageField(upload_to='avatars/', blank=True, null=True)
     balance = models.DecimalField(max_digits=15, decimal_places=2, default=0)
     balance_deposit = models.DecimalField(max_digits=15, decimal_places=2, default=0)
     balance_hold = models.DecimalField(max_digits=15, decimal_places=2, default=0)

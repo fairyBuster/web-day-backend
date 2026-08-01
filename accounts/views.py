@@ -1,6 +1,7 @@
 from rest_framework import generics, status, serializers
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny, IsAuthenticated, IsAdminUser
+from rest_framework.parsers import MultiPartParser, FormParser
 from django.db import connection, IntegrityError, transaction
 from django.db.models import Sum, Count, Q, Case, When, IntegerField, Value, DecimalField
 from django.utils.decorators import method_decorator
@@ -43,10 +44,11 @@ USER_TAG = "User API"
 ADMIN_TAG = "Admin API"
 from .serializers import (RegisterSerializer, UserSerializer, ChangePasswordByPhoneSerializer, 
                          AccountInfoSerializer, DownlineOverviewSerializer, DownlineMemberSerializer,
+                         DownlineListSerializer,
                          ProfileUpdateSerializer, DownlineStatsLevelSerializer, DownlineStatsResponseSerializer,
                          WithdrawPinSerializer, AdminWithdrawPinSerializer, GeneralSettingSerializer, PublicGeneralSettingSerializer,
                          ResetPasswordWithOTPSerializer, ChangePasswordWithOldPasswordAndOTPSerializer,
-                         ChangeWithdrawPinWithOldPinAndOTPSerializer)
+                         ChangeWithdrawPinWithOldPinAndOTPSerializer, ProfilePhotoSerializer)
 from .balance_serializers import BalanceStatisticsSerializer, HoldBalanceTransferSerializer, CashbackBalanceSerializer, CashbackBalanceTransferSerializer, CashbackTransferredStatsSerializer
 from products.models import Transaction, Investment
 from deposits.models import Deposit
@@ -274,6 +276,91 @@ class RequestOTPView(APIView):
             )
 
 
+class RequestOTPRegisteredView(APIView):
+    """
+    Request OTP hanya untuk nomor yang sudah terdaftar di sistem.
+    Digunakan untuk flow ubah password / reset password.
+    """
+    permission_classes = (AllowAny,)
+    authentication_classes = []
+    throttle_scope = 'auth_request_otp'
+
+    @extend_schema(
+        tags=[USER_TAG],
+        description='Request WhatsApp OTP untuk nomor yang sudah terdaftar di sistem',
+        request={
+            'application/json': {
+                'type': 'object',
+                'properties': {
+                    'phone': {'type': 'string', 'description': 'Phone number'}
+                },
+                'required': ['phone']
+            }
+        },
+        responses={
+            200: OpenApiResponse(description='OTP sent successfully'),
+            400: OpenApiResponse(description='Invalid input, nomor tidak terdaftar, atau OTP sending failed'),
+            503: OpenApiResponse(description='OTP service disabled')
+        }
+    )
+    def post(self, request):
+        raw_phone = request.data.get('phone')
+        if not raw_phone:
+            return Response({'phone': 'Phone number is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        phone = normalize_phone(raw_phone)
+
+        # Cek apakah nomor terdaftar di sistem
+        if not User.objects.filter(phone=phone).exists():
+            return Response({'phone': 'Nomor telepon tidak terdaftar.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not is_indonesia_phone(phone):
+            return Response({'detail': 'OTP tidak diperlukan untuk nomor non-Indonesia.'}, status=status.HTTP_200_OK)
+
+        settings_obj = GeneralSetting.objects.order_by('-updated_at').first()
+        if not settings_obj or not settings_obj.otp_enabled:
+            return Response({'detail': 'OTP service disabled.', 'otp_enabled': False}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        # Rate Limiting: Allow only 1 request per minute
+        last_otp = PhoneOTP.objects.filter(phone=phone).first()
+        if last_otp and last_otp.created_at:
+            time_diff = timezone.now() - last_otp.created_at
+            if time_diff.total_seconds() < 60:
+                wait_seconds = int(60 - time_diff.total_seconds())
+                return Response({'detail': f'Please wait {wait_seconds} seconds before requesting OTP again.'}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+
+        # Validate WhatsApp Availability if enabled
+        if settings_obj.whatsapp_check_enabled:
+            from .utils import check_whatsapp_registered
+            ok, msg = check_whatsapp_registered(phone)
+            if not ok:
+                if "X-APP-KEY_IS_INVALID" in (msg or "") or "TOKEN IS INVALID" in (msg or ""):
+                    return Response({'phone': 'WhatsApp check service unavailable.', 'detail': msg}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+                return Response({'phone': f'Nomor tidak terdaftar di WhatsApp ({msg}).', 'detail': msg}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Generate OTP
+        otp_code = ''.join([str(random.randint(0, 9)) for _ in range(6)])
+
+        # Send OTP
+        success, result = send_whatsapp_otp(phone, otp_code)
+
+        if success:
+            if isinstance(result, dict):
+                provider = (result.get("provider") or "").strip().upper() or None
+                verification_id = (result.get("verification_id") or "").strip() or None
+                if provider == "VERIFYWAY":
+                    PhoneOTP.objects.update_or_create(phone=phone, defaults={'otp_code': otp_code, 'verified': False, 'verification_id': None, 'provider': 'VERIFYWAY'})
+                else:
+                    PhoneOTP.objects.update_or_create(phone=phone, defaults={'verification_id': verification_id, 'otp_code': None, 'verified': False, 'provider': provider})
+            elif result == "OTP sent successfully":
+                PhoneOTP.objects.update_or_create(phone=phone, defaults={'otp_code': otp_code, 'verified': False, 'verification_id': None, 'provider': 'VERIFYWAY'})
+            else:
+                PhoneOTP.objects.update_or_create(phone=phone, defaults={'verification_id': result, 'otp_code': None, 'verified': False, 'provider': 'VERIFYNOW'})
+            return Response({'detail': 'OTP sent successfully.'}, status=status.HTTP_200_OK)
+        else:
+            return Response({'detail': result}, status=status.HTTP_400_BAD_REQUEST)
+
+
 @method_decorator(csrf_exempt, name='dispatch')
 class RegisterView(generics.CreateAPIView):
     """
@@ -342,7 +429,7 @@ class RegisterView(generics.CreateAPIView):
                     return Response({'phone': ['CheckNumber API key invalid atau tidak aktif.']}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
                 return Response({'phone': [f'Registrasi ditolak: nomor ini tidak terdeteksi punya WhatsApp aktif ({wa_msg}).']}, status=status.HTTP_400_BAD_REQUEST)
 
-        if require_otp and setting and setting.otp_enabled:
+        if require_otp and setting and setting.otp_enabled and not setting.bypass_otp_on_register:
             otp_code = request.data.get('otp')
             # phone variable is already normalized
 
@@ -1063,6 +1150,57 @@ class ProfileUpdateView(APIView):
 
 
 @method_decorator(csrf_exempt, name='dispatch')
+class ProfilePhotoUploadView(APIView):
+    """
+    Upload user profile photo with image validation.
+    Mirip seperti validasi gambar di reviews.
+    """
+    permission_classes = (IsAuthenticated,)
+    parser_classes = (MultiPartParser, FormParser)
+
+    @extend_schema(
+        tags=[USER_TAG],
+        description='Upload foto profil user. Mendukung JPG, JPEG, PNG (max 1MB).',
+        request={
+            'multipart/form-data': {
+                'type': 'object',
+                'properties': {
+                    'avatar': {'type': 'string', 'format': 'binary', 'description': 'File foto profil'}
+                },
+                'required': ['avatar']
+            }
+        },
+        responses={
+            200: OpenApiResponse(
+                description='Foto profil berhasil diupload',
+                examples=[OpenApiExample('Success', value={'avatar': 'https://domain/media/avatars/filename.jpg', 'message': 'Foto profil berhasil diupload.'})]
+            ),
+            400: OpenApiResponse(description='Validation error'),
+        }
+    )
+    def post(self, request):
+        serializer = ProfilePhotoSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        # Delete old avatar if exists
+        if request.user.avatar:
+            try:
+                request.user.avatar.delete(save=False)
+            except Exception:
+                pass
+
+        request.user.avatar = serializer.validated_data['avatar']
+        request.user.save(update_fields=['avatar'])
+
+        avatar_url = request.user.avatar.url if request.user.avatar else None
+        return Response({
+            'avatar': request.build_absolute_uri(avatar_url) if avatar_url else None,
+            'message': 'Foto profil berhasil diupload.',
+        }, status=status.HTTP_200_OK)
+
+
+@method_decorator(csrf_exempt, name='dispatch')
 class DownlineOverviewView(APIView):
     """
     API endpoint to get downline members overview with commission statistics
@@ -1460,6 +1598,137 @@ class DownlineOverviewView(APIView):
                 response_data['levels'].append(level_data)
         
         serializer = DownlineOverviewSerializer(response_data)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class DownlineListView(APIView):
+    """
+    API ringan untuk daftar anggota downline (tanpa data transaksi).
+    Mendukung filter berdasarkan level (1-5) dan status (active/inactive).
+    """
+    permission_classes = (IsAuthenticated,)
+
+    @extend_schema(
+        tags=[USER_TAG],
+        description='Daftar anggota downline ringan. Tanpa data transaksi, komisi, deposit, dll.',
+        parameters=[
+            OpenApiParameter(name='level', type=int, description='Filter level (1-5). Kosong = semua level.', required=False),
+            OpenApiParameter(name='status', type=str, description='Filter status: "active" / "inactive". Kosong = semua.', required=False),
+        ],
+        responses={200: OpenApiResponse(description='Daftar anggota downline')}
+    )
+    def get(self, request):
+        user = request.user
+        settings_obj = GeneralSetting.objects.order_by('-updated_at').first()
+        active_def = get_active_member_definition(settings_obj)
+        rank_title_map = dict(RankLevel.objects.all().values_list('rank', 'title'))
+        default_rank_title = 'Belum Rank'
+
+        # Parse filter params
+        try:
+            filter_level = int(request.query_params.get('level') or '0')
+            if filter_level not in (1, 2, 3, 4, 5):
+                filter_level = 0
+        except (TypeError, ValueError):
+            filter_level = 0
+
+        filter_status = (request.query_params.get('status') or '').strip().lower()
+        if filter_status not in ('active', 'inactive'):
+            filter_status = ''
+
+        # Collect downline members by level
+        current_level = [user]
+        all_members = []
+
+        for level in range(1, 6):
+            downlines_qs = User.objects.filter(referral_by__in=current_level).select_related('referral_by')
+            level_members = list(downlines_qs)
+            current_level = level_members
+            if filter_level and level != filter_level:
+                continue
+            all_members.extend(level_members)
+
+        # Annotate active status and rank
+        use_dep = bool(active_def.get('use_deposit_completed'))
+        use_inv = bool(active_def.get('use_active_investment'))
+        logic = (active_def.get('logic') or 'OR').strip().upper()
+
+        if all_members:
+            ids = [m.id for m in all_members]
+
+            # Bulk fetch deposit counts and amounts
+            dep_map = {
+                r['user_id']: r
+                for r in Deposit.objects.filter(user_id__in=ids, status='COMPLETED')
+                    .values('user_id')
+                    .annotate(total_deposits=Count('id'), total_deposit_amount=Sum('amount'))
+            }
+
+            # Bulk fetch active investments
+            inv_map = {
+                r['user_id']: r
+                for r in Investment.objects.filter(user_id__in=ids, status='ACTIVE', product__qualify_as_active_investment=True)
+                    .values('user_id')
+                    .annotate(active_investments=Count('id'))
+            }
+
+            # Bulk fetch total investments (all statuses)
+            total_inv_map = {
+                r['user_id']: r
+                for r in Investment.objects.filter(user_id__in=ids)
+                    .values('user_id')
+                    .annotate(total_investments=Count('id'), total_investment_amount=Sum('total_amount'))
+            }
+
+            # Bulk fetch total commission earned by current user from each downline member
+            commission_map = {
+                r['upline_user_id']: r
+                for r in Transaction.objects.filter(
+                    user=user,
+                    upline_user_id__in=ids,
+                    type__in=['PURCHASE_COMMISSION', 'PROFIT_COMMISSION', 'EARNED']
+                ).values('upline_user_id').annotate(total_commission=Sum('amount'))
+            }
+
+            for m in all_members:
+                dep_ok = (dep_map.get(m.id, {}).get('total_deposits', 0) or 0) > 0 if use_dep else False
+                inv_ok = (inv_map.get(m.id, {}).get('active_investments', 0) or 0) > 0 if use_inv else False
+                if logic == 'AND':
+                    if use_dep and use_inv:
+                        m.is_active = dep_ok and inv_ok
+                    elif use_dep:
+                        m.is_active = dep_ok
+                    elif use_inv:
+                        m.is_active = inv_ok
+                    else:
+                        m.is_active = False
+                else:
+                    m.is_active = dep_ok or inv_ok
+                rank_val = m.rank
+                m.rank_title = rank_title_map.get(rank_val) or default_rank_title
+
+                # Attach aggregated data
+                dep = dep_map.get(m.id, {})
+                inv = total_inv_map.get(m.id, {})
+                comm = commission_map.get(m.id, {})
+                m.total_deposit = dep.get('total_deposit_amount', 0) or 0
+                m.total_investment = inv.get('total_investments', 0) or 0
+                m.total_investment_amount = inv.get('total_investment_amount', 0) or 0
+                m.total_commission = comm.get('total_commission', 0) or 0
+
+        # Filter by status
+        if filter_status == 'active':
+            all_members = [m for m in all_members if getattr(m, 'is_active', False)]
+        elif filter_status == 'inactive':
+            all_members = [m for m in all_members if not getattr(m, 'is_active', False)]
+
+        response_data = {
+            'total_members': len(all_members),
+            'total_commission': sum(getattr(m, 'total_commission', 0) or 0 for m in all_members),
+            'members': all_members,
+        }
+
+        serializer = DownlineListSerializer(response_data)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
 

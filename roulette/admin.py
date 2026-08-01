@@ -54,7 +54,7 @@ class RoulettePrizeAdmin(admin.ModelAdmin):
         (
             "Hadiah",
             {
-                "fields": ("name", "description", "prize_type", "amount"),
+                "fields": ("name", "image", "description", "prize_type", "amount"),
                 "description": "Jika prize_type=NONE maka ini zonk. Jika BALANCE/BALANCE_DEPOSIT maka amount akan masuk ke wallet terkait.",
             },
         ),

@@ -4,6 +4,7 @@ from django.db import models
 class News(models.Model):
     title = models.CharField(max_length=200)
     slug = models.SlugField(max_length=220, unique=True)
+    author_name = models.CharField(max_length=200, blank=True, default='', help_text='Nama penulis berita')
     body = models.TextField()
     image = models.ImageField(upload_to='news/', blank=True, null=True)
     is_published = models.BooleanField(default=True)

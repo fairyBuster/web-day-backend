@@ -1,4 +1,6 @@
 from datetime import datetime, time, timedelta
+import os
+from PIL import Image
 from django.db import transaction
 from django.db.models import Sum, Count, Q
 from rest_framework import serializers
@@ -25,6 +27,8 @@ class PublicGeneralSettingSerializer(serializers.ModelSerializer):
             'otp_enabled',
             'otp_provider',
             'whatsapp_check_enabled',
+            'bypass_otp_on_register',
+            'require_referral_code_on_register',
         )
 
 
@@ -32,7 +36,7 @@ class UserSerializer(serializers.ModelSerializer):
     """Serializer for User model - used for GET requests"""
     class Meta:
         model = User
-        fields = ('id', 'username', 'email', 'full_name', 'phone', 'telegram', 'balance', 
+        fields = ('id', 'username', 'email', 'full_name', 'phone', 'telegram', 'avatar', 'balance', 
                  'balance_deposit', 'balance_hold', 'balance_cashback', 'banned_status', 'referral_by', 'referral_code', 
                  'rank', 'is_account_non_expired', 'is_account_non_locked', 
                  'is_credentials_non_expired', 'is_enabled', 'created_at', 'updated_at')
@@ -76,6 +80,9 @@ class RegisterSerializer(serializers.ModelSerializer):
 
         # Validate referral code if provided
         referral_code = attrs.pop('referral_code', None)
+        settings_obj = GeneralSetting.objects.order_by('-updated_at').first()
+        if settings_obj and settings_obj.require_referral_code_on_register and not referral_code:
+            raise serializers.ValidationError({"referral_code": "Kode referral wajib diisi saat pendaftaran."})
         if referral_code:
             try:
                 referrer = User.objects.get(referral_code=referral_code)
@@ -274,9 +281,11 @@ class AccountInfoSerializer(serializers.ModelSerializer):
     ip_address = serializers.SerializerMethodField()
     active_investments_count = serializers.SerializerMethodField()
 
+    avatar = serializers.SerializerMethodField()
+
     class Meta:
         model = User
-        fields = ('id', 'username', 'email', 'full_name', 'phone', 'telegram', 'balance', 
+        fields = ('id', 'username', 'email', 'full_name', 'phone', 'telegram', 'avatar', 'balance', 
                  'balance_deposit', 'balance_hold', 'balance_cashback', 'referral_by_username', 'referral_by_phone', 
                  'root_parent_username', 'root_parent_phone',
                  'referral_code', 'rank', 'created_at', 'updated_at', 'ip_address', 'active_investments_count')
@@ -284,6 +293,14 @@ class AccountInfoSerializer(serializers.ModelSerializer):
                            'balance_deposit', 'balance_hold', 'balance_cashback', 'referral_by_username', 'referral_by_phone', 
                            'root_parent_username', 'root_parent_phone',
                            'referral_code', 'rank', 'created_at', 'updated_at', 'active_investments_count')
+
+    def get_avatar(self, obj):
+        if obj.avatar:
+            request = self.context.get('request')
+            if request:
+                return request.build_absolute_uri(obj.avatar.url)
+            return obj.avatar.url
+        return None
 
     def get_active_investments_count(self, obj):
         return Investment.objects.filter(user=obj, status='ACTIVE').count()
@@ -740,16 +757,87 @@ class DownlineOverviewSerializer(serializers.Serializer):
     levels = DownlineLevelSerializer(many=True)
 
 
-class ProfileUpdateSerializer(serializers.ModelSerializer):
-    """Serializer for updating user profile - full_name, username, and telegram"""
-    
-    class Meta:
-        model = User
-        fields = ('full_name', 'username', 'telegram')
-    
-    def validate_username(self, value):
-        """Validate that username is unique (excluding current user)"""
-        user = self.instance
-        if User.objects.filter(username=value).exclude(id=user.id).exists():
-            raise serializers.ValidationError("Username sudah digunakan oleh user lain.")
+class DownlineListMemberSerializer(serializers.Serializer):
+    """Serializer ringan untuk daftar anggota downline (tanpa data transaksi)"""
+    id = serializers.IntegerField()
+    username = serializers.CharField()
+    phone = serializers.CharField()
+    full_name = serializers.CharField()
+    referral_by_username = serializers.SerializerMethodField()
+    referral_by_phone = serializers.SerializerMethodField()
+    referral_by_code = serializers.SerializerMethodField()
+    referral_code = serializers.CharField()
+    rank = serializers.IntegerField(allow_null=True)
+    rank_title = serializers.CharField(allow_null=True)
+    is_active = serializers.BooleanField()
+    total_deposit = serializers.DecimalField(max_digits=15, decimal_places=2)
+    total_investment = serializers.IntegerField()
+    total_investment_amount = serializers.DecimalField(max_digits=15, decimal_places=2)
+    total_commission = serializers.DecimalField(max_digits=15, decimal_places=2)
+    registration_date = serializers.DateTimeField(source='created_at', read_only=True)
+
+    def get_referral_by_username(self, obj):
+        ref = getattr(obj, 'referral_by', None)
+        return ref.username if ref else None
+
+    def get_referral_by_phone(self, obj):
+        ref = getattr(obj, 'referral_by', None)
+        return ref.phone if ref else None
+
+    def get_referral_by_code(self, obj):
+        ref = getattr(obj, 'referral_by', None)
+        return ref.referral_code if ref else None
+
+
+class DownlineListSerializer(serializers.Serializer):
+    """Serializer ringan untuk response daftar downline"""
+    total_members = serializers.IntegerField()
+    total_commission = serializers.DecimalField(max_digits=15, decimal_places=2)
+    members = DownlineListMemberSerializer(many=True)
+
+
+class ProfilePhotoSerializer(serializers.Serializer):
+    """Serializer for uploading profile photo with image validation."""
+    avatar = serializers.ImageField(write_only=True, required=True)
+
+    def validate_avatar(self, value):
+        allowed_formats = {
+            "JPEG": {".jpg", ".jpeg"},
+            "PNG": {".png"},
+        }
+        allowed_content_types = {"image/jpeg", "image/png"}
+        max_bytes = 1 * 1024 * 1024  # 1MB
+
+        if getattr(value, "size", 0) > max_bytes:
+            raise serializers.ValidationError("Ukuran foto maksimal 1MB.")
+
+        filename = (getattr(value, "name", "") or "").strip()
+        extension = os.path.splitext(filename)[1].lower()
+        if not extension or extension not in {ext for exts in allowed_formats.values() for ext in exts}:
+            raise serializers.ValidationError("Ekstensi file harus JPG, JPEG, atau PNG.")
+
+        content_type = (getattr(value, "content_type", "") or "").lower().strip()
+        if content_type and content_type not in allowed_content_types:
+            raise serializers.ValidationError("Content-Type file harus image JPG/PNG.")
+
+        try:
+            img = Image.open(value)
+            img.verify()
+            value.seek(0)
+            img = Image.open(value)
+            img.load()
+            fmt = (img.format or "").upper()
+        except Exception:
+            raise serializers.ValidationError("File gambar tidak valid.")
+        finally:
+            try:
+                value.seek(0)
+            except Exception:
+                pass
+
+        if fmt not in allowed_formats:
+            raise serializers.ValidationError("Format gambar harus JPG/PNG/WEBP.")
+        if extension not in allowed_formats[fmt]:
+            raise serializers.ValidationError("Ekstensi file tidak sesuai dengan isi gambar.")
+
         return value

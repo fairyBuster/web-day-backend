@@ -55,6 +55,7 @@ class RoulettePrize(models.Model):
     ]
 
     name = models.CharField(max_length=120)
+    image = models.ImageField(upload_to='roulette/', blank=True, null=True, help_text='Gambar hadiah roulette')
     description = models.TextField(blank=True)
     prize_type = models.CharField(
         max_length=20,
