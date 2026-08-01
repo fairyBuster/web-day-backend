@@ -305,15 +305,20 @@ def fetch_wowpayidr_va(
     Returns dict with keys: va, expire_time, msn, additional_info,
           merchant_reference_id, amount, selected_method, error (if any)
     """
+    import logging
+    _logger = logging.getLogger(__name__)
     from urllib.parse import urlparse, parse_qs
+
+    _headers = {
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    }
 
     parsed = urlparse(trade_url)
     domain = f"{parsed.scheme}://{parsed.netloc}"
-    # Try extracting UUID from query param 'uuid'
     qs = parse_qs(parsed.query)
     checkout_uuid = (qs.get("uuid") or [None])[0]
 
-    # If no query uuid, extract from page
     if not checkout_uuid:
         checkout_uuid = _extract_checkout_uuid_from_page(trade_url, timeout=timeout)
 
@@ -321,12 +326,21 @@ def fetch_wowpayidr_va(
         return {"error": "Gagal mendapatkan checkout UUID dari trade_url."}
 
     checkout_base = f"{domain}/api/cash-in/checkout/{checkout_uuid}"
+    _logger.info(f"ATPAY VA: checkout_base={checkout_base}")
 
     # 1) GET checkout → get available methods
     try:
-        r1 = requests.get(checkout_base, timeout=timeout)
+        r1 = requests.get(checkout_base, headers=_headers, timeout=timeout)
+        r1.raise_for_status()
+        raw_text = r1.text.strip()
+        if not raw_text:
+            raise ValueError("Response kosong (mungkin Cloudflare challenge)")
         data1 = r1.json()
+    except requests.HTTPError as e:
+        _logger.error(f"ATPAY VA HTTP error: status={r1.status_code}, body=...{r1.text[-200:] if r1.text else ''}")
+        return {"error": f"Gagal mengakses checkout page (HTTP {r1.status_code})"}
     except Exception as e:
+        _logger.error(f"ATPAY VA error GET checkout: {str(e)}, body=...{r1.text[-200:] if r1.text else ''}")
         return {"error": f"Gagal mengakses checkout page: {str(e)}"}
 
     if data1.get("code") != "SUCCESS":
@@ -336,9 +350,11 @@ def fetch_wowpayidr_va(
             checkout_uuid = fresh_uuid
             checkout_base = f"{domain}/api/cash-in/checkout/{checkout_uuid}"
             try:
-                r1 = requests.get(checkout_base, timeout=timeout)
+                r1 = requests.get(checkout_base, headers=_headers, timeout=timeout)
+                r1.raise_for_status()
                 data1 = r1.json()
             except Exception as e:
+                _logger.error(f"ATPAY VA retry error: {str(e)}")
                 return {"error": f"Gagal mengakses checkout page: {str(e)}"}
             if data1.get("code") != "SUCCESS":
                 return {"error": data1.get("message", "Checkout API error")}
@@ -349,7 +365,6 @@ def fetch_wowpayidr_va(
     merchant_reference_id = (data1.get("data") or {}).get("merchantReferenceId") or ""
     amount = (data1.get("data") or {}).get("amount") or "0"
 
-    # Validate method exists
     method_upper = method.strip().upper()
     valid = [m.get("method", "") for m in support_methods]
     if method_upper not in [vm.upper() for vm in valid]:
@@ -358,25 +373,25 @@ def fetch_wowpayidr_va(
             "available_methods": valid,
         }
 
-    # 2) Select method — try POST to checkout/select endpoint
+    # 2) Select method
     select_url = f"{checkout_base}/select"
     try:
-        r2 = requests.post(select_url, json={"method": method_upper}, timeout=timeout)
-        # Some implementations might use different endpoints
+        r2 = requests.post(select_url, json={"method": method_upper}, headers=_headers, timeout=timeout)
         if r2.status_code == 404:
-            # fallback: try POST to checkout base directly
-            r2 = requests.post(checkout_base, json={"method": method_upper, "step": "TO_PAY"}, timeout=timeout)
+            r2 = requests.post(checkout_base, json={"method": method_upper, "step": "TO_PAY"}, headers=_headers, timeout=timeout)
         if r2.status_code == 404:
-            # fallback: try GET with method param
-            r2 = requests.get(f"{checkout_base}?method={method_upper}", timeout=timeout)
+            r2 = requests.get(f"{checkout_base}?method={method_upper}", headers=_headers, timeout=timeout)
     except Exception as e:
+        _logger.error(f"ATPAY VA select method error: {str(e)}")
         return {"error": f"Gagal memilih method: {str(e)}"}
 
     # 3) GET checkout again to retrieve VA
     try:
-        r3 = requests.get(checkout_base, timeout=timeout)
+        r3 = requests.get(checkout_base, headers=_headers, timeout=timeout)
+        r3.raise_for_status()
         data3 = r3.json()
     except Exception as e:
+        _logger.error(f"ATPAY VA get VA error: {str(e)}")
         return {"error": f"Gagal mendapatkan VA: {str(e)}"}
 
     if data3.get("code") != "SUCCESS":
