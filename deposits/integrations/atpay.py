@@ -309,15 +309,24 @@ def fetch_wowpayidr_va(
     _logger = logging.getLogger(__name__)
     from urllib.parse import urlparse, parse_qs
 
-    _headers = {
-        "Accept": "application/json, text/plain, */*",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    }
-
     parsed = urlparse(trade_url)
     domain = f"{parsed.scheme}://{parsed.netloc}"
     qs = parse_qs(parsed.query)
     checkout_uuid = (qs.get("uuid") or [None])[0]
+
+    # Use session to persist cookies across requests (required by wowpayidr)
+    session = requests.Session()
+    session.headers.update({
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    })
+
+    # First visit the HTML payment page to establish session/cookies
+    try:
+        page_resp = session.get(trade_url, timeout=timeout, allow_redirects=True)
+        _logger.info(f"ATPAY VA: visited payment page, status={page_resp.status_code}")
+    except Exception as e:
+        _logger.warning(f"ATPAY VA: could not visit payment page: {str(e)}")
 
     if not checkout_uuid:
         checkout_uuid = _extract_checkout_uuid_from_page(trade_url, timeout=timeout)
@@ -330,7 +339,7 @@ def fetch_wowpayidr_va(
 
     # 1) GET checkout → get available methods
     try:
-        r1 = requests.get(checkout_base, headers=_headers, timeout=timeout)
+        r1 = session.get(checkout_base, timeout=timeout)
         r1.raise_for_status()
         raw_text = r1.text.strip()
         if not raw_text:
@@ -350,7 +359,7 @@ def fetch_wowpayidr_va(
             checkout_uuid = fresh_uuid
             checkout_base = f"{domain}/api/cash-in/checkout/{checkout_uuid}"
             try:
-                r1 = requests.get(checkout_base, headers=_headers, timeout=timeout)
+                r1 = session.get(checkout_base, timeout=timeout)
                 r1.raise_for_status()
                 data1 = r1.json()
             except Exception as e:
@@ -373,21 +382,50 @@ def fetch_wowpayidr_va(
             "available_methods": valid,
         }
 
-    # 2) Select method
-    select_url = f"{checkout_base}/select"
-    try:
-        r2 = requests.post(select_url, json={"method": method_upper}, headers=_headers, timeout=timeout)
-        if r2.status_code == 404:
-            r2 = requests.post(checkout_base, json={"method": method_upper, "step": "TO_PAY"}, headers=_headers, timeout=timeout)
-        if r2.status_code == 404:
-            r2 = requests.get(f"{checkout_base}?method={method_upper}", headers=_headers, timeout=timeout)
-    except Exception as e:
-        _logger.error(f"ATPAY VA select method error: {str(e)}")
-        return {"error": f"Gagal memilih method: {str(e)}"}
+    # 2) Select method — try multiple possible endpoints with session cookies
+    select_headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "Referer": checkout_base,
+        "Origin": domain,
+    }
+    select_body = {"method": method_upper}
+
+    select_urls = [
+        f"{checkout_base}/select",
+        checkout_base,
+        f"{domain}/api/cash-in/select/{checkout_uuid}",
+    ]
+    selected = False
+
+    for sel_url in select_urls:
+        _logger.info(f"ATPAY VA: trying select POST {sel_url}")
+        try:
+            r2 = session.post(sel_url, json=select_body, headers=select_headers, timeout=timeout)
+            if r2.status_code < 400 and r2.status_code != 404:
+                _logger.info(f"ATPAY VA: select POST {sel_url} → HTTP {r2.status_code}")
+                selected = True
+                break
+            else:
+                _logger.info(f"ATPAY VA: select POST {sel_url} → HTTP {r2.status_code}")
+        except Exception as e:
+            _logger.info(f"ATPAY VA: select POST {sel_url} error: {str(e)}")
+
+    if not selected:
+        # Try PUT
+        for sel_url in select_urls[:2]:
+            try:
+                r2 = session.put(sel_url, json=select_body, headers=select_headers, timeout=timeout)
+                if r2.status_code < 400 and r2.status_code != 404:
+                    _logger.info(f"ATPAY VA: select PUT {sel_url} → HTTP {r2.status_code}")
+                    selected = True
+                    break
+            except Exception as e:
+                _logger.info(f"ATPAY VA: select PUT {sel_url} error: {str(e)}")
 
     # 3) GET checkout again to retrieve VA
     try:
-        r3 = requests.get(checkout_base, headers=_headers, timeout=timeout)
+        r3 = session.get(checkout_base, timeout=timeout)
         r3.raise_for_status()
         data3 = r3.json()
     except Exception as e:
