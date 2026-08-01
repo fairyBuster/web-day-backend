@@ -2,6 +2,14 @@
 
 Dokumen ini menjelaskan alur CI/CD project menggunakan GitHub Actions.
 
+ssh-keygen -t ed25519 -f ~/.ssh/deploy_key -N ""
+
+cat ~/.ssh/deploy_key.pub >> ~/.ssh/authorized_keys
+chmod 700 ~/.ssh
+chmod 600 ~/.ssh/authorized_keys
+
+cat ~/.ssh/deploy_key
+
 ## Ringkasan
 
 Project ini memakai 2 workflow:
