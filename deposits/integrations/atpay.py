@@ -382,57 +382,69 @@ def fetch_wowpayidr_va(
             "available_methods": valid,
         }
 
-    # 2) Select method — try multiple approaches
+    # 2) Reverse-engineered: JS generates X-SN = MD5(merchantReferenceId + currentTime + secret?)
+    # The JS would compute this client-side. Since we have no X-SN, let's try calling
+    # /api/cash-in/select/{uuid} without it — and also try the /pending page approach.
+    # 
+    # Key insight from browser: after method select, the referer changed from 
+    # /payment?uuid= to /pending?uuid= and checkout instantly returned TO_PAY.
+    # This suggests the selection goes through the JS-SPA routing, not a REST API call.
+    # 
+    # Let's try hitting the checkout API with referer=/pending?uuid= which mimics 
+    # the SPA state after JS internally selected the method.
     select_headers = {
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json",
-        "Referer": f"{domain}/payment?uuid={checkout_uuid}",
+        "Referer": f"{domain}/pending?uuid={checkout_uuid}&method={method_upper}",
         "Origin": domain,
     }
-
-    _logger.info(f"ATPAY VA: full checkout body: {json.dumps(data1, ensure_ascii=False)[:2000]}")
-    _logger.info(f"ATPAY VA: cookies={dict(session.cookies)}, resp_headers_xsn={r1.headers.get('X-SN', 'none')}")
-
-    # Approach 1: GET checkout with ?method= query param (many APIs support this)
+    _logger.info(f"ATPAY VA: trying GET with pending referer")
     try:
-        r_method = session.get(f"{checkout_base}?method={method_upper}", timeout=timeout)
-        _logger.info(f"ATPAY VA: GET {checkout_base}?method={method_upper} → step={(r_method.json().get('data',{}).get('step'))}")
+        r_pending = session.get(checkout_base, headers=select_headers, timeout=timeout)
+        _logger.info(f"ATPAY VA: pending-referer GET → HTTP {r_pending.status_code}, step={(r_pending.json().get('data',{}) or {}).get('step','?')}")
     except Exception:
         pass
 
-    # Approach 2: Fetch JS bundle to find select endpoint
+    # Also try: the JS app navigates to /pending?uuid=X and then calls checkout,
+    # which now returns TO_PAY. Let's simulate GET /pending first, then checkout.
+    try:
+        _logger.info(f"ATPAY VA: simulating JS navigation to /pending")
+        r_nav = session.get(f"{domain}/pending?uuid={checkout_uuid}", timeout=timeout)
+        _logger.info(f"ATPAY VA: nav /pending → HTTP {r_nav.status_code}")
+        # Now GET checkout with proper referer
+        h = {"Referer": f"{domain}/pending?uuid={checkout_uuid}", "Accept": "application/json, text/plain, */*"}
+        r3 = session.get(checkout_base, headers=h, timeout=timeout)
+        data3 = r3.json()
+        step = (data3.get("data") or {}).get("step", "")
+        _logger.info(f"ATPAY VA: after /pending nav, checkout step={step}")
+        if step == "TO_PAY":
+            # Success! Go straight to result
+            checkout_data = data3.get("data") or {}
+            return {
+                "va": checkout_data.get("va"),
+                "selected_method": checkout_data.get("selectedMethod") or method_upper,
+                "amount": checkout_data.get("amount") or amount,
+                "merchant_reference_id": checkout_data.get("merchantReferenceId") or merchant_reference_id,
+                "expire_time": checkout_data.get("expireTime"),
+                "msn": checkout_data.get("msn"),
+                "additional_info": checkout_data.get("additionalInfo") or {},
+                "method_guide": checkout_data.get("methodGuideVos") or [],
+                "error": None,
+            }
+    except Exception as e:
+        _logger.info(f"ATPAY VA: nav approach error: {str(e)[:200]}")
+
+    # Fallback: also log JS search results
     import re
     try:
-        r_js = session.get(f"{domain}/js/app.1c292c94.js", timeout=timeout)
-        if r_js.status_code != 200 or len(r_js.text) < 100:
-            html = session.get(f"{domain}/?uuid={checkout_uuid}", timeout=5).text
-            js_srcs = re.findall(r'src="(/js/[^"]+)"', html)
-            for src in js_srcs[:3]:
-                r_js = session.get(f"{domain}{src}", timeout=timeout)
-                if r_js.status_code == 200 and len(r_js.text) > 500:
-                    break
-        js_content = r_js.text or ""
-        if len(js_content) > 500:
-            for p in [r'select[^"\' ]*', r'[cC]ash[Ii]n[^"\' ]*', r'X-SN[^"\' ]*', r'method[^"\' ]*select']:
-                matches = re.findall(p, js_content[:100000], re.IGNORECASE)
-                if matches:
-                    _logger.info(f"ATPAY VA: JS pattern '{p}': {matches[:10]}")
-    except Exception as e:
-        _logger.info(f"ATPAY VA: JS search error: {str(e)[:200]}")
-    
-    # Approach 3: The selection likely sends currentTime/merchantReferenceId back
-    # Try POST to checkout with all known fields from data1
-    xsn = (data1.get("data") or {}).get("sn") or (data1.get("data") or {}).get("xSn")
-    if not xsn:
-        xsn = r1.headers.get("x-sn") or r1.headers.get("X-SN")
-    if xsn:
-        select_headers["X-SN"] = xsn
-    select_headers["Referer"] = f"{domain}/pending?uuid={checkout_uuid}"
-    try:
-        r2 = session.post(f"{domain}/api/cash-in/select/{checkout_uuid}", json={"method": method_upper}, headers=select_headers, timeout=timeout)
-        _logger.info(f"ATPAY VA: POST select → HTTP {r2.status_code}, body={r2.text[:500]}")
-    except Exception as e:
-        _logger.info(f"ATPAY VA: POST select error: {str(e)[:200]}")
+        js_text = session.get(f"{domain}/js/app.1c292c94.js", timeout=timeout).text or ""
+        for p in [r'X-SN[^"\' ]*', r'\.sn\b[^"\' ]*', r'select[^"\' ]*ap[ip]', r'[/\w]*method[/\w]*']:
+            matches = re.findall(p, js_text[:150000])
+            if matches:
+                uniq = list(dict.fromkeys(matches))[:8]
+                _logger.info(f"ATPAY VA: JS '{p}': {uniq}")
+    except Exception:
+        pass
 
     # 3) GET checkout again to retrieve VA
     try:
