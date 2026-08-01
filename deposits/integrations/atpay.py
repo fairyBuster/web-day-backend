@@ -382,68 +382,68 @@ def fetch_wowpayidr_va(
             "available_methods": valid,
         }
 
-    # 2) Reverse-engineered: JS generates X-SN = MD5(merchantReferenceId + currentTime + secret?)
-    # The JS would compute this client-side. Since we have no X-SN, let's try calling
-    # /api/cash-in/select/{uuid} without it — and also try the /pending page approach.
-    # 
-    # Key insight from browser: after method select, the referer changed from 
-    # /payment?uuid= to /pending?uuid= and checkout instantly returned TO_PAY.
-    # This suggests the selection goes through the JS-SPA routing, not a REST API call.
-    # 
-    # Let's try hitting the checkout API with referer=/pending?uuid= which mimics 
-    # the SPA state after JS internally selected the method.
-    select_headers = {
-        "Accept": "application/json, text/plain, */*",
-        "Content-Type": "application/json",
-        "Referer": f"{domain}/pending?uuid={checkout_uuid}&method={method_upper}",
-        "Origin": domain,
-    }
-    _logger.info(f"ATPAY VA: trying GET with pending referer")
-    try:
-        r_pending = session.get(checkout_base, headers=select_headers, timeout=timeout)
-        _logger.info(f"ATPAY VA: pending-referer GET → HTTP {r_pending.status_code}, step={(r_pending.json().get('data',{}) or {}).get('step','?')}")
-    except Exception:
-        pass
+    # 2) Compute X-SN from checkout data — try common hash patterns
+    import re, hashlib
+    import time as time_module
+    
+    merchant_ref = (data1.get("data") or {}).get("merchantReferenceId") or ""
+    current_time = str((data1.get("data") or {}).get("currentTime") or "")
+    
+    # Try generating X-SN candidates
+    xsn_candidates = []
+    if merchant_ref and current_time:
+        # MD5(merchantReferenceId + currentTime)
+        xsn_candidates.append(hashlib.md5((merchant_ref + current_time).encode()).hexdigest())
+        # MD5(currentTime + merchantReferenceId)
+        xsn_candidates.append(hashlib.md5((current_time + merchant_ref).encode()).hexdigest())
+        # MD5(currentTime)
+        xsn_candidates.append(hashlib.md5(current_time.encode()).hexdigest())
+        # MD5(merchantReferenceId)
+        xsn_candidates.append(hashlib.md5(merchant_ref.encode()).hexdigest())
+    
+    _logger.info(f"ATPAY VA: trying X-SN candidates from merchant_ref={merchant_ref}, current_time={current_time}")
+    
+    for xsn in xsn_candidates:
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+            "X-SN": xsn,
+            "Referer": f"{domain}/payment?uuid={checkout_uuid}",
+            "Origin": domain,
+        }
+        select_url = f"{domain}/api/cash-in/select/{checkout_uuid}"
+        try:
+            r2 = session.post(select_url, json={"method": method_upper}, headers=headers, timeout=timeout)
+            body = r2.text[:200]
+            code = (r2.json() or {}).get("code", "")
+            _logger.info(f"ATPAY VA: POST select X-SN={xsn[:16]}... → code={code}, body={body}")
+            if code == "SUCCESS":
+                _logger.info(f"ATPAY VA: X-SN CRACKED! {xsn}")
+                break
+        except Exception:
+            pass
 
-    # Also try: the JS app navigates to /pending?uuid=X and then calls checkout,
-    # which now returns TO_PAY. Let's simulate GET /pending first, then checkout.
+    # Also download and search JS more aggressively
     try:
-        _logger.info(f"ATPAY VA: simulating JS navigation to /pending")
-        r_nav = session.get(f"{domain}/pending?uuid={checkout_uuid}", timeout=timeout)
-        _logger.info(f"ATPAY VA: nav /pending → HTTP {r_nav.status_code}")
-        # Now GET checkout with proper referer
-        h = {"Referer": f"{domain}/pending?uuid={checkout_uuid}", "Accept": "application/json, text/plain, */*"}
-        r3 = session.get(checkout_base, headers=h, timeout=timeout)
-        data3 = r3.json()
-        step = (data3.get("data") or {}).get("step", "")
-        _logger.info(f"ATPAY VA: after /pending nav, checkout step={step}")
-        if step == "TO_PAY":
-            # Success! Go straight to result
-            checkout_data = data3.get("data") or {}
-            return {
-                "va": checkout_data.get("va"),
-                "selected_method": checkout_data.get("selectedMethod") or method_upper,
-                "amount": checkout_data.get("amount") or amount,
-                "merchant_reference_id": checkout_data.get("merchantReferenceId") or merchant_reference_id,
-                "expire_time": checkout_data.get("expireTime"),
-                "msn": checkout_data.get("msn"),
-                "additional_info": checkout_data.get("additionalInfo") or {},
-                "method_guide": checkout_data.get("methodGuideVos") or [],
-                "error": None,
-            }
+        # Try all JS files for X-SN generation
+        js_files = ["/js/app.1c292c94.js", "/js/chunk-vendors.dfddc0cd.js", "/js/chunk-1949b06d.70a25792.js"]
+        for js_path in js_files:
+            try:
+                r_js = session.get(f"{domain}{js_path}", timeout=timeout)
+                if r_js.status_code != 200 or len(r_js.text) < 200:
+                    continue
+                js = r_js.text
+                # Search for X-SN related code
+                for query in ['X-SN', 'x-sn', 'xSn', '.sn=', '["sn"]', 'md5', 'SHA', 'hash']:
+                    idx = js.lower().find(query.lower())
+                    if idx >= 0:
+                        ctx = js[max(0,idx-50):idx+150]
+                        # Clean context to one line
+                        ctx_clean = ctx.replace('\n',' ').replace('\r','')[:200]
+                        _logger.info(f"ATPAY VA: {js_path} '{query}' at {idx}: ...{ctx_clean}...")
+            except Exception:
+                pass
     except Exception as e:
-        _logger.info(f"ATPAY VA: nav approach error: {str(e)[:200]}")
-
-    # Fallback: also log JS search results
-    import re
-    try:
-        js_text = session.get(f"{domain}/js/app.1c292c94.js", timeout=timeout).text or ""
-        for p in [r'X-SN[^"\' ]*', r'\.sn\b[^"\' ]*', r'select[^"\' ]*ap[ip]', r'[/\w]*method[/\w]*']:
-            matches = re.findall(p, js_text[:150000])
-            if matches:
-                uniq = list(dict.fromkeys(matches))[:8]
-                _logger.info(f"ATPAY VA: JS '{p}': {uniq}")
-    except Exception:
         pass
 
     # 3) GET checkout again to retrieve VA
