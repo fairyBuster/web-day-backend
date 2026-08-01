@@ -382,8 +382,7 @@ def fetch_wowpayidr_va(
             "available_methods": valid,
         }
 
-    # 2) Select method — wowpayidr checkout API is GET-only.
-    # Method selection happens via a different endpoint. Extract from page HTML.
+    # 2) Select method — parse payment page HTML more aggressively
     select_headers = {
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json",
@@ -391,25 +390,43 @@ def fetch_wowpayidr_va(
         "Origin": domain,
     }
 
-    # Try: parse the payment page HTML to find API endpoint used by frontend
     try:
-        page_resp2 = session.get(trade_url, timeout=timeout, allow_redirects=True)
+        page_resp2 = session.get(f"{domain}/?uuid={checkout_uuid}", timeout=timeout, allow_redirects=True)
         page_html = page_resp2.text or ""
         import re
-        # Look for API paths in JS: "api/cash-in/checkout/{uuid}/method" or similar
-        api_paths = re.findall(r'["\u2018](/api/[a-zA-Z0-9_\-/]{3,})["\u2019]', page_html)
-        _logger.info(f"ATPAY VA: found API paths in page: {api_paths}")
-        # Look for select/method related endpoints
-        for p in api_paths:
-            if 'select' in p.lower() or 'method' in p.lower() or 'pay' in p.lower() or 'confirm' in p.lower():
-                _logger.info(f"ATPAY VA: trying POST {domain}{p}")
-                try:
-                    r2 = session.post(f"{domain}{p}", json={"method": method_upper}, headers=select_headers, timeout=timeout)
-                    _logger.info(f"ATPAY VA: POST {domain}{p} → HTTP {r2.status_code}, body={r2.text[:300]}")
-                except Exception as e:
-                    _logger.info(f"ATPAY VA: POST {domain}{p} error: {str(e)}")
+        # Broader regex: match any path-like string in JS
+        api_paths = set()
+        for m in re.finditer(r'(?:["\u2018\u2019])(/[a-zA-Z0-9_\-./]{3,200})(?:["\u2018\u2019])', page_html):
+            api_paths.add(m.group(1))
+        _logger.info(f"ATPAY VA: found API paths in page ({len(api_paths)}): {sorted(api_paths)}")
+
+        # Try common patterns
+        select_candidates = [
+            f"{checkout_base}/method",
+            f"{checkout_base}/method/{method_upper}",
+            f"{checkout_base}/pay",
+            f"{checkout_base}/confirm",
+            f"{domain}/api/cash-in/method/{method_upper}/{checkout_uuid}",
+            f"{domain}/api/cash-in/select/{checkout_uuid}",
+        ]
+        # Also try paths from page
+        for p in sorted(api_paths):
+            if 'cash-in' in p and checkout_uuid in p:
+                if p not in select_candidates:
+                    select_candidates.append(f"{domain}{p}")
+
+        for candidate_url in select_candidates:
+            _logger.info(f"ATPAY VA: trying selection POST {candidate_url}")
+            try:
+                r2 = session.post(candidate_url, json={"method": method_upper}, headers=select_headers, timeout=timeout)
+                body = r2.text[:300]
+                _logger.info(f"ATPAY VA: POST {candidate_url} → HTTP {r2.status_code}, body={body}")
+                if r2.json().get('code') == 'SUCCESS':
+                    break
+            except Exception as e:
+                _logger.info(f"ATPAY VA: POST {candidate_url} error: {str(e)[:200]}")
     except Exception as e:
-        _logger.info(f"ATPAY VA: page parse error: {str(e)}")
+        _logger.info(f"ATPAY VA: page parse error: {str(e)[:300]}")
 
     # 3) GET checkout again to retrieve VA
     try:
