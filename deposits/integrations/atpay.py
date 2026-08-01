@@ -382,8 +382,8 @@ def fetch_wowpayidr_va(
             "available_methods": valid,
         }
 
-    # 2) Select method — wowpayidr accepts POST to checkout base with method+step
-    # The /select endpoint is 404 (BAD_REQUEST), so POST directly to checkout_base
+    # 2) Select method — wowpayidr uses PUT or PATCH, not POST
+    # POST returns "Request method 'POST' not supported" on checkout_base
     select_headers = {
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json",
@@ -391,22 +391,23 @@ def fetch_wowpayidr_va(
         "Origin": domain,
     }
 
-    # Try all known select payload variations
-    select_payloads = [
-        {"method": method_upper},
-        {"method": method_upper, "step": "TO_SELECT_METHOD"},
-        {"method": method_upper, "selectedMethod": method_upper},
-        {"selectedMethod": method_upper, "step": "TO_SELECT_METHOD"},
-    ]
+    select_payload = {"method": method_upper}
 
-    for payload in select_payloads:
-        _logger.info(f"ATPAY VA: trying POST {checkout_base} with payload={payload}")
-        try:
-            r2 = session.post(checkout_base, json=payload, headers=select_headers, timeout=timeout)
-            _logger.info(f"ATPAY VA: POST {checkout_base} → HTTP {r2.status_code}, body={r2.text[:300]}")
-        except Exception as e:
-            _logger.info(f"ATPAY VA: POST error: {str(e)}")
-            continue
+    # Try PUT
+    _logger.info(f"ATPAY VA: trying PUT {checkout_base}")
+    try:
+        r2 = session.put(checkout_base, json=select_payload, headers=select_headers, timeout=timeout)
+        _logger.info(f"ATPAY VA: PUT {checkout_base} → HTTP {r2.status_code}, body={r2.text[:300]}")
+    except Exception as e:
+        _logger.info(f"ATPAY VA: PUT error: {str(e)}")
+
+    # Try PATCH
+    _logger.info(f"ATPAY VA: trying PATCH {checkout_base}")
+    try:
+        r2 = session.patch(checkout_base, json=select_payload, headers=select_headers, timeout=timeout)
+        _logger.info(f"ATPAY VA: PATCH {checkout_base} → HTTP {r2.status_code}, body={r2.text[:300]}")
+    except Exception as e:
+        _logger.info(f"ATPAY VA: PATCH error: {str(e)}")
 
     # 3) GET checkout again to retrieve VA
     try:
