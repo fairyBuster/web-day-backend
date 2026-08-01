@@ -402,22 +402,32 @@ def fetch_wowpayidr_va(
         _logger.info(f"ATPAY VA: trying select POST {sel_url}")
         try:
             r2 = session.post(sel_url, json=select_body, headers=select_headers, timeout=timeout)
+            _logger.info(f"ATPAY VA: select POST {sel_url} → HTTP {r2.status_code}, body={r2.text[:300]}")
             if r2.status_code < 400 and r2.status_code != 404:
-                _logger.info(f"ATPAY VA: select POST {sel_url} → HTTP {r2.status_code}")
                 selected = True
                 break
-            else:
-                _logger.info(f"ATPAY VA: select POST {sel_url} → HTTP {r2.status_code}")
         except Exception as e:
             _logger.info(f"ATPAY VA: select POST {sel_url} error: {str(e)}")
+
+    if not selected:
+        # Try with step parameter
+        for sel_url in select_urls[:2]:
+            try:
+                r2 = session.post(sel_url, json={"method": method_upper, "step": "TO_PAY"}, headers=select_headers, timeout=timeout)
+                _logger.info(f"ATPAY VA: select POST with step {sel_url} → HTTP {r2.status_code}, body={r2.text[:300]}")
+                if r2.status_code < 400 and r2.status_code != 404:
+                    selected = True
+                    break
+            except Exception as e:
+                _logger.info(f"ATPAY VA: select POST with step {sel_url} error: {str(e)}")
 
     if not selected:
         # Try PUT
         for sel_url in select_urls[:2]:
             try:
                 r2 = session.put(sel_url, json=select_body, headers=select_headers, timeout=timeout)
+                _logger.info(f"ATPAY VA: select PUT {sel_url} → HTTP {r2.status_code}, body={r2.text[:300]}")
                 if r2.status_code < 400 and r2.status_code != 404:
-                    _logger.info(f"ATPAY VA: select PUT {sel_url} → HTTP {r2.status_code}")
                     selected = True
                     break
             except Exception as e:
