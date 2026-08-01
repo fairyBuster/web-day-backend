@@ -382,8 +382,8 @@ def fetch_wowpayidr_va(
             "available_methods": valid,
         }
 
-    # 2) Select method — wowpayidr uses PUT or PATCH, not POST
-    # POST returns "Request method 'POST' not supported" on checkout_base
+    # 2) Select method — wowpayidr checkout API is GET-only.
+    # Method selection happens via a different endpoint. Extract from page HTML.
     select_headers = {
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json",
@@ -391,23 +391,25 @@ def fetch_wowpayidr_va(
         "Origin": domain,
     }
 
-    select_payload = {"method": method_upper}
-
-    # Try PUT
-    _logger.info(f"ATPAY VA: trying PUT {checkout_base}")
+    # Try: parse the payment page HTML to find API endpoint used by frontend
     try:
-        r2 = session.put(checkout_base, json=select_payload, headers=select_headers, timeout=timeout)
-        _logger.info(f"ATPAY VA: PUT {checkout_base} → HTTP {r2.status_code}, body={r2.text[:300]}")
+        page_resp2 = session.get(trade_url, timeout=timeout, allow_redirects=True)
+        page_html = page_resp2.text or ""
+        import re
+        # Look for API paths in JS: "api/cash-in/checkout/{uuid}/method" or similar
+        api_paths = re.findall(r'["\u2018](/api/[a-zA-Z0-9_\-/]{3,})["\u2019]', page_html)
+        _logger.info(f"ATPAY VA: found API paths in page: {api_paths}")
+        # Look for select/method related endpoints
+        for p in api_paths:
+            if 'select' in p.lower() or 'method' in p.lower() or 'pay' in p.lower() or 'confirm' in p.lower():
+                _logger.info(f"ATPAY VA: trying POST {domain}{p}")
+                try:
+                    r2 = session.post(f"{domain}{p}", json={"method": method_upper}, headers=select_headers, timeout=timeout)
+                    _logger.info(f"ATPAY VA: POST {domain}{p} → HTTP {r2.status_code}, body={r2.text[:300]}")
+                except Exception as e:
+                    _logger.info(f"ATPAY VA: POST {domain}{p} error: {str(e)}")
     except Exception as e:
-        _logger.info(f"ATPAY VA: PUT error: {str(e)}")
-
-    # Try PATCH
-    _logger.info(f"ATPAY VA: trying PATCH {checkout_base}")
-    try:
-        r2 = session.patch(checkout_base, json=select_payload, headers=select_headers, timeout=timeout)
-        _logger.info(f"ATPAY VA: PATCH {checkout_base} → HTTP {r2.status_code}, body={r2.text[:300]}")
-    except Exception as e:
-        _logger.info(f"ATPAY VA: PATCH error: {str(e)}")
+        _logger.info(f"ATPAY VA: page parse error: {str(e)}")
 
     # 3) GET checkout again to retrieve VA
     try:
