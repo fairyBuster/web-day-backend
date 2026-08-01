@@ -423,27 +423,37 @@ def fetch_wowpayidr_va(
         except Exception:
             pass
 
-    # Also download and search JS more aggressively
+    # Also download and search JS more aggressively — need X-SECRET, X-SIGN, and X-SN
     try:
-        # Try all JS files for X-SN generation
-        js_files = ["/js/app.1c292c94.js", "/js/chunk-vendors.dfddc0cd.js", "/js/chunk-1949b06d.70a25792.js"]
+        js_files = ["/js/app.1c292c94.js", "/js/chunk-vendors.dfddc0cd.js", "/js/chunk-1949b06d.70a25792.js", "/js/chunk-40c70231.cd10e77f.js"]
         for js_path in js_files:
             try:
                 r_js = session.get(f"{domain}{js_path}", timeout=timeout)
                 if r_js.status_code != 200 or len(r_js.text) < 200:
                     continue
                 js = r_js.text
-                # Search for X-SN related code
-                for query in ['X-SN', 'x-sn', 'xSn', '.sn=', '["sn"]', 'md5', 'SHA', 'hash']:
-                    idx = js.lower().find(query.lower())
+                for query in ['X-SECRET', 'X-SIGN', 'x-sign', 'x-secret', 'hmac', 'HMAC', 'sha256', '.sign(']:
+                    idx = js.find(query)
                     if idx >= 0:
-                        ctx = js[max(0,idx-50):idx+150]
-                        # Clean context to one line
-                        ctx_clean = ctx.replace('\n',' ').replace('\r','')[:200]
-                        _logger.info(f"ATPAY VA: {js_path} '{query}' at {idx}: ...{ctx_clean}...")
+                        ctx = js[max(0,idx-80):idx+200].replace('\n',' ').replace('\r','')
+                        _logger.info(f"ATPAY VA: {js_path} '{query}': ...{ctx[:300]}...")
             except Exception:
                 pass
-    except Exception as e:
+    except Exception:
+        pass
+
+    # Fallback: dump all search hits from app.js for payment-related code
+    try:
+        r_js = session.get(f"{domain}/js/app.1c292c94.js", timeout=timeout)
+        if r_js.status_code == 200 and len(r_js.text) > 1000:
+            js = r_js.text
+            for keyword in ['sn', 'sign', 'secret', 'hmac', 'md5', 'sha', 'select', 'checkout']:
+                for m in re.finditer(re.escape(keyword), js, re.IGNORECASE):
+                    ctx = js[max(0,m.start()-60):m.start()+150].replace('\n',' ').replace('\r','')[:250]
+                    if 'export' in ctx.lower() or 'function' in ctx.lower() or 'const' in ctx.lower() or 'let' in ctx.lower() or 'return' in ctx.lower():
+                        _logger.info(f"ATPAY VA: app.js '{keyword}' context: ...{ctx}...")
+                        break  # one context per keyword is enough
+    except Exception:
         pass
 
     # 3) GET checkout again to retrieve VA
