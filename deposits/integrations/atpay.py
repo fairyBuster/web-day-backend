@@ -382,100 +382,30 @@ def fetch_wowpayidr_va(
             "available_methods": valid,
         }
 
-    # 2) Compute X-SN from checkout data — try common hash patterns
-    import re, hashlib
-    import time as time_module
-    
-    merchant_ref = (data1.get("data") or {}).get("merchantReferenceId") or ""
-    current_time = str((data1.get("data") or {}).get("currentTime") or "")
-    
-    # Try generating X-SN candidates
-    xsn_candidates = []
-    if merchant_ref and current_time:
-        # MD5(merchantReferenceId + currentTime)
-        xsn_candidates.append(hashlib.md5((merchant_ref + current_time).encode()).hexdigest())
-        # MD5(currentTime + merchantReferenceId)
-        xsn_candidates.append(hashlib.md5((current_time + merchant_ref).encode()).hexdigest())
-        # MD5(currentTime)
-        xsn_candidates.append(hashlib.md5(current_time.encode()).hexdigest())
-        # MD5(merchantReferenceId)
-        xsn_candidates.append(hashlib.md5(merchant_ref.encode()).hexdigest())
-    
-    _logger.info(f"ATPAY VA: trying X-SN candidates from merchant_ref={merchant_ref}, current_time={current_time}")
-    
-    for xsn in xsn_candidates:
-        headers = {
-            "Accept": "application/json, text/plain, */*",
-            "Content-Type": "application/json",
-            "X-SN": xsn,
-            "Referer": f"{domain}/payment?uuid={checkout_uuid}",
-            "Origin": domain,
-        }
-        select_url = f"{domain}/api/cash-in/select/{checkout_uuid}"
-        try:
-            r2 = session.post(select_url, json={"method": method_upper}, headers=headers, timeout=timeout)
-            body = r2.text[:200]
-            code = (r2.json() or {}).get("code", "")
-            _logger.info(f"ATPAY VA: POST select X-SN={xsn[:16]}... → code={code}, body={body}")
-            if code == "SUCCESS":
-                _logger.info(f"ATPAY VA: X-SN CRACKED! {xsn}")
-                break
-        except Exception:
-            pass
+    # 2) POST selectMethod with browser-like headers
+    select_url = f"{checkout_base}/selectMethod"
+    select_payload = {"selectedMethod": method_upper}
+    select_headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "Referer": f"{domain}/payment?uuid={checkout_uuid}",
+        "Origin": domain,
+    }
 
-    # Also download and search JS more aggressively — need X-SECRET, X-SIGN, and X-SN
+    _logger.info(f"ATPAY VA: POST {select_url} with {select_payload}")
     try:
-        js_files = ["/js/app.1c292c94.js", "/js/chunk-vendors.dfddc0cd.js", "/js/chunk-1949b06d.70a25792.js", "/js/chunk-40c70231.cd10e77f.js"]
-        for js_path in js_files:
-            try:
-                r_js = session.get(f"{domain}{js_path}", timeout=timeout)
-                if r_js.status_code != 200 or len(r_js.text) < 200:
-                    continue
-                js = r_js.text
-                for query in ['X-SECRET', 'X-SIGN', 'x-sign', 'x-secret', 'hmac', 'HMAC', 'sha256', '.sign(']:
-                    idx = js.find(query)
-                    if idx >= 0:
-                        ctx = js[max(0,idx-80):idx+200].replace('\n',' ').replace('\r','')
-                        _logger.info(f"ATPAY VA: {js_path} '{query}': ...{ctx[:300]}...")
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    # Fallback: dump all search hits from app.js for payment-related code
-    try:
-        r_js = session.get(f"{domain}/js/app.1c292c94.js", timeout=timeout)
-        if r_js.status_code == 200 and len(r_js.text) > 1000:
-            js = r_js.text
-            for keyword in ['sn', 'sign', 'secret', 'hmac', 'md5', 'sha', 'select', 'checkout']:
-                for m in re.finditer(re.escape(keyword), js, re.IGNORECASE):
-                    ctx = js[max(0,m.start()-60):m.start()+150].replace('\n',' ').replace('\r','')[:250]
-                    if 'export' in ctx.lower() or 'function' in ctx.lower() or 'const' in ctx.lower() or 'let' in ctx.lower() or 'return' in ctx.lower():
-                        _logger.info(f"ATPAY VA: app.js '{keyword}' context: ...{ctx}...")
-                        break  # one context per keyword is enough
-    except Exception:
-        pass
-
-    # 3) GET checkout again to retrieve VA
-    try:
-        r3 = session.get(checkout_base, timeout=timeout)
-        r3.raise_for_status()
-        data3 = r3.json()
+        r2 = session.post(select_url, json=select_payload, headers=select_headers, timeout=timeout)
+        r2.raise_for_status()
+        select_data = r2.json()
+        _logger.info(f"ATPAY VA: selectMethod → code={select_data.get('code')}, step={(select_data.get('data') or {}).get('step')}")
     except Exception as e:
-        _logger.error(f"ATPAY VA get VA error: {str(e)}")
-        return {"error": f"Gagal mendapatkan VA: {str(e)}"}
+        _logger.error(f"ATPAY VA: selectMethod error: {str(e)}")
+        return {"error": f"Gagal memilih method pembayaran: {str(e)}"}
 
-    if data3.get("code") != "SUCCESS":
-        return {"error": data3.get("message", "Gagal mendapatkan VA")}
+    if select_data.get("code") != "SUCCESS":
+        return {"error": select_data.get("message", "Gagal memilih method pembayaran")}
 
-    checkout_data = data3.get("data") or {}
-    step = checkout_data.get("step", "")
-
-    if step != "TO_PAY":
-        return {
-            "error": f"Method belum dipilih, step saat ini: {step}",
-            "available_methods": [m.get("method", "") for m in (checkout_data.get("supportMethods") or [])],
-        }
+    checkout_data = select_data.get("data") or {}
 
     return {
         "va": checkout_data.get("va"),
