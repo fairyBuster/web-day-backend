@@ -258,4 +258,147 @@ def map_payout_trade_status(trade_status: str):
         return "REJECTED"
     if value == "pending":
         return "PROCESSING"
+
+
+# ── wowpayidr checkout helpers ──────────────────────────────────────────────
+
+
+def _extract_checkout_uuid_from_page(trade_url: str, timeout: int = 15) -> str:
+    """
+    GET the wowpayidr payment page and try to extract the checkout UUID used by
+    the internal API calls (e.g. /api/cash-in/checkout/{uuid}).
+    Returns a uuid string or None.
+    """
+    import re
+    try:
+        resp = requests.get(trade_url, timeout=timeout, allow_redirects=True)
+        body = resp.text or ""
+        # Try direct pattern: /api/cash-in/checkout/{uuid}
+        match = re.search(r'/api/cash-in/checkout/([a-f0-9\-]{20,})', body, re.IGNORECASE)
+        if match:
+            return match.group(1)
+        # Try JavaScript variable assignment
+        match = re.search(r'["\u2018]([a-f0-9\-]{30,})["\u2019]', body)
+        if match:
+            guess = match.group(1).strip('"').strip("\u2019")
+            if len(guess) >= 32:
+                return guess
+    except Exception:
+        pass
     return None
+
+
+def fetch_wowpayidr_va(
+    trade_url: str,
+    method: str,
+    timeout: int = 20,
+) -> dict:
+    """
+    Call wowpayidr checkout flow internally and return VA details without
+    requiring the user to open the trade_url in a browser.
+
+    Args:
+        trade_url: URL returned by ATPAY `trade_url` field
+        method: Payment method (e.g. 'MANDIRI', 'BRI', 'PERMATA', 'DANAMON')
+        timeout: HTTP timeout in seconds
+
+    Returns dict with keys: va, expire_time, msn, additional_info,
+          merchant_reference_id, amount, selected_method, error (if any)
+    """
+    from urllib.parse import urlparse, parse_qs
+
+    parsed = urlparse(trade_url)
+    domain = f"{parsed.scheme}://{parsed.netloc}"
+    # Try extracting UUID from query param 'uuid'
+    qs = parse_qs(parsed.query)
+    checkout_uuid = (qs.get("uuid") or [None])[0]
+
+    # If no query uuid, extract from page
+    if not checkout_uuid:
+        checkout_uuid = _extract_checkout_uuid_from_page(trade_url, timeout=timeout)
+
+    if not checkout_uuid:
+        return {"error": "Gagal mendapatkan checkout UUID dari trade_url."}
+
+    checkout_base = f"{domain}/api/cash-in/checkout/{checkout_uuid}"
+
+    # 1) GET checkout → get available methods
+    try:
+        r1 = requests.get(checkout_base, timeout=timeout)
+        data1 = r1.json()
+    except Exception as e:
+        return {"error": f"Gagal mengakses checkout page: {str(e)}"}
+
+    if data1.get("code") != "SUCCESS":
+        # Retry: try extracting fresh UUID from page
+        fresh_uuid = _extract_checkout_uuid_from_page(trade_url, timeout=timeout)
+        if fresh_uuid and fresh_uuid != checkout_uuid:
+            checkout_uuid = fresh_uuid
+            checkout_base = f"{domain}/api/cash-in/checkout/{checkout_uuid}"
+            try:
+                r1 = requests.get(checkout_base, timeout=timeout)
+                data1 = r1.json()
+            except Exception as e:
+                return {"error": f"Gagal mengakses checkout page: {str(e)}"}
+            if data1.get("code") != "SUCCESS":
+                return {"error": data1.get("message", "Checkout API error")}
+        else:
+            return {"error": data1.get("message", "Checkout API error")}
+
+    support_methods = (data1.get("data") or {}).get("supportMethods") or []
+    merchant_reference_id = (data1.get("data") or {}).get("merchantReferenceId") or ""
+    amount = (data1.get("data") or {}).get("amount") or "0"
+
+    # Validate method exists
+    method_upper = method.strip().upper()
+    valid = [m.get("method", "") for m in support_methods]
+    if method_upper not in [vm.upper() for vm in valid]:
+        return {
+            "error": f"Method '{method}' tidak tersedia. Pilih: {', '.join(valid)}",
+            "available_methods": valid,
+        }
+
+    # 2) Select method — try POST to checkout/select endpoint
+    select_url = f"{checkout_base}/select"
+    try:
+        r2 = requests.post(select_url, json={"method": method_upper}, timeout=timeout)
+        # Some implementations might use different endpoints
+        if r2.status_code == 404:
+            # fallback: try POST to checkout base directly
+            r2 = requests.post(checkout_base, json={"method": method_upper, "step": "TO_PAY"}, timeout=timeout)
+        if r2.status_code == 404:
+            # fallback: try GET with method param
+            r2 = requests.get(f"{checkout_base}?method={method_upper}", timeout=timeout)
+    except Exception as e:
+        return {"error": f"Gagal memilih method: {str(e)}"}
+
+    # 3) GET checkout again to retrieve VA
+    try:
+        r3 = requests.get(checkout_base, timeout=timeout)
+        data3 = r3.json()
+    except Exception as e:
+        return {"error": f"Gagal mendapatkan VA: {str(e)}"}
+
+    if data3.get("code") != "SUCCESS":
+        return {"error": data3.get("message", "Gagal mendapatkan VA")}
+
+    checkout_data = data3.get("data") or {}
+    step = checkout_data.get("step", "")
+
+    if step != "TO_PAY":
+        return {
+            "error": f"Method belum dipilih, step saat ini: {step}",
+            "available_methods": [m.get("method", "") for m in (checkout_data.get("supportMethods") or [])],
+        }
+
+    return {
+        "va": checkout_data.get("va"),
+        "selected_method": checkout_data.get("selectedMethod") or method_upper,
+        "amount": checkout_data.get("amount") or amount,
+        "merchant_reference_id": checkout_data.get("merchantReferenceId") or merchant_reference_id,
+        "expire_time": checkout_data.get("expireTime"),
+        "msn": checkout_data.get("msn"),
+        "additional_info": checkout_data.get("additionalInfo") or {},
+        "method_guide": checkout_data.get("methodGuideVos") or [],
+        "error": None,
+    }

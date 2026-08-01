@@ -55,6 +55,7 @@ from .integrations.atpay import (
     post_json as atpay_post_json,
     sign_payload as atpay_sign_payload,
     verify_payload as atpay_verify_payload,
+    fetch_wowpayidr_va as atpay_fetch_wowpayidr_va,
 )
 from withdrawal.integrations.jayapay import sign_params_legacy
 from .integrations.klikpay import build_params as klikpay_build_params, sign_params as klikpay_sign_params, send_prepaid_request as klikpay_send_prepaid
@@ -2415,6 +2416,190 @@ class AtpayDepositInitiateView(APIView):
         return Response(
             {"detail": response_payload.get("message") or "ATPAY create deposit gagal", "provider": response_payload},
             status=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class AtpayDepositInitiateDirectVAView(APIView):
+    """
+    Initiate deposit via ATPAY dan langsung menghasilkan VA (tanpa trade_url browser).
+    Mirror dari AtpayDepositInitiateView, tapi backend fetch wowpayidr checkout
+    secara internal dan mengembalikan VA number langsung.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_scope = "deposit_initiate"
+
+    @extend_schema(
+        summary="Initiate deposit via ATPAY — langsung return VA",
+        request={
+            "application/json": {
+                "type": "object",
+                "properties": {
+                    "amount": {"type": "string", "example": "100.00"},
+                    "wallet_type": {"type": "string", "enum": ["BALANCE", "BALANCE_DEPOSIT"]},
+                    "method": {
+                        "type": "string",
+                        "enum": ["BRI", "MANDIRI", "PERMATA", "DANAMON"],
+                        "description": "Metode pembayaran VA yang dipilih",
+                    },
+                },
+                "required": ["amount", "method"],
+            }
+        },
+    )
+    def post(self, request):
+        gs = GatewaySettings.objects.order_by("-updated_at").first()
+        enabled = bool(gs and gs.atpay_enabled)
+        api_url = (gs.atpay_api_url or "").strip() if gs else ""
+        merchant_no = (gs.atpay_merchant_no or "").strip() if gs else ""
+        sign_type = atpay_normalize_sign_type((gs.atpay_sign_type or "MD5").strip() if gs else "MD5")
+        secret_key = (gs.atpay_secret_key or "").strip() if gs else ""
+        private_key = (gs.atpay_private_key or "").strip() if gs else ""
+        public_key = (gs.atpay_public_key or "").strip() if gs else ""
+        app_domain = (gs.app_domain or "").strip() if gs else ""
+        return_url = (gs.atpay_return_url or "").strip() if gs else ""
+        min_deposit_amount = (gs.min_deposit_amount or Decimal("0")) if gs else Decimal("0")
+        max_deposit_amount = (gs.max_deposit_amount or Decimal("0")) if gs else Decimal("0")
+
+        if not enabled:
+            return Response({"detail": "ATPAY tidak aktif"}, status=status.HTTP_400_BAD_REQUEST)
+        if not api_url or not merchant_no:
+            return Response({"detail": "Konfigurasi ATPAY belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
+        if sign_type == "MD5" and not secret_key:
+            return Response({"detail": "Secret key ATPAY belum diisi"}, status=status.HTTP_400_BAD_REQUEST)
+        if sign_type == "MD5withRsa" and (not private_key or not public_key):
+            return Response({"detail": "Private/Public key ATPAY belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
+        if not app_domain:
+            return Response({"detail": "Konfigurasi domain untuk callback belum diisi"}, status=status.HTTP_400_BAD_REQUEST)
+
+        wallet_type = (request.data.get("wallet_type") or gs.default_wallet_type or "BALANCE").strip().upper()
+        if wallet_type not in ("BALANCE", "BALANCE_DEPOSIT"):
+            return Response({"detail": "wallet_type tidak valid"}, status=status.HTTP_400_BAD_REQUEST)
+
+        method = (request.data.get("method") or "").strip().upper()
+        valid_methods = {"BRI", "MANDIRI", "PERMATA", "DANAMON"}
+        if method not in valid_methods:
+            return Response({"detail": f"method tidak valid. Pilih: {', '.join(sorted(valid_methods))}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            amount = atpay_normalize_amount(request.data.get("amount"))
+            if amount <= 0:
+                raise InvalidOperation()
+        except Exception:
+            return Response({"detail": "amount tidak valid"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if min_deposit_amount and min_deposit_amount > 0 and amount < min_deposit_amount:
+            return Response({"detail": f"Minimal deposit adalah {min_deposit_amount}"}, status=status.HTTP_400_BAD_REQUEST)
+        if max_deposit_amount and max_deposit_amount > 0 and amount > max_deposit_amount:
+            return Response({"detail": f"Maksimal deposit adalah {max_deposit_amount}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = request.user
+        order_num = f"DAT{_now_wib().strftime('%y%m%d%H%M%S')}{uuid.uuid4().hex[:8].upper()}"
+        callback_url = f"https://{app_domain}/api/deposits/atpay/callback/"
+        title = _build_clienthub_order_item(amount)["name"][:200]
+
+        trx = Transaction.objects.create(
+            user=user,
+            product=None,
+            type="DEPOSIT",
+            amount=amount,
+            currency_code="IDR",
+            description=f"Deposit via ATPAY ({wallet_type})",
+            status="PENDING",
+            wallet_type=wallet_type,
+            trx_id=order_num,
+        )
+        dep = Deposit.objects.create(
+            user=user,
+            gateway="ATPAY",
+            order_num=order_num,
+            amount=amount,
+            amount_currency_code="IDR",
+            wallet_type=wallet_type,
+            status="PENDING",
+            transaction=trx,
+        )
+
+        payload = atpay_build_deposit_payload(
+            merchant_no=merchant_no,
+            out_trade_sn=order_num,
+            title=title,
+            amount=amount,
+            attach=wallet_type,
+            notify_url=callback_url,
+            return_url=return_url,
+            sign_type=sign_type,
+        )
+        payload["sign"] = atpay_sign_payload(payload, sign_type, secret_key=secret_key, private_key=private_key)
+        dep.request_params = payload
+        dep.save(update_fields=["request_params"])
+
+        try:
+            response_payload = atpay_post_json(f"{api_url.rstrip('/')}/gw-api/deposit/create", payload)
+        except Exception as exc:
+            dep.response_payload = {"error": str(exc)}
+            dep.save(update_fields=["response_payload"])
+            _ppaypros_mark_deposit_failed(trx, dep, reason="ATPAY request error")
+            return Response({"detail": f"Gagal menghubungi ATPAY: {exc}"}, status=status.HTTP_502_BAD_GATEWAY)
+
+        if response_payload.get("sign"):
+            response_payload["_sign_valid"] = atpay_verify_payload(
+                response_payload,
+                response_payload.get("sign_type") or sign_type,
+                secret_key=secret_key,
+                public_key=public_key,
+            )
+
+        dep.response_payload = response_payload
+        dep.save(update_fields=["response_payload"])
+
+        if str(response_payload.get("code") or "").strip() != "100":
+            _ppaypros_mark_deposit_failed(trx, dep, reason="ATPAY create failed")
+            return Response(
+                {"detail": response_payload.get("message") or "ATPAY create deposit gagal", "provider": response_payload},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        data = response_payload.get("data") if isinstance(response_payload.get("data"), dict) else {}
+        payment_url = str(data.get("trade_url") or "").strip()
+        if not payment_url:
+            _ppaypros_mark_deposit_failed(trx, dep, reason="ATPAY trade_url kosong")
+            return Response({"detail": "ATPAY tidak mengembalikan trade_url"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Save payment_url to deposit
+        dep.payment_url = payment_url
+        dep.save(update_fields=["payment_url"])
+
+        # Fetch VA internally via wowpayidr
+        va_result = atpay_fetch_wowpayidr_va(payment_url, method)
+
+        if va_result.get("error"):
+            logger.error(f"ATPAY VA fetch error for order {order_num}: {va_result['error']}")
+            return Response({
+                "order_num": order_num,
+                "amount": f"{amount:.2f}",
+                "order_sn": data.get("order_sn"),
+                "payment_url": payment_url,
+                "detail": va_result["error"],
+                "available_methods": va_result.get("available_methods"),
+                "provider": response_payload,
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(
+            {
+                "order_num": order_num,
+                "amount": f"{amount:.2f}",
+                "order_sn": data.get("order_sn"),
+                "payment_url": payment_url,
+                "va": va_result.get("va"),
+                "selected_method": va_result.get("selected_method"),
+                "merchant_reference_id": va_result.get("merchant_reference_id"),
+                "expire_time": va_result.get("expire_time"),
+                "msn": va_result.get("msn"),
+                "additional_info": va_result.get("additional_info") or {},
+                "method_guide": va_result.get("method_guide") or [],
+                "provider": response_payload,
+            },
+            status=status.HTTP_200_OK,
         )
 
 
