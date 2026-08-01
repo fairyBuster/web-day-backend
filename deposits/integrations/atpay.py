@@ -382,53 +382,59 @@ def fetch_wowpayidr_va(
             "available_methods": valid,
         }
 
-    # 2) Select method — need X-SN token from page HTML
+    # 2) Select method — try multiple approaches
     select_headers = {
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json",
-        "Referer": checkout_base,
+        "Referer": f"{domain}/payment?uuid={checkout_uuid}",
         "Origin": domain,
     }
 
+    _logger.info(f"ATPAY VA: full checkout body: {json.dumps(data1, ensure_ascii=False)[:2000]}")
+    _logger.info(f"ATPAY VA: cookies={dict(session.cookies)}, resp_headers_xsn={r1.headers.get('X-SN', 'none')}")
+
+    # Approach 1: GET checkout with ?method= query param (many APIs support this)
     try:
-        page_resp2 = session.get(f"{domain}/?uuid={checkout_uuid}", timeout=timeout, allow_redirects=True)
-        page_html = page_resp2.text or ""
-        import re
+        r_method = session.get(f"{checkout_base}?method={method_upper}", timeout=timeout)
+        _logger.info(f"ATPAY VA: GET {checkout_base}?method={method_upper} → step={(r_method.json().get('data',{}).get('step'))}")
+    except Exception:
+        pass
 
-        # Extract X-SN token from page JS
-        xsn = None
-        for pattern in [
-            r'"X-SN"\s*:\s*"([^"]+)"',
-            r"['\"]X-SN['\"]\s*,\s*['\"]([^'\"]+)['\"]",
-            r"X-SN['\"]\s*:\s*['\"]([^'\"]+)['\"]",
-            r"['\"]([a-f0-9]{32,})['\"]",
-            r"sn\s*=\s*['\"]([^'\"]+)['\"]",
-            r"token\s*=\s*['\"]([^'\"]+)['\"]",
-        ]:
-            m = re.search(pattern, page_html, re.IGNORECASE)
-            if m:
-                xsn = m.group(1).strip()
-                _logger.info(f"ATPAY VA: found X-SN candidate: {xsn[:50]}... via pattern {pattern[:50]}")
-                break
-
-        if xsn:
-            select_headers["X-SN"] = xsn
-            select_url = f"{domain}/api/cash-in/select/{checkout_uuid}"
-            _logger.info(f"ATPAY VA: trying POST {select_url} with X-SN={xsn[:30]}...")
-            try:
-                r2 = session.post(select_url, json={"method": method_upper}, headers=select_headers, timeout=timeout)
-                body = r2.text[:300]
-                _logger.info(f"ATPAY VA: POST {select_url} → HTTP {r2.status_code}, body={body}")
-                if r2.json().get('code') == 'SUCCESS':
-                    _logger.info(f"ATPAY VA: SUCCESS!")
-            except Exception as e:
-                _logger.info(f"ATPAY VA: POST with X-SN error: {str(e)[:200]}")
-        else:
-            # Dump part of page to find token
-            _logger.info(f"ATPAY VA: X-SN not found in page. Page snippet (first 1000 chars): {page_html[:1000]}")
-            _logger.info(f"ATPAY VA: Page snippet (last 500 chars): {page_html[-500:]}")
+    # Approach 2: Fetch JS bundle to find select endpoint and X-SN
+    try:
+        r_js = session.get(f"{domain}/js/app.1c292c94.js", timeout=timeout)
+        # Fallback to any app*.js
+        if r_js.status_code != 200 or len(r_js.text) < 100:
+            import re as re2
+            html = session.get(f"{domain}/?uuid={checkout_uuid}", timeout=5).text
+            js_srcs = re2.findall(r'src="(/js/[^"]+)"', html)
+            for src in js_srcs[:3]:
+                r_js = session.get(f"{domain}{src}", timeout=timeout)
+                if r_js.status_code == 200 and len(r_js.text) > 500:
+                    break
+        js_content = r_js.text or ""
+        if len(js_content) > 500:
+            # Search for select-related URLs and X-SN generation
+            import re as re3
+            for pattern in [r'select["\s:]+([^,;{}\[\]]+)', r'cash-in[^"\' ]*select[^"\' ]*', r'X-SN["\s:=]+([^,;]+)', r'"X-SN"[^}]+', r'sn\s*[=:]\s*["\u2018]([^"\' ]{8,})']:
+                matches = re3.findall(pattern, js_content[:50000], re.IGNORECASE)
+                if matches:
+                    _logger.info(f"ATPAY VA: JS select-search '{pattern}': {matches[:5]}")
     except Exception as e:
-        _logger.info(f"ATPAY VA: page parse error: {str(e)[:300]}")
+        _logger.info(f"ATPAY VA: JS search error: {str(e)[:200]}")
+    
+    # Approach 3: Try POST to select with what we have
+    xsn = (data1.get("data") or {}).get("sn") or (data1.get("data") or {}).get("xSn")
+    if not xsn:
+        xsn = r1.headers.get("x-sn") or r1.headers.get("X-SN")
+    if xsn:
+        select_headers["X-SN"] = xsn
+        select_headers["Referer"] = f"{domain}/pending?uuid={checkout_uuid}"
+        try:
+            r2 = session.post(f"{domain}/api/cash-in/select/{checkout_uuid}", json={"method": method_upper}, headers=select_headers, timeout=timeout)
+            _logger.info(f"ATPAY VA: POST select → HTTP {r2.status_code}, body={r2.text[:500]}")
+        except Exception as e:
+            _logger.info(f"ATPAY VA: POST select error: {str(e)[:200]}")
 
     # 3) GET checkout again to retrieve VA
     try:
