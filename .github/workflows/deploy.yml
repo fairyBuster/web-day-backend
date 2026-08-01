@@ -1,0 +1,61 @@
+name: CD
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch yang akan di-deploy
+        required: true
+        default: main
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Start SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SERVER_SSH_KEY }}
+
+      - name: Add server to known_hosts
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT || '22' }}
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -p "$SERVER_PORT" -H "$SERVER_HOST" >> ~/.ssh/known_hosts
+
+      - name: Deploy via SSH
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT || '22' }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          GITHUB_BRANCH: ${{ github.ref_name }}
+          INPUT_BRANCH: ${{ github.event.inputs.branch }}
+        run: |
+          set -eu
+          BRANCH="$GITHUB_BRANCH"
+          if [ -n "${INPUT_BRANCH:-}" ]; then
+            BRANCH="$INPUT_BRANCH"
+          fi
+
+          ssh -p "$SERVER_PORT" "$SERVER_USER@$SERVER_HOST" <<EOF
+          set -eu
+          cd "$DEPLOY_PATH"
+          git fetch --all --prune
+          git checkout "$BRANCH"
+          git pull --ff-only origin "$BRANCH"
+          docker compose up -d --build
+          docker compose ps
+          EOF

@@ -364,7 +364,7 @@ if APP_DOMAIN:
 
 # Security Settings for Domain/IP Restriction
 # Force bypass to fix "Access denied" in development
-BYPASS_DOMAIN_IP_SECURITY = True # os.environ.get('BYPASS_DOMAIN_IP_SECURITY', 'False').lower() == 'true'
+BYPASS_DOMAIN_IP_SECURITY = os.environ.get('BYPASS_DOMAIN_IP_SECURITY', 'False').strip().lower() in ('true', '1', 'yes', 'on')
 
 # JWT configuration
 SIMPLE_JWT = {
