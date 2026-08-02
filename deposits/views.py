@@ -1925,6 +1925,11 @@ def _ppaypros_complete_deposit(trx: Transaction, dep: Deposit | None, paid_amoun
             dep.save(update_fields=["status", "credited_amount", "credited_currency_code", "amount_currency_code"])
 
     try:
+        from roulette.services import grant_tickets_for_self_deposit
+        grant_tickets_for_self_deposit(trx.user, trx, deposit_amount=credited_amount)
+    except Exception:
+        pass
+    try:
         _grant_deposit_cashback(trx.user, trx, credited_amount=credited_amount, currency_code=currency_code)
     except Exception:
         pass
