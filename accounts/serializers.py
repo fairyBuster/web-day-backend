@@ -106,7 +106,6 @@ class RegisterSerializer(serializers.ModelSerializer):
         return attrs
 
     def create(self, validated_data):
-        validated_data.setdefault('rank', 0)
         validated_data.pop('password2', None)
         validated_data.pop('otp', None)
         withdraw_pin = (validated_data.pop('withdraw_pin', None) or '').strip()
