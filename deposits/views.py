@@ -2269,6 +2269,7 @@ class PPayProsDepositInitiateQRView(APIView):
             return Response(
                 {
                     "order_num": order_num,
+                    "amount": str(amount),
                     "payment_url": payment_url or None,
                     "pay_order_id": pay_order_id or None,
                     "pay_data_type": pay_data_type or None,
