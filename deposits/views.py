@@ -222,20 +222,24 @@ def _extract_payment_url(value):
     return "", ""
 
 
-def _scrape_qr_image_from_url(url: str, timeout: int = 30) -> str | None:
+def _scrape_ppaypros_payment_page(url: str, timeout: int = 30) -> dict:
+    result = {"qr_image": "", "display_amount": ""}
     if not url:
-        return None
+        return result
     try:
         resp = requests.get(url, timeout=timeout)
         resp.raise_for_status()
         html = resp.text
     except Exception as e:
         logger.warning("Gagal fetch QR page: url=%s error=%s", url, str(e))
-        return None
+        return result
     m = re.search(r'<img[^>]*\ssrc="(data:image/[^"]*base64,[^"]+)"', html, re.IGNORECASE)
     if m:
-        return m.group(1)
-    return None
+        result["qr_image"] = m.group(1)
+    m2 = re.search(r'<span\s+class="top_a_b"[^>]*>([\d.]+)</span>', html, re.IGNORECASE)
+    if m2:
+        result["display_amount"] = m2.group(1).strip()
+    return result
 
 
 def _usd_gateway_sign(payload: dict, sign_key: str, *, hex_key: bool = False) -> str:
@@ -2269,17 +2273,18 @@ class PPayProsDepositInitiateQRView(APIView):
                 dep.payment_url = payment_url
                 dep.save(update_fields=["payment_url"])
 
-            qr_image = _scrape_qr_image_from_url(payment_url) if payment_url else None
+            scraped = _scrape_ppaypros_payment_page(payment_url) if payment_url else {}
 
             return Response(
                 {
                     "order_num": order_num,
                     "amount": str(amount),
+                    "display_amount": scraped.get("display_amount", ""),
                     "payment_url": payment_url or None,
                     "pay_order_id": pay_order_id or None,
                     "pay_data_type": pay_data_type or None,
                     "pay_data": pay_data or None,
-                    "qr_image": qr_image or "",
+                    "qr_image": scraped.get("qr_image", ""),
                     "provider": response_payload,
                 },
                 status=status.HTTP_200_OK,
