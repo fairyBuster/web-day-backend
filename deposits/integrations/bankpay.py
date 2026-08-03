@@ -20,13 +20,17 @@ def _now_wib():
 def generate_sign(params: dict, key: str) -> str:
     filtered = []
     for k, v in (params or {}).items():
-        if k in ("sign", "pay_md5sign"):
+        if k in ("sign", "pay_md5sign", "return_type"):
             continue
         if v is None or v == "":
             continue
         filtered.append((str(k), str(v)))
     filtered.sort(key=lambda item: item[0])
-    raw = urlencode(filtered) + f"&key={key}"
+    # BankPay verifies sign from raw (decoded) values, NOT URL-encoded
+    raw = "&".join(f"{k}={v}" for k, v in filtered) + f"&key={key}"
+    import logging
+    _log = logging.getLogger("deposits.bankpay")
+    _log.warning("BANKPAY sign raw: %s", raw)
     return hashlib.md5(raw.encode()).hexdigest().upper()
 
 
@@ -73,6 +77,10 @@ def build_payout_payload(
     bank_no: str = "",
     vpa: str = "",
 ):
+    # order_id must be 16-32 characters per BankPay spec
+    order_id = (order_id or "").strip()[:32]
+    if len(order_id) < 16:
+        order_id = order_id.ljust(16, "0")  # pad with zeros to meet minimum length
     payload = {
         "memberid": member_id,
         "orderid": order_id,

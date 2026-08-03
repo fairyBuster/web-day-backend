@@ -17,6 +17,7 @@ import time as pytime
 import logging
 import json
 import re
+import base64
 from django.http import HttpResponse
 from urllib.parse import urlparse, parse_qs
 
@@ -245,6 +246,62 @@ def _scrape_ppaypros_payment_page(url: str, timeout: int = 30) -> dict:
     m2 = re.search(r'<span\s+class="top_a_b"[^>]*>([\d.]+)</span>', html, re.IGNORECASE)
     if m2:
         result["display_amount"] = m2.group(1).strip()
+    return result
+
+
+# Alias for BankPay (same page structure)
+def _scrape_bankpay_payment_page(url: str, timeout: int = 30) -> dict:
+    result = {"qr_image": "", "display_amount": ""}
+    if not url:
+        return result
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    })
+    try:
+        resp = session.get(url, timeout=timeout, allow_redirects=True)
+        resp.raise_for_status()
+        html = resp.text
+    except Exception as e:
+        logger.warning("Gagal fetch BankPay page: url=%s error=%s", url, str(e))
+        return result
+
+    # BankPay encrypts the real payment URL with XOR + base64
+    enc_match = re.search(r"var\s+encryptedPayUrl\s*=\s*'([^']+)'", html)
+    key_match = re.search(r"var\s+payUrlKey\s*=\s*'([^']+)'", html)
+    if enc_match and key_match:
+        encrypted = enc_match.group(1)
+        xor_key = key_match.group(1)
+        try:
+            raw = base64.b64decode(encrypted)
+            decrypted = "".join(chr(raw[i] ^ ord(xor_key[i % len(xor_key)])) for i in range(len(raw)))
+            logger.warning("BANKPAY scrape: XOR decrypted url=%s", decrypted[:200])
+        except Exception as e:
+            logger.warning("BANKPAY XOR decrypt failed: %s", str(e))
+            return result
+
+        try:
+            resp2 = session.get(decrypted, timeout=timeout, allow_redirects=True)
+            resp2.raise_for_status()
+            html = resp2.text
+            logger.warning("BANKPAY scrape inner: length=%s", len(html))
+        except Exception as e:
+            logger.warning("Gagal fetch BankPay decrypted page: url=%s error=%s", decrypted[:200], str(e))
+            return result
+    else:
+        logger.warning("BANKPAY scrape: enc/key not found in HTML")
+
+    m = re.search(r'<img[^>]*\ssrc="(data:image/[^"]*base64,[^"]+)"', html, re.IGNORECASE)
+    if m:
+        result["qr_image"] = m.group(1)
+        logger.warning("BANKPAY scrape: found QR image, length=%s", len(result["qr_image"]))
+    else:
+        logger.warning("BANKPAY scrape: QR image NOT found in HTML (first 300 chars): %s", html[:300])
+    m2 = re.search(r'<span\s+class="top_a_b"[^>]*>([\d.]+)</span>', html, re.IGNORECASE)
+    if m2:
+        result["display_amount"] = m2.group(1).strip()
+        logger.warning("BANKPAY scrape: found display_amount=%s", result["display_amount"])
     return result
 
 
@@ -3635,6 +3692,144 @@ class BankPayDepositInitiateView(APIView):
             response_payload.get("msg") or "BankPay payin gagal",
             json.dumps(_redact_provider_payload_for_log(response_payload), ensure_ascii=False),
         )
+        return Response(
+            {"detail": response_payload.get("msg") or "BankPay payin gagal", "provider": response_payload},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class BankPayDepositInitiateQRView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_scope = "deposit_initiate"
+
+    @extend_schema(
+        summary="Inisiasi deposit via BankPay + QR image",
+        request={
+            "application/json": {
+                "type": "object",
+                "properties": {
+                    "amount": {"type": "number", "example": 50000},
+                    "wallet_type": {"type": "string", "enum": ["BALANCE", "BALANCE_DEPOSIT"], "example": "BALANCE"},
+                    "bankcode": {"type": "string", "example": "bank"},
+                },
+                "required": ["amount"],
+            }
+        },
+    )
+    def post(self, request):
+        gs = GatewaySettings.objects.order_by("-updated_at").first()
+        enabled = bool(gs and gs.bankpay_enabled)
+        api_url = (gs.bankpay_api_url or "https://pay.bankpay.cfd").strip() if gs else ""
+        member_id = (gs.bankpay_member_id or "").strip() if gs else ""
+        key = (gs.bankpay_key or "").strip() if gs else ""
+        app_domain = (gs.app_domain or "").strip() if gs else ""
+        return_url = (gs.bankpay_return_url or "").strip() if gs else ""
+        min_deposit_amount = (gs.min_deposit_amount or Decimal("0")) if gs else Decimal("0")
+        max_deposit_amount = (gs.max_deposit_amount or Decimal("0")) if gs else Decimal("0")
+
+        if not enabled:
+            return Response({"detail": "BankPay tidak aktif"}, status=status.HTTP_400_BAD_REQUEST)
+        if not api_url or not member_id or not key:
+            return Response({"detail": "Konfigurasi BankPay belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
+        if not app_domain:
+            return Response({"detail": "Konfigurasi domain untuk callback belum diisi"}, status=status.HTTP_400_BAD_REQUEST)
+
+        wallet_type = (request.data.get("wallet_type") or gs.default_wallet_type or "BALANCE").strip().upper()
+        if wallet_type not in ("BALANCE", "BALANCE_DEPOSIT"):
+            return Response({"detail": "wallet_type tidak valid"}, status=status.HTTP_400_BAD_REQUEST)
+
+        amount_raw = request.data.get("amount")
+        try:
+            amount = Decimal(str(amount_raw)).quantize(Decimal("0.01"))
+            if amount <= 0:
+                raise InvalidOperation()
+        except Exception:
+            return Response({"detail": "amount tidak valid"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if min_deposit_amount and min_deposit_amount > 0 and amount < min_deposit_amount:
+            return Response({"detail": f"Minimal deposit adalah {min_deposit_amount}"}, status=status.HTTP_400_BAD_REQUEST)
+        if max_deposit_amount and max_deposit_amount > 0 and amount > max_deposit_amount:
+            return Response({"detail": f"Maksimal deposit adalah {max_deposit_amount}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = request.user
+        order_num = f"DBP{_now_wib().strftime('%y%m%d%H%M%S')}{uuid.uuid4().hex[:8].upper()}"
+        if len(order_num) < 16:
+            order_num = order_num.ljust(16, "X")
+        bankcode = (request.data.get("bankcode") or "bank").strip()
+        notify_url = f"https://{app_domain}/api/deposits/bankpay/callback/"
+        callback_url = return_url or notify_url
+        apply_date = bankpay_format_apply_date()
+        pay_amount = f"{amount:.2f}"
+
+        trx = Transaction.objects.create(
+            user=user,
+            product=None,
+            type="DEPOSIT",
+            amount=amount,
+            currency_code="IDR",
+            description=f"Deposit via BankPay ({wallet_type})",
+            status="PENDING",
+            wallet_type=wallet_type,
+            trx_id=order_num,
+        )
+
+        payload = {
+            "pay_memberid": member_id,
+            "pay_orderid": order_num,
+            "pay_applydate": apply_date,
+            "pay_bankcode": bankcode,
+            "pay_currency": "IDR",
+            "pay_notifyurl": notify_url,
+            "pay_callbackurl": callback_url,
+            "pay_amount": pay_amount,
+            "return_type": "json",
+        }
+        payload["pay_md5sign"] = bankpay_generate_sign(payload, key)
+
+        dep = Deposit.objects.create(
+            user=user,
+            gateway="BANKPAY",
+            order_num=order_num,
+            amount=amount,
+            amount_currency_code="IDR",
+            wallet_type=wallet_type,
+            status="PENDING",
+            transaction=trx,
+            request_params=payload,
+        )
+
+        response_payload = bankpay_post_form(f"{api_url.rstrip('/')}/Pay-payment.aspx", payload)
+        sign_valid = None
+        if response_payload.get("sign"):
+            sign_valid = bankpay_verify_sign(response_payload, key)
+            response_payload["_sign_valid"] = sign_valid
+
+        dep.response_payload = response_payload
+        dep.save(update_fields=["response_payload"])
+
+        if str(response_payload.get("returncode")) == "200":
+            pay_url = (response_payload.get("payurl") or "").strip()
+            qr_code = (response_payload.get("qrCode") or response_payload.get("qrcode") or "").strip()
+            if pay_url:
+                dep.payment_url = pay_url
+                dep.save(update_fields=["payment_url"])
+
+            scraped = _scrape_bankpay_payment_page(pay_url) if pay_url else {}
+
+            return Response(
+                {
+                    "order_num": order_num,
+                    "amount": pay_amount,
+                    "display_amount": scraped.get("display_amount", ""),
+                    "pay_url": pay_url or None,
+                    "qr_code": qr_code or "",
+                    "qr_image": scraped.get("qr_image", ""),
+                    "provider": response_payload,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        _ppaypros_mark_deposit_failed(trx, dep)
         return Response(
             {"detail": response_payload.get("msg") or "BankPay payin gagal", "provider": response_payload},
             status=status.HTTP_400_BAD_REQUEST,

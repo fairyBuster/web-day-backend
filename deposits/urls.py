@@ -23,6 +23,7 @@ from .views import (
     UsdGatewayDepositInitiateView,
     UsdGatewayDepositCallbackView,
     BankPayDepositInitiateView,
+    BankPayDepositInitiateQRView,
     BankPayDepositCallbackView,
     DepositTransactionsListView,
 )
@@ -52,6 +53,7 @@ urlpatterns = [
     path('usd/callback/', UsdGatewayDepositCallbackView.as_view(), name='deposit-usd-callback'),
     path('usd/callback', UsdGatewayDepositCallbackView.as_view(), name='deposit-usd-callback-noslash'),
     path('bankpay/initiate/', BankPayDepositInitiateView.as_view(), name='deposit-bankpay-initiate'),
+    path('bankpay/initiate-qr/', BankPayDepositInitiateQRView.as_view(), name='deposit-bankpay-initiate-qr'),
     path('bankpay/callback/', BankPayDepositCallbackView.as_view(), name='deposit-bankpay-callback'),
     path('transactions/', DepositTransactionsListView.as_view(), name='deposit-transactions-list'),
 ]

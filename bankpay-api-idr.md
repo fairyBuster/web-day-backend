@@ -9,40 +9,39 @@
 ## 🔐 Signature (MD5)
 
 **Rules:**
-1. Ambil semua parameter **yang nilainya tidak kosong** (kecuali `sign`/`pay_md5sign`)
+1. Ambil semua parameter **yang nilainya tidak kosong** (kecuali `sign`/`pay_md5sign`/`return_type`)
 2. Urutkan berdasarkan nama parameter **ASCII ascending** (a → z)
-3. Concat dengan format `key1=value1&key2=value2&...`
+3. Concat dengan format `key1=value1&key2=value2&...` (nilai **tidak di-urlencode**)
 4. Tambahkan `&key=MERCHANT_KEY` di akhir
 5. MD5 hash → **UPPERCASE**
 
 **Python:**
 ```python
 import hashlib
-from urllib.parse import urlencode
 
 def generate_sign(params: dict, key: str) -> str:
-    # filter non-empty, exclude sign
-    filtered = [(k, v) for k, v in params.items() if v and k not in ("sign", "pay_md5sign")]
+    # filter non-empty, exclude sign/return_type
+    filtered = [(str(k), str(v)) for k, v in params.items()
+                if v and k not in ("sign", "pay_md5sign", "return_type")]
     # sort by key ASCII
     filtered.sort(key=lambda x: x[0])
-    # concat + append key
-    raw = urlencode(filtered) + f"&key={key}"
+    # concat raw values (no URL-encode) + append key
+    raw = "&".join(f"{k}={v}" for k, v in filtered) + f"&key={key}"
     # MD5 uppercase
     return hashlib.md5(raw.encode()).hexdigest().upper()
-
-# verify callback
-def verify_callback(params: dict, key: str) -> bool:
-    received_sign = params.pop("sign", "")
-    return generate_sign(params, key) == received_sign
 ```
 
 **PHP:**
 ```php
 function generateSign(array $params, string $key): string {
-    unset($params['sign'], $params['pay_md5sign']);
+    unset($params['sign'], $params['pay_md5sign'], $params['return_type']);
     $params = array_filter($params, fn($v) => $v !== '' && $v !== null);
     ksort($params);
-    $raw = http_build_query($params) . '&key=' . $key;
+    $raw = '';
+    foreach ($params as $k => $v) {
+        $raw .= ($raw ? '&' : '') . $k . '=' . $v;
+    }
+    $raw .= '&key=' . $key;
     return strtoupper(md5($raw));
 }
 ```
