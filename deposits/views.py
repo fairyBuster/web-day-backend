@@ -3873,29 +3873,42 @@ class BankPayDepositCallbackView(APIView):
 
 
 def _bankpay_collect_payload(request) -> dict:
-    if isinstance(request.data, dict) and request.data:
-        return dict(request.data)
-    post_data = dict(request.POST) if hasattr(request, "POST") else {}
-    result = {}
-    for k, v in post_data.items():
-        if isinstance(v, list) and len(v) == 1:
-            result[k] = v[0]
-        elif isinstance(v, list):
-            result[k] = v[-1]
-        else:
-            result[k] = v
-    if not result:
-        raw = request.body or b""
+    raw_data = request.data if hasattr(request, "data") else None
+    # DRF request.data for form-urlencoded is a QueryDict (subclass of dict).
+    # dict(QueryDict) returns list values, so force scalar first.
+    if raw_data is not None:
         try:
-            body_str = raw.decode("utf-8")
+            if hasattr(raw_data, "dict"):
+                scalar = raw_data.dict()
+            elif isinstance(raw_data, dict):
+                scalar = {k: (v[0] if isinstance(v, (list, tuple)) and len(v) == 1 else v) for k, v in raw_data.items()}
+            else:
+                scalar = {}
         except Exception:
-            body_str = ""
-        for pair in body_str.split("&"):
-            if "=" in pair:
-                k, v = pair.split("=", 1)
-                result[k] = v
-            elif pair:
-                result[pair] = ""
+            scalar = {}
+        if scalar:
+            return scalar
+
+    # Fallback: POST form data
+    if hasattr(request, "POST"):
+        try:
+            return request.POST.dict() if hasattr(request.POST, "dict") else dict(request.POST)
+        except Exception:
+            pass
+
+    # Last resort: raw body
+    result = {}
+    raw = request.body or b""
+    try:
+        body_str = raw.decode("utf-8")
+    except Exception:
+        body_str = ""
+    for pair in body_str.split("&"):
+        if "=" in pair:
+            k, v = pair.split("=", 1)
+            result[k] = v
+        elif pair:
+            result[pair] = ""
     return result
 
 
