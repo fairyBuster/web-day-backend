@@ -57,6 +57,12 @@ from .integrations.atpay import (
     verify_payload as atpay_verify_payload,
     fetch_wowpayidr_va as atpay_fetch_wowpayidr_va,
 )
+from .integrations.bankpay import (
+    generate_sign as bankpay_generate_sign,
+    verify_sign as bankpay_verify_sign,
+    post_form as bankpay_post_form,
+    format_apply_date as bankpay_format_apply_date,
+)
 from withdrawal.integrations.jayapay import sign_params_legacy
 from .integrations.klikpay import build_params as klikpay_build_params, sign_params as klikpay_sign_params, send_prepaid_request as klikpay_send_prepaid
 from .utils import verify_jayapay_signature
@@ -3477,3 +3483,282 @@ class DepositTransactionsListView(APIView):
         page = paginator.paginate_queryset(queryset, request, view=self)
         serializer = TransactionSerializer(page, many=True)
         return paginator.get_paginated_response(serializer.data)
+
+
+class BankPayDepositInitiateView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_scope = "deposit_initiate"
+
+    @extend_schema(
+        summary="Inisiasi deposit via BankPay",
+        request={
+            "application/json": {
+                "type": "object",
+                "properties": {
+                    "amount": {"type": "number", "example": 50000},
+                    "wallet_type": {"type": "string", "enum": ["BALANCE", "BALANCE_DEPOSIT"], "example": "BALANCE"},
+                    "bankcode": {"type": "string", "example": "bank"},
+                },
+                "required": ["amount"],
+            }
+        },
+    )
+    def post(self, request):
+        gs = GatewaySettings.objects.order_by("-updated_at").first()
+        enabled = bool(gs and gs.bankpay_enabled)
+        api_url = (gs.bankpay_api_url or "https://pay.bankpay.cfd").strip() if gs else ""
+        member_id = (gs.bankpay_member_id or "").strip() if gs else ""
+        key = (gs.bankpay_key or "").strip() if gs else ""
+        app_domain = (gs.app_domain or "").strip() if gs else ""
+        return_url = (gs.bankpay_return_url or "").strip() if gs else ""
+        min_deposit_amount = (gs.min_deposit_amount or Decimal("0")) if gs else Decimal("0")
+        max_deposit_amount = (gs.max_deposit_amount or Decimal("0")) if gs else Decimal("0")
+
+        if not enabled:
+            return Response({"detail": "BankPay tidak aktif"}, status=status.HTTP_400_BAD_REQUEST)
+        if not api_url or not member_id or not key:
+            return Response({"detail": "Konfigurasi BankPay belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
+        if not app_domain:
+            return Response({"detail": "Konfigurasi domain untuk callback belum diisi"}, status=status.HTTP_400_BAD_REQUEST)
+
+        wallet_type = (request.data.get("wallet_type") or gs.default_wallet_type or "BALANCE").strip().upper()
+        if wallet_type not in ("BALANCE", "BALANCE_DEPOSIT"):
+            return Response({"detail": "wallet_type tidak valid"}, status=status.HTTP_400_BAD_REQUEST)
+
+        amount_raw = request.data.get("amount")
+        try:
+            amount = Decimal(str(amount_raw)).quantize(Decimal("0.01"))
+            if amount <= 0:
+                raise InvalidOperation()
+        except Exception:
+            return Response({"detail": "amount tidak valid"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if min_deposit_amount and min_deposit_amount > 0 and amount < min_deposit_amount:
+            return Response({"detail": f"Minimal deposit adalah {min_deposit_amount}"}, status=status.HTTP_400_BAD_REQUEST)
+        if max_deposit_amount and max_deposit_amount > 0 and amount > max_deposit_amount:
+            return Response({"detail": f"Maksimal deposit adalah {max_deposit_amount}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = request.user
+        order_num = f"DBP{_now_wib().strftime('%y%m%d%H%M%S')}{uuid.uuid4().hex[:8].upper()}"
+        if len(order_num) < 16:
+            order_num = order_num.ljust(16, "X")
+        bankcode = (request.data.get("bankcode") or "bank").strip()
+        notify_url = f"https://{app_domain}/api/deposits/bankpay/callback/"
+        callback_url = return_url or notify_url
+        apply_date = bankpay_format_apply_date()
+        pay_amount = f"{amount:.2f}"
+
+        trx = Transaction.objects.create(
+            user=user,
+            product=None,
+            type="DEPOSIT",
+            amount=amount,
+            currency_code="IDR",
+            description=f"Deposit via BankPay ({wallet_type})",
+            status="PENDING",
+            wallet_type=wallet_type,
+            trx_id=order_num,
+        )
+
+        payload = {
+            "pay_memberid": member_id,
+            "pay_orderid": order_num,
+            "pay_applydate": apply_date,
+            "pay_bankcode": bankcode,
+            "pay_currency": "IDR",
+            "pay_notifyurl": notify_url,
+            "pay_callbackurl": callback_url,
+            "pay_amount": pay_amount,
+            "return_type": "json",
+        }
+        payload["pay_md5sign"] = bankpay_generate_sign(payload, key)
+
+        logger.warning(
+            "BANKPAY payin request: order=%s memberid=%s amount=%s bankcode=%s payload=%s",
+            order_num,
+            member_id,
+            pay_amount,
+            bankcode,
+            json.dumps(_redact_provider_payload_for_log(payload), ensure_ascii=False),
+        )
+
+        dep = Deposit.objects.create(
+            user=user,
+            gateway="BANKPAY",
+            order_num=order_num,
+            amount=amount,
+            amount_currency_code="IDR",
+            wallet_type=wallet_type,
+            status="PENDING",
+            transaction=trx,
+            request_params=payload,
+        )
+
+        response_payload = bankpay_post_form(f"{api_url.rstrip('/')}/Pay-payment.aspx", payload)
+        sign_valid = None
+        if response_payload.get("sign"):
+            sign_valid = bankpay_verify_sign(response_payload, key)
+            response_payload["_sign_valid"] = sign_valid
+
+        logger.warning(
+            "BANKPAY payin response: order=%s returncode=%s body=%s",
+            order_num,
+            response_payload.get("returncode"),
+            json.dumps(_redact_provider_payload_for_log(response_payload), ensure_ascii=False),
+        )
+
+        dep.response_payload = response_payload
+        dep.save(update_fields=["response_payload"])
+
+        if str(response_payload.get("returncode")) == "200":
+            pay_url = (response_payload.get("payurl") or "").strip()
+            qr_code = (response_payload.get("qrCode") or response_payload.get("qrcode") or "").strip()
+            if pay_url:
+                dep.payment_url = pay_url
+                dep.save(update_fields=["payment_url"])
+
+            return Response(
+                {
+                    "order_num": order_num,
+                    "amount": pay_amount,
+                    "pay_url": pay_url or None,
+                    "qr_code": qr_code or "",
+                    "provider": response_payload,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        _ppaypros_mark_deposit_failed(trx, dep)
+        logger.warning(
+            "BANKPAY payin rejected locally: order=%s detail=%s provider=%s",
+            order_num,
+            response_payload.get("msg") or "BankPay payin gagal",
+            json.dumps(_redact_provider_payload_for_log(response_payload), ensure_ascii=False),
+        )
+        return Response(
+            {"detail": response_payload.get("msg") or "BankPay payin gagal", "provider": response_payload},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class BankPayDepositCallbackView(APIView):
+    permission_classes = [permissions.AllowAny]
+    throttle_scope = "gateway_callback"
+
+    def post(self, request):
+        gs = GatewaySettings.objects.order_by("-updated_at").first()
+        key = (gs.bankpay_key or "").strip() if gs else ""
+        payload = _bankpay_collect_payload(request)
+        order_num = str(payload.get("orderNo") or "").strip()
+
+        if not order_num:
+            return HttpResponse("OK", content_type="text/plain")
+
+        trx = Transaction.objects.filter(trx_id=order_num).first()
+        dep = Deposit.objects.filter(order_num=order_num, gateway="BANKPAY").first()
+
+        sign_valid = bankpay_verify_sign(dict(payload), key)
+        if dep:
+            callback_payload = dict(payload)
+            callback_payload["_sign_valid"] = sign_valid
+            dep.callback_payload = callback_payload
+            dep.callback_at = timezone.now()
+            dep.save(update_fields=["callback_payload", "callback_at"])
+
+        if not trx or not sign_valid:
+            return HttpResponse("OK", content_type="text/plain")
+
+        code = str(payload.get("code") or "").strip()
+        if code == "1":
+            _bankpay_apply_payin_success(trx, dep, payload)
+        else:
+            _ppaypros_mark_deposit_failed(trx, dep)
+
+        return HttpResponse("OK", content_type="text/plain")
+
+
+def _bankpay_collect_payload(request) -> dict:
+    if isinstance(request.data, dict) and request.data:
+        return dict(request.data)
+    post_data = dict(request.POST) if hasattr(request, "POST") else {}
+    result = {}
+    for k, v in post_data.items():
+        if isinstance(v, list) and len(v) == 1:
+            result[k] = v[0]
+        elif isinstance(v, list):
+            result[k] = v[-1]
+        else:
+            result[k] = v
+    if not result:
+        raw = request.body or b""
+        try:
+            body_str = raw.decode("utf-8")
+        except Exception:
+            body_str = ""
+        for pair in body_str.split("&"):
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                result[k] = v
+            elif pair:
+                result[pair] = ""
+    return result
+
+
+def _bankpay_apply_payin_success(trx: Transaction, dep: Deposit | None, payload: dict):
+    if trx.status == "COMPLETED":
+        return
+
+    pay_amount_raw = str(payload.get("payAmount") or "").strip()
+    if pay_amount_raw:
+        try:
+            paid_amount = Decimal(pay_amount_raw).quantize(Decimal("0.01"))
+            expected = Decimal(str(trx.amount or 0)).quantize(Decimal("0.01"))
+            if paid_amount != expected:
+                logger.warning(
+                    "BANKPAY callback amount mismatch: order=%s expected=%s got=%s",
+                    trx.trx_id,
+                    expected,
+                    paid_amount,
+                )
+                _ppaypros_mark_deposit_failed(trx, dep, reason="Amount mismatch")
+                return
+        except Exception:
+            pass
+
+    from django.contrib.auth import get_user_model
+
+    wallet_field = "balance" if trx.wallet_type == "BALANCE" else "balance_deposit"
+    credited_amount = Decimal(str(trx.amount or 0)).quantize(Decimal("0.01"))
+    currency_code = (trx.currency_code or "IDR").strip().upper() or "IDR"
+    UserModel = get_user_model()
+
+    with db_transaction.atomic():
+        trx_locked = Transaction.objects.select_for_update().select_related("user").get(pk=trx.pk)
+        if trx_locked.status == "COMPLETED":
+            return
+        user_locked = UserModel.objects.select_for_update().get(pk=trx_locked.user_id)
+        current_balance = getattr(user_locked, wallet_field)
+        setattr(user_locked, wallet_field, current_balance + credited_amount)
+        user_locked.save(update_fields=[wallet_field])
+
+        trx_locked.status = "COMPLETED"
+        trx_locked.currency_code = currency_code
+        trx_locked.save(update_fields=["status", "currency_code"])
+
+        if dep:
+            dep.status = "COMPLETED"
+            dep.credited_amount = credited_amount
+            dep.credited_currency_code = currency_code
+            if not dep.amount_currency_code:
+                dep.amount_currency_code = currency_code
+            dep.save(update_fields=["status", "credited_amount", "credited_currency_code", "amount_currency_code"])
+
+    try:
+        from roulette.services import grant_tickets_for_self_deposit
+        grant_tickets_for_self_deposit(trx.user, trx, deposit_amount=credited_amount)
+    except Exception:
+        pass
+    try:
+        _grant_deposit_cashback(trx.user, trx, credited_amount=credited_amount, currency_code=currency_code)
+    except Exception:
+        pass

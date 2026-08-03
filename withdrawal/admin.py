@@ -3,7 +3,7 @@ from django.conf import settings
 from django.urls import path, reverse
 from django.shortcuts import redirect
 from django.template.response import TemplateResponse
-from .models import Withdrawal, WithdrawalSettings, WithdrawalJayapay, WithdrawalService, UsdPayoutWithdrawal, JayapayPhPayoutWithdrawal, PPayProsWithdrawal, AtpayWithdrawal
+from .models import Withdrawal, WithdrawalSettings, WithdrawalJayapay, WithdrawalService, UsdPayoutWithdrawal, JayapayPhPayoutWithdrawal, PPayProsWithdrawal, AtpayWithdrawal, BankPayWithdrawal
 from .integrations.jayapay import build_params, sign_params, sign_params_legacy, send_cash_request
 from .integrations.jayapay_banks import JAYAPAY_BANKS
 from .integrations.jayapay_ph_banks import JAYAPAY_PH_PAYOUT_BANKS
@@ -12,6 +12,7 @@ from .integrations.usd_payout import build_payload as usd_build_payload, sign_hm
 from .integrations.ppaypros import build_payout_payload as ppaypros_build_payout_payload, map_payout_state as ppaypros_map_payout_state
 from deposits.integrations.ppaypros import amount_to_points as ppaypros_amount_to_points, generate_sign as ppaypros_generate_sign, parse_data_field as ppaypros_parse_data_field, post_json as ppaypros_post_json, verify_sign as ppaypros_verify_sign
 from deposits.integrations.atpay import build_bank_code_payload as atpay_build_bank_code_payload, build_payout_payload as atpay_build_payout_payload, build_payout_query_payload as atpay_build_payout_query_payload, map_payout_trade_status as atpay_map_payout_trade_status, normalize_amount as atpay_normalize_amount, normalize_sign_type as atpay_normalize_sign_type, post_json as atpay_post_json, sign_payload as atpay_sign_payload, verify_payload as atpay_verify_payload
+from deposits.integrations.bankpay import generate_sign as bankpay_generate_sign, post_form as bankpay_post_form, build_payout_payload as bankpay_build_payout_payload, fetch_bank_list as bankpay_fetch_bank_list
 from django.utils.html import format_html
 import json
 import logging
@@ -92,7 +93,7 @@ class WithdrawalAdmin(admin.ModelAdmin):
     list_filter = ('status', 'created_at')
     search_fields = ('user__phone', 'bank_account__account_number')
     readonly_fields = ('created_at', 'updated_at')
-    actions = ['process_withdrawal_jayapay']
+    actions = ['process_withdrawal_jayapay', 'process_withdrawal_bankpay']
     change_form_template = 'admin/withdrawal/change_form.html'
     autocomplete_fields = ('user', 'bank_account', 'transaction')
     list_select_related = ('user', 'bank_account', 'transaction', 'withdrawal_service')
@@ -146,6 +147,11 @@ class WithdrawalAdmin(admin.ModelAdmin):
                 '<int:pk>/process-atpay/',
                 self.admin_site.admin_view(self.process_atpay_view),
                 name='withdrawal_withdrawal_process_atpay',
+            ),
+            path(
+                '<int:pk>/process-bankpay/',
+                self.admin_site.admin_view(self.process_bankpay_view),
+                name='withdrawal_withdrawal_process_bankpay',
             ),
         ]
         return custom + urls
@@ -739,10 +745,113 @@ class WithdrawalAdmin(admin.ModelAdmin):
 
         return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
 
+    def process_bankpay_view(self, request, pk: int):
+        try:
+            wd = Withdrawal.objects.select_related('bank_account__bank', 'user', 'transaction').get(pk=pk)
+        except Withdrawal.DoesNotExist:
+            self.message_user(request, 'Withdrawal tidak ditemukan', level=messages.ERROR)
+            return redirect(reverse('admin:withdrawal_withdrawal_changelist'))
+
+        gs = WithdrawalSettings.objects.order_by("-updated_at").first()
+        enabled = bool(gs and gs.bankpay_payout_enabled)
+        api_url = (gs.bankpay_payout_api_url or "https://pay.bankpay.cfd").strip() if gs else ""
+        member_id = (gs.bankpay_payout_member_id or "").strip() if gs else ""
+        key = (gs.bankpay_payout_key or "").strip() if gs else ""
+        app_domain = getattr(gs, "app_domain", "").strip() if gs else ""
+        if not app_domain:
+            try:
+                from deposits.models import GatewaySettings
+                ggs = GatewaySettings.objects.order_by("-updated_at").first()
+                app_domain = (getattr(ggs, "app_domain", "") or "").strip() if ggs else ""
+            except Exception:
+                app_domain = ""
+
+        if not enabled:
+            self.message_user(request, 'BankPay payout tidak aktif', level=messages.ERROR)
+            return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+        if not api_url or not member_id or not key:
+            self.message_user(request, 'Konfigurasi BankPay payout belum lengkap', level=messages.ERROR)
+            return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+
+        if request.method == "POST":
+            bankno = (request.POST.get("bankno") or (getattr(wd.bank_account.bank, "code", "") if wd.bank_account else "")).strip()
+            bankname = (request.POST.get("bankname") or (getattr(wd.bank_account.bank, "name", "") if wd.bank_account else "")).strip()
+            cardnumber = (request.POST.get("cardnumber") or (wd.bank_account.account_number if wd.bank_account else "")).strip()
+            accountname = (request.POST.get("accountname") or (wd.bank_account.account_name if wd.bank_account else "")).strip()
+            mobile = (request.POST.get("mobile") or getattr(wd.user, "phone", "") or "").strip()
+            email = (request.POST.get("email") or getattr(wd.user, "email", "") or f"user{wd.user_id}@example.com").strip()
+            amount_raw = (request.POST.get("amount") or "").strip() or str(wd.net_amount or wd.amount)
+
+            if not cardnumber or not accountname or not amount_raw:
+                self.message_user(request, 'Account Number, Account Name, Amount wajib diisi', level=messages.ERROR)
+                return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+
+            try:
+                amount = Decimal(str(amount_raw))
+                if amount <= 0:
+                    raise InvalidOperation()
+            except Exception:
+                self.message_user(request, 'Amount tidak valid', level=messages.ERROR)
+                return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+
+            order_id = wd.transaction.trx_id if wd.transaction else f"WBP{wd.id}{int(time.time())}"
+            notify_url = f"https://{app_domain}/api/withdrawals/bankpay/callback/"
+            pay_amount = f"{amount:.2f}"
+
+            payload = bankpay_build_payout_payload(
+                member_id=member_id,
+                order_id=order_id,
+                amount=pay_amount,
+                bankcode="bank",
+                notify_url=notify_url,
+                mobile=mobile,
+                email=email,
+                bank_name=bankname,
+                card_number=cardnumber,
+                account_name=accountname,
+                bank_no=bankno,
+            )
+            payload["sign"] = bankpay_generate_sign(payload, key)
+
+            trace, _ = BankPayWithdrawal.objects.get_or_create(withdrawal=wd, defaults={"request_params": payload})
+            if trace and not trace.request_params:
+                trace.request_params = payload
+                trace.save(update_fields=["request_params"])
+
+            response_payload = bankpay_post_form(f"{api_url.rstrip('/')}/Pay-payment-draw.aspx", payload)
+            if trace:
+                stored = trace.response_payload or {}
+                stored["initiate"] = response_payload
+                trace.response_payload = stored
+                trace.save(update_fields=["response_payload"])
+
+            if isinstance(response_payload, dict) and response_payload.get("status") == 1:
+                wd.status = 'PROCESSING'
+                wd.save(update_fields=['status'])
+                self.message_user(request, f"Withdrawal #{wd.id} dikirim ke BankPay", level=messages.SUCCESS)
+                return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+
+            wd.status = 'REJECTED'
+            wd.save(update_fields=['status'])
+            self.message_user(request, f"BankPay gagal: {response_payload.get('msg') if isinstance(response_payload, dict) else response_payload}", level=messages.ERROR)
+            return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+
+        return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+
     def render_change_form(self, request, context, add=False, change=False, form_url='', obj=None):
         if obj:
             gs = WithdrawalSettings.objects.order_by("-updated_at").first()
             atpay_bank_codes, atpay_bank_codes_error = _fetch_atpay_bank_codes(gs)
+            bankpay_bank_codes, bankpay_bank_codes_error = [], ""
+            if gs and gs.bankpay_payout_enabled and gs.bankpay_payout_member_id and gs.bankpay_payout_key:
+                try:
+                    bankpay_bank_codes, bankpay_bank_codes_error = bankpay_fetch_bank_list(
+                        gs.bankpay_payout_api_url or "https://pay.bankpay.cfd",
+                        gs.bankpay_payout_member_id.strip(),
+                        gs.bankpay_payout_key.strip(),
+                    )
+                except Exception as e:
+                    bankpay_bank_codes_error = str(e)
             atpay_bank_code_set = {
                 item["bank_code"]
                 for item in atpay_bank_codes
@@ -818,6 +927,21 @@ class WithdrawalAdmin(admin.ModelAdmin):
                 'usd_payout_bank_codes': [{"code": c[0], "name": c[1]} for c in USD_PAYOUT_BANK_CODE_CHOICES],
                 'process_usd_payout_url': reverse('admin:withdrawal_withdrawal_process_usd_payout', args=(obj.id,)),
                 'usd_payout_enabled': getattr(settings, 'USD_PAYOUT_ENABLED', False),
+                'bankpay_payout_enabled': bool(gs and gs.bankpay_payout_enabled),
+                'bankpay_payout_member_id': (gs.bankpay_payout_member_id or "").strip() if gs else "",
+                'bankpay_bank_codes': bankpay_bank_codes,
+                'bankpay_bank_codes_error': bankpay_bank_codes_error,
+                'bankpay_payout_initial': {
+                    'bankcode': getattr(getattr(obj.bank_account, 'bank', None), 'code', '') or '',
+                    'cardnumber': obj.bank_account.account_number if obj.bank_account else '',
+                    'accountname': obj.bank_account.account_name if obj.bank_account else '',
+                    'bankname': getattr(getattr(obj.bank_account, 'bank', None), 'name', '') or '',
+                    'bankno': getattr(getattr(obj.bank_account, 'bank', None), 'code', '') or '',
+                    'mobile': (getattr(obj.bank_account, 'phone', '') or getattr(obj.user, 'phone', '') or '').strip(),
+                    'email': getattr(obj.user, 'email', '') or f"user{obj.user_id}@example.com",
+                    'amount': str(obj.net_amount or obj.amount),
+                },
+                'process_bankpay_url': reverse('admin:withdrawal_withdrawal_process_bankpay', args=(obj.id,)),
             })
         return super().render_change_form(request, context, add, change, form_url, obj)
 
@@ -876,6 +1000,80 @@ class WithdrawalAdmin(admin.ModelAdmin):
             self.message_user(request, f"Berhasil memproses {processed} withdrawal via Jayapay.", level=messages.SUCCESS)
     process_withdrawal_jayapay.short_description = 'Process via Jayapay'
 
+    def process_withdrawal_bankpay(self, request, queryset):
+        gs = WithdrawalSettings.objects.order_by("-updated_at").first()
+        enabled = bool(gs and gs.bankpay_payout_enabled)
+        api_url = (gs.bankpay_payout_api_url or "https://pay.bankpay.cfd").strip() if gs else ""
+        member_id = (gs.bankpay_payout_member_id or "").strip() if gs else ""
+        key = (gs.bankpay_payout_key or "").strip() if gs else ""
+        app_domain = getattr(gs, "app_domain", "").strip() if gs else ""
+
+        if not enabled:
+            self.message_user(request, 'BankPay payout tidak aktif', level=messages.ERROR)
+            return
+        if not api_url or not member_id or not key:
+            self.message_user(request, 'Konfigurasi BankPay payout belum lengkap', level=messages.ERROR)
+            return
+
+        processed = 0
+        for wd in queryset.select_related('bank_account__bank', 'transaction'):
+            if wd.status not in ('PENDING', 'PROCESSING'):
+                self.message_user(request, f"Withdrawal #{wd.id} dilewati: status {wd.status}", level=messages.WARNING)
+                continue
+            if not wd.bank_account:
+                self.message_user(request, f"Withdrawal #{wd.id} gagal: tidak ada bank_account", level=messages.ERROR)
+                continue
+
+            bank = wd.bank_account.bank
+            account_no = wd.bank_account.account_number or ""
+            account_name = wd.bank_account.account_name or ""
+            bank_name_str = getattr(bank, "name", "") or ""
+            bank_code = getattr(bank, "code", "") or ""
+
+            try:
+                order_id = getattr(getattr(wd, "transaction", None), "trx_id", None) or f"WBP{wd.pk}{int(time.time())}"
+                notify_url = f"https://{app_domain}/api/withdrawals/bankpay/callback/"
+                # Use withdrawal net amount
+                net = wd.net_amount if wd.net_amount and wd.net_amount > 0 else (wd.amount - wd.fee if wd.fee else wd.amount)
+                pay_amount = f"{net:.2f}" if net else f"{wd.amount:.2f}"
+
+                payload = bankpay_build_payout_payload(
+                    member_id=member_id,
+                    order_id=order_id,
+                    amount=pay_amount,
+                    bankcode="bank",
+                    notify_url=notify_url,
+                    mobile=getattr(wd.user, "phone", "") or "",
+                    email=getattr(wd.user, "email", "") or f"user{wd.user_id}@example.com",
+                    bank_name=bank_name_str,
+                    card_number=account_no,
+                    account_name=account_name,
+                    bank_no=bank_code,
+                )
+                payload["sign"] = bankpay_generate_sign(payload, key)
+
+                resp = bankpay_post_form(f"{api_url.rstrip('/')}/Pay-payment-draw.aspx", payload)
+
+                trace, _ = BankPayWithdrawal.objects.get_or_create(withdrawal=wd, defaults={"request_params": payload})
+                if trace:
+                    if not trace.request_params:
+                        trace.request_params = payload
+                    stored = trace.response_payload or {}
+                    stored["initiate"] = resp
+                    trace.response_payload = stored
+                    trace.save(update_fields=["request_params", "response_payload"])
+
+                wd.status = 'PROCESSING'
+                wd.save()
+                processed += 1
+                self.message_user(request, f"Withdrawal #{wd.id} dikirim ke BankPay", level=messages.SUCCESS)
+            except Exception as e:
+                self.message_user(request, f"Withdrawal #{wd.id} gagal dikirim: {e}", level=messages.ERROR)
+
+        if processed:
+            self.message_user(request, f"Berhasil memproses {processed} withdrawal via BankPay.", level=messages.SUCCESS)
+    process_withdrawal_bankpay.short_description = 'Process via BankPay'
+
 
 @admin.register(WithdrawalJayapay)
 class WithdrawalJayapayAdmin(WithdrawalAdmin):
@@ -899,6 +1097,7 @@ class WithdrawalSettingsAdmin(admin.ModelAdmin):
         'jayapay_ph_payout_enabled',
         'ppaypros_payout_enabled',
         'atpay_payout_enabled',
+        'bankpay_payout_enabled',
         'updated_at',
     )
     list_filter = ('is_active',)
@@ -966,6 +1165,14 @@ class WithdrawalSettingsAdmin(admin.ModelAdmin):
                 'atpay_payout_secret_key',
                 'atpay_payout_private_key',
                 'atpay_payout_public_key',
+            )
+        }),
+        ('BankPay Payout', {
+            'fields': (
+                'bankpay_payout_enabled',
+                'bankpay_payout_api_url',
+                'bankpay_payout_member_id',
+                'bankpay_payout_key',
             )
         }),
     )

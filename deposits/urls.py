@@ -22,6 +22,8 @@ from .views import (
     PPayProsDepositQueryView,
     UsdGatewayDepositInitiateView,
     UsdGatewayDepositCallbackView,
+    BankPayDepositInitiateView,
+    BankPayDepositCallbackView,
     DepositTransactionsListView,
 )
 
@@ -49,5 +51,7 @@ urlpatterns = [
     path('usd/initiate/', UsdGatewayDepositInitiateView.as_view(), name='deposit-usd-initiate'),
     path('usd/callback/', UsdGatewayDepositCallbackView.as_view(), name='deposit-usd-callback'),
     path('usd/callback', UsdGatewayDepositCallbackView.as_view(), name='deposit-usd-callback-noslash'),
+    path('bankpay/initiate/', BankPayDepositInitiateView.as_view(), name='deposit-bankpay-initiate'),
+    path('bankpay/callback/', BankPayDepositCallbackView.as_view(), name='deposit-bankpay-callback'),
     path('transactions/', DepositTransactionsListView.as_view(), name='deposit-transactions-list'),
 ]

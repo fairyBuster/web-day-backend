@@ -21,6 +21,7 @@ class GatewaySettings(models.Model):
     clienthub_enabled = models.BooleanField(default=False)
     sitransferhub_enabled = models.BooleanField(default=False)
     atpay_enabled = models.BooleanField(default=False)
+    bankpay_enabled = models.BooleanField(default=False)
 
     # Jayapay config
     jayapay_merchant_code = models.CharField(max_length=100, blank=True, default='')
@@ -89,6 +90,12 @@ class GatewaySettings(models.Model):
     atpay_private_key = models.TextField(blank=True, default='', help_text='Dipakai jika sign_type=MD5withRsa')
     atpay_public_key = models.TextField(blank=True, default='', help_text='Public key ATPAY untuk verifikasi callback MD5withRsa')
     atpay_return_url = models.CharField(max_length=512, blank=True, default='', help_text='URL redirect setelah pembayaran selesai')
+
+    # BankPay pay-in
+    bankpay_api_url = models.CharField(max_length=255, blank=True, default='https://pay.bankpay.cfd')
+    bankpay_member_id = models.CharField(max_length=100, blank=True, default='', help_text='Merchant ID dari BankPay')
+    bankpay_key = models.CharField(max_length=255, blank=True, default='', help_text='MERCHANT_KEY untuk signature MD5')
+    bankpay_return_url = models.CharField(max_length=512, blank=True, default='', help_text='URL redirect setelah pembayaran selesai')
 
     updated_at = models.DateTimeField(auto_now=True)
 

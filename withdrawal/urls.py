@@ -17,6 +17,8 @@ from .views import (
     PPayProsPayoutQueryView,
     UsdPayoutInitiateView,
     UsdPayoutCallbackView,
+    BankPayPayoutInitiateView,
+    BankPayPayoutCallbackView,
     WithdrawalTransactionsListView,
 )
 
@@ -38,5 +40,7 @@ urlpatterns = [
     path('ppaypros/query/<int:pk>/', PPayProsPayoutQueryView.as_view(), name='withdrawal-ppaypros-query'),
     path('usd-payout/initiate/<int:pk>/', UsdPayoutInitiateView.as_view(), name='withdrawal-usd-payout-initiate'),
     path('usd-payout/callback/', UsdPayoutCallbackView.as_view(), name='withdrawal-usd-payout-callback'),
+    path('bankpay/initiate/<int:pk>/', BankPayPayoutInitiateView.as_view(), name='withdrawal-bankpay-initiate'),
+    path('bankpay/callback/', BankPayPayoutCallbackView.as_view(), name='withdrawal-bankpay-callback'),
     path('transactions/', WithdrawalTransactionsListView.as_view(), name='withdrawal-transactions'),
 ]

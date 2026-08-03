@@ -5,12 +5,12 @@ from .models import GatewaySettings, Deposit
 @admin.register(GatewaySettings)
 class GatewaySettingsAdmin(admin.ModelAdmin):
     list_display = (
-        'default_wallet_type', 'app_domain', 'min_deposit_amount', 'max_deposit_amount', 'usd_gateway_min_deposit_amount', 'usd_gateway_max_deposit_amount', 'jayapay_enabled', 'jayapay_ph_enabled', 'klikpay_enabled', 'usd_gateway_enabled', 'ppaypros_enabled', 'clienthub_enabled', 'sitransferhub_enabled', 'atpay_enabled', 'updated_at'
+        'default_wallet_type', 'app_domain', 'min_deposit_amount', 'max_deposit_amount', 'usd_gateway_min_deposit_amount', 'usd_gateway_max_deposit_amount', 'jayapay_enabled', 'jayapay_ph_enabled', 'klikpay_enabled', 'usd_gateway_enabled', 'ppaypros_enabled', 'clienthub_enabled', 'sitransferhub_enabled', 'atpay_enabled', 'bankpay_enabled', 'updated_at'
     )
     readonly_fields = ('updated_at',)
     fieldsets = (
         ('Global', {
-            'fields': ('default_wallet_type', 'app_domain', 'min_deposit_amount', 'max_deposit_amount', 'jayapay_enabled', 'jayapay_ph_enabled', 'klikpay_enabled', 'usd_gateway_enabled', 'ppaypros_enabled', 'clienthub_enabled', 'sitransferhub_enabled', 'atpay_enabled')
+            'fields': ('default_wallet_type', 'app_domain', 'min_deposit_amount', 'max_deposit_amount', 'jayapay_enabled', 'jayapay_ph_enabled', 'klikpay_enabled', 'usd_gateway_enabled', 'ppaypros_enabled', 'clienthub_enabled', 'sitransferhub_enabled', 'atpay_enabled', 'bankpay_enabled')
         }),
         ('Jayapay', {
             'fields': (
@@ -102,6 +102,15 @@ class GatewaySettingsAdmin(admin.ModelAdmin):
                 'atpay_return_url',
             ),
             'description': 'Konfigurasi ATPAY untuk deposit. Pilih `MD5` atau `MD5withRsa` sesuai kredensial merchant.',
+        }),
+        ('BankPay', {
+            'fields': (
+                'bankpay_api_url',
+                'bankpay_member_id',
+                'bankpay_key',
+                'bankpay_return_url',
+            ),
+            'description': 'Konfigurasi BankPay untuk deposit IDR. Sign MD5, callback return OK plain text.',
         }),
     )
 

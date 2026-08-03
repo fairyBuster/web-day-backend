@@ -55,6 +55,11 @@ class WithdrawalSettings(models.Model):
     atpay_payout_private_key = models.TextField(blank=True, default='', help_text='Dipakai jika sign_type=MD5withRsa')
     atpay_payout_public_key = models.TextField(blank=True, default='', help_text='Public key ATPAY untuk verifikasi callback MD5withRsa')
 
+    bankpay_payout_enabled = models.BooleanField(default=False)
+    bankpay_payout_api_url = models.CharField(max_length=255, blank=True, default='https://pay.bankpay.cfd')
+    bankpay_payout_member_id = models.CharField(max_length=100, blank=True, default='', help_text='Merchant ID dari BankPay')
+    bankpay_payout_key = models.CharField(max_length=255, blank=True, default='', help_text='MERCHANT_KEY untuk signature MD5 payout')
+
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -253,3 +258,18 @@ class WithdrawalJayapay(Withdrawal):
         proxy = True
         verbose_name = 'Withdrawal Jayapay'
         verbose_name_plural = 'Withdrawals Jayapay'
+
+
+class BankPayWithdrawal(models.Model):
+    withdrawal = models.OneToOneField(Withdrawal, on_delete=models.CASCADE, related_name='bankpay_withdrawal')
+    request_params = models.JSONField(default=dict)
+    response_payload = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'withdrawal_bankpay'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"BankPay payout for Withdrawal #{self.withdrawal.pk}"

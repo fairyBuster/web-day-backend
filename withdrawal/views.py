@@ -13,7 +13,7 @@ from rest_framework.views import APIView
 from django.http import HttpResponse
 
 from .integrations.jayapay import build_params, sign_params_legacy, send_cash_request
-from .models import JayapayWithdrawal, JayapayPhPayoutWithdrawal, UsdPayoutWithdrawal, PPayProsWithdrawal, AtpayWithdrawal
+from .models import JayapayWithdrawal, JayapayPhPayoutWithdrawal, UsdPayoutWithdrawal, PPayProsWithdrawal, AtpayWithdrawal, BankPayWithdrawal
 from products.models import Transaction
 from products.serializers import TransactionSerializer
 from django.db.models import Q
@@ -36,6 +36,13 @@ from deposits.integrations.atpay import (
     post_json as atpay_post_json,
     sign_payload as atpay_sign_payload,
     verify_payload as atpay_verify_payload,
+)
+from deposits.integrations.bankpay import (
+    generate_sign as bankpay_generate_sign,
+    verify_sign as bankpay_verify_sign,
+    post_form as bankpay_post_form,
+    build_payout_payload as bankpay_build_payout_payload,
+    map_payout_returncode as bankpay_map_payout_returncode,
 )
 from deposits.utils import verify_jayapay_signature
 from .integrations.jayapay_ph_banks import JAYAPAY_PH_PAYOUT_BANKS
@@ -1276,3 +1283,160 @@ class WithdrawalTransactionsListView(APIView):
         page = paginator.paginate_queryset(queryset, request, view=self)
         serializer = TransactionSerializer(page, many=True)
         return paginator.get_paginated_response(serializer.data)
+
+
+class BankPayPayoutInitiateView(APIView):
+    permission_classes = [permissions.IsAdminUser]
+    throttle_scope = "withdraw_admin_initiate"
+
+    @extend_schema(summary="Inisiasi withdraw via BankPay (admin)")
+    def post(self, request, pk: int):
+        gs = WithdrawalSettings.objects.order_by("-updated_at").first()
+        enabled = bool(gs and gs.bankpay_payout_enabled)
+        api_url = (gs.bankpay_payout_api_url or "https://pay.bankpay.cfd").strip() if gs else ""
+        member_id = (gs.bankpay_payout_member_id or "").strip() if gs else ""
+        key = (gs.bankpay_payout_key or "").strip() if gs else ""
+        app_domain = _resolve_app_domain(gs)
+
+        if not enabled:
+            return Response({"detail": "BankPay payout tidak aktif"}, status=status.HTTP_400_BAD_REQUEST)
+        if not api_url or not member_id or not key:
+            return Response({"detail": "Konfigurasi BankPay payout belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
+        if not app_domain:
+            return Response({"detail": "Konfigurasi domain untuk callback belum diisi"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            wd = Withdrawal.objects.select_related("user", "bank_account__bank", "transaction").get(pk=pk)
+        except Withdrawal.DoesNotExist:
+            return Response({"detail": "Withdrawal tidak ditemukan"}, status=status.HTTP_404_NOT_FOUND)
+
+        if wd.status not in ("PENDING", "PROCESSING"):
+            return Response({"detail": "Status withdrawal tidak valid untuk inisiasi"}, status=status.HTTP_400_BAD_REQUEST)
+
+        account_no = getattr(wd.bank_account, "account_number", "") or ""
+        account_name = getattr(wd.bank_account, "account_name", "") or ""
+        bank_name = getattr(getattr(wd, "bank_account", None), "bank", None)
+        bank_name_str = getattr(bank_name, "name", "") or ""
+        bank_code = getattr(bank_name, "code", "") or ""
+
+        amount_raw = request.data.get("amount")
+        try:
+            amount = ppaypros_normalize_amount(amount_raw) if amount_raw is not None else ppaypros_normalize_amount(wd.net_amount or wd.amount)
+            if amount <= 0:
+                raise InvalidOperation()
+        except Exception:
+            return Response({"detail": "amount tidak valid"}, status=status.HTTP_400_BAD_REQUEST)
+
+        order_id = getattr(getattr(wd, "transaction", None), "trx_id", None) or f"WBP{wd.pk}{int(pytime.time())}"
+        notify_url = f"https://{app_domain}/api/withdrawals/bankpay/callback/"
+        pay_amount = f"{amount:.2f}"
+
+        payload = bankpay_build_payout_payload(
+            member_id=member_id,
+            order_id=order_id,
+            amount=pay_amount,
+            bankcode="bank",
+            notify_url=notify_url,
+            mobile=getattr(wd.user, "phone", "") or "",
+            email=getattr(wd.user, "email", "") or f"user{wd.user_id}@example.com",
+            bank_name=bank_name_str,
+            card_number=account_no,
+            account_name=account_name,
+            bank_no=bank_code,
+        )
+        payload["sign"] = bankpay_generate_sign(payload, key)
+
+        trace, _ = BankPayWithdrawal.objects.get_or_create(withdrawal=wd, defaults={"request_params": payload})
+        if trace and not trace.request_params:
+            trace.request_params = payload
+            trace.save(update_fields=["request_params"])
+
+        response_payload = bankpay_post_form(f"{api_url.rstrip('/')}/Pay-payment-draw.aspx", payload)
+        if trace:
+            stored = trace.response_payload or {}
+            stored["initiate"] = response_payload
+            trace.response_payload = stored
+            trace.save(update_fields=["response_payload"])
+
+        if isinstance(response_payload, dict) and response_payload.get("status") == 1:
+            msg = response_payload.get("msg") if isinstance(response_payload.get("msg"), dict) else {}
+            trade_state = str(msg.get("trade_state") or "").strip().upper()
+            if trade_state == "SUCCESS":
+                wd.status = "COMPLETED"
+                wd.save(update_fields=["status"])
+            elif trade_state in ("REFUSE",):
+                wd.status = "REJECTED"
+                wd.save(update_fields=["status"])
+            else:
+                wd.status = "PROCESSING"
+                wd.save(update_fields=["status"])
+            return Response({"gateway": response_payload}, status=status.HTTP_200_OK)
+
+        wd.status = "REJECTED"
+        wd.save(update_fields=["status"])
+        return Response({"detail": response_payload.get("msg") if isinstance(response_payload, dict) else "Payout gagal", "gateway": response_payload}, status=status.HTTP_400_BAD_REQUEST)
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class BankPayPayoutCallbackView(APIView):
+    permission_classes = [permissions.AllowAny]
+    throttle_scope = "gateway_callback"
+
+    @extend_schema(summary="Callback BankPay untuk update status withdraw")
+    def post(self, request, *args, **kwargs):
+        gs = WithdrawalSettings.objects.order_by("-updated_at").first()
+        key = (gs.bankpay_payout_key or "").strip() if gs else ""
+        payload = _bankpay_withdraw_collect_payload(request)
+        order_id = str(payload.get("orderid") or "").strip()
+        if not order_id:
+            return HttpResponse("OK", content_type="text/plain")
+
+        trx = Transaction.objects.filter(trx_id=order_id).first()
+        withdrawal = Withdrawal.objects.filter(transaction=trx).first() if trx else None
+        if not withdrawal:
+            return HttpResponse("OK", content_type="text/plain")
+
+        sign_valid = bankpay_verify_sign(dict(payload), key)
+        trace = BankPayWithdrawal.objects.filter(withdrawal=withdrawal).first()
+        if trace:
+            stored = trace.response_payload or {}
+            stored["callback"] = {**payload, "_sign_valid": sign_valid}
+            trace.response_payload = stored
+            trace.save(update_fields=["response_payload"])
+
+        if not sign_valid:
+            return HttpResponse("OK", content_type="text/plain")
+
+        returncode = str(payload.get("returncode") or "").strip()
+        mapped = bankpay_map_payout_returncode(returncode)
+        if mapped:
+            withdrawal.status = mapped
+            withdrawal.save(update_fields=["status"])
+        return HttpResponse("OK", content_type="text/plain")
+
+
+def _bankpay_withdraw_collect_payload(request) -> dict:
+    if isinstance(request.data, dict) and request.data:
+        return dict(request.data)
+    post_data = dict(request.POST) if hasattr(request, "POST") else {}
+    result = {}
+    for k, v in post_data.items():
+        if isinstance(v, list) and len(v) == 1:
+            result[k] = v[0]
+        elif isinstance(v, list):
+            result[k] = v[-1]
+        else:
+            result[k] = v
+    if not result:
+        raw = request.body or b""
+        try:
+            body_str = raw.decode("utf-8")
+        except Exception:
+            body_str = ""
+        for pair in body_str.split("&"):
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                result[k] = v
+            elif pair:
+                result[pair] = ""
+    return result

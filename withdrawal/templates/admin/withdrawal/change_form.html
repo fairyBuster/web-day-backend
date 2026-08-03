@@ -353,4 +353,59 @@
       </div>
     </form>
   </div>
+
+  <!-- BankPay Payout Section -->
+  <div class="module" style="margin-top: 30px; border: 1px solid #ccc; border-radius: 5px; padding: 20px;">
+    <h2>Process via BankPay</h2>
+    {% if bankpay_payout_enabled %}
+      <form method="post" action="{{ process_bankpay_url }}">
+        {% csrf_token %}
+        <fieldset class="module aligned">
+          <div class="form-row">
+            <div>
+              <label for="id_bp_bankcode">Bank</label>
+              {% if bankpay_bank_codes %}
+                <select id="id_bp_bankcode" name="bankno" onchange="document.getElementById('id_bp_bankname').value=this.options[this.selectedIndex].text.split(' (')[0]">
+                  {% for bank in bankpay_bank_codes %}
+                    <option value="{{ bank.bankCode }}" {% if bank.bankCode == bankpay_payout_initial.bankno %}selected{% endif %}>{{ bank.bankName }} ({{ bank.bankCode }})</option>
+                  {% endfor %}
+                </select>
+              {% else %}
+                <input type="text" id="id_bp_bankcode" name="bankno" value="{{ bankpay_payout_initial.bankno }}" />
+                {% if bankpay_bank_codes_error %}<p style="color: #999; font-size: 12px;">{{ bankpay_bank_codes_error }}</p>{% endif %}
+              {% endif %}
+            </div>
+          </div>
+          <input type="hidden" id="id_bp_bankname" name="bankname" value="{{ bankpay_payout_initial.bankname }}" />
+
+          <div class="form-row">
+            <div>
+              <label for="id_bp_cardnumber">Account Number</label>
+              <input type="text" id="id_bp_cardnumber" name="cardnumber" value="{{ bankpay_payout_initial.cardnumber }}" required />
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div>
+              <label for="id_bp_accountname">Account Name</label>
+              <input type="text" id="id_bp_accountname" name="accountname" value="{{ bankpay_payout_initial.accountname }}" required />
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div>
+              <label for="id_bp_amount">Amount</label>
+              <input type="number" step="0.01" id="id_bp_amount" name="amount" value="{{ bankpay_payout_initial.amount }}" required />
+            </div>
+          </div>
+        </fieldset>
+
+        <div class="submit-row">
+          <button type="submit" class="default">Submit to BankPay</button>
+        </div>
+      </form>
+    {% else %}
+      <p style="color: #999;">BankPay payout tidak aktif. Aktifkan di WithdrawalSettings dan isi konfigurasi member_id/key.</p>
+    {% endif %}
+  </div>
 {% endblock %}
