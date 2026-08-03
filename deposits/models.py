@@ -124,6 +124,7 @@ class Deposit(models.Model):
         ('CLIENTHUB', 'ClientHub'),
         ('SITRANSFERHUB', 'SiTransfer Hub'),
         ('ATPAY', 'ATPAY'),
+        ('BANKPAY', 'BankPay'),
     ]
     WALLET_CHOICES = [
         ('BALANCE', 'Balance'),
