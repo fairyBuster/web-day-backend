@@ -142,7 +142,7 @@ class Deposit(models.Model):
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='PENDING')
 
     transaction = models.ForeignKey(Transaction, on_delete=models.SET_NULL, null=True, blank=True)
-    payment_url = models.CharField(max_length=500, blank=True, default='')
+    payment_url = models.CharField(max_length=2000, blank=True, default='')
 
     request_params = models.JSONField(default=dict, blank=True)
     response_payload = models.JSONField(null=True, blank=True)
