@@ -251,9 +251,18 @@ def _scrape_ppaypros_payment_page(url: str, timeout: int = 30) -> dict:
 
 # Alias for BankPay (same page structure)
 def _scrape_bankpay_payment_page(url: str, timeout: int = 30) -> dict:
+    """Scrape BankPay payment page to get QR image and display amount.
+
+    Flow:
+    1. Fetch outer page → XOR decrypt → get real payment URL
+    2. Follow redirects → may land on MoneyCome JSON API
+    3. If JSON API: extract QR image URL from next.data/next.qrcode, then fetch the image
+    4. If HTML: scrape base64 img + display_amount
+    """
     result = {"qr_image": "", "display_amount": ""}
     if not url:
         return result
+    decrypted_url = ""  # populated by XOR decrypt step
     session = requests.Session()
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -262,20 +271,25 @@ def _scrape_bankpay_payment_page(url: str, timeout: int = 30) -> dict:
     try:
         resp = session.get(url, timeout=timeout, allow_redirects=True)
         resp.raise_for_status()
-        html = resp.text
+        content = resp.text
+        content_type = resp.headers.get("Content-Type", "").lower()
+        final_url = resp.url
     except Exception as e:
         logger.warning("Gagal fetch BankPay page: url=%s error=%s", url, str(e))
         return result
 
-    # BankPay encrypts the real payment URL with XOR + base64
-    enc_match = re.search(r"var\s+encryptedPayUrl\s*=\s*'([^']+)'", html)
-    key_match = re.search(r"var\s+payUrlKey\s*=\s*'([^']+)'", html)
+    logger.warning("BANKPAY scrape step1: final_url=%s content_type=%s len=%s", final_url[:200], content_type, len(content))
+
+    # --- Step 1: XOR decrypt if outer page has encrypted URL ---
+    enc_match = re.search(r"var\s+encryptedPayUrl\s*=\s*'([^']+)'", content)
+    key_match = re.search(r"var\s+payUrlKey\s*=\s*'([^']+)'", content)
     if enc_match and key_match:
         encrypted = enc_match.group(1)
         xor_key = key_match.group(1)
         try:
             raw = base64.b64decode(encrypted)
             decrypted = "".join(chr(raw[i] ^ ord(xor_key[i % len(xor_key)])) for i in range(len(raw)))
+            decrypted_url = decrypted
             logger.warning("BANKPAY scrape: XOR decrypted url=%s", decrypted[:200])
         except Exception as e:
             logger.warning("BANKPAY XOR decrypt failed: %s", str(e))
@@ -284,21 +298,264 @@ def _scrape_bankpay_payment_page(url: str, timeout: int = 30) -> dict:
         try:
             resp2 = session.get(decrypted, timeout=timeout, allow_redirects=True)
             resp2.raise_for_status()
-            html = resp2.text
-            logger.warning("BANKPAY scrape inner: length=%s", len(html))
+            content = resp2.text
+            content_type = resp2.headers.get("Content-Type", "").lower()
+            final_url = resp2.url
+            logger.warning("BANKPAY scrape step2: final_url=%s content_type=%s len=%s", final_url[:200], content_type, len(content))
         except Exception as e:
             logger.warning("Gagal fetch BankPay decrypted page: url=%s error=%s", decrypted[:200], str(e))
             return result
-    else:
-        logger.warning("BANKPAY scrape: enc/key not found in HTML")
 
-    m = re.search(r'<img[^>]*\ssrc="(data:image/[^"]*base64,[^"]+)"', html, re.IGNORECASE)
+    # --- Step 2: Handle MoneyCome JSON API redirect ---
+    if "application/json" in content_type:
+        try:
+            data = json.loads(content)
+            logger.warning("BANKPAY scrape: got JSON, keys=%s", list(data.keys())[:20])
+        except Exception:
+            logger.warning("BANKPAY scrape: JSON parse failed, content=%s", content[:500])
+            return result
+
+        # Extract amount from prepay field
+        prepay = str(data.get("prepay") or "").replace(",", "").strip()
+        if prepay:
+            result["display_amount"] = prepay
+
+        # Extract QR image URL from next block
+        next_block = data.get("next", {}) if isinstance(data.get("next"), dict) else {}
+        qr_url = (
+            next_block.get("qrcode")
+            or next_block.get("data")
+            or next_block.get("img_data")
+            or ""
+        ).strip()
+        if qr_url:
+            logger.warning("BANKPAY scrape: fetching QR image from %s", qr_url[:200])
+            try:
+                resp3 = session.get(qr_url, timeout=timeout, allow_redirects=True)
+                resp3.raise_for_status()
+                img_content = resp3.content
+                img_ct = resp3.headers.get("Content-Type", "").lower()
+                if img_ct.startswith("image/"):
+                    b64 = base64.b64encode(img_content).decode()
+                    result["qr_image"] = f"data:{img_ct};base64,{b64}"
+                    logger.warning("BANKPAY scrape: encoded QR image, b64_len=%s", len(b64))
+                else:
+                    logger.warning("BANKPAY scrape: QR response not image, ct=%s len=%s", img_ct, len(img_content))
+            except Exception as e:
+                logger.warning("BANKPAY scrape: failed to fetch QR image: %s", str(e))
+
+        return result
+
+    # --- Step 3: Handle SPA page (PTMPAY / similar) — find API endpoints from JS bundles ---
+    if "text/html" in content_type and len(content) > 1000:
+        logger.warning("BANKPAY scrape: SPA HTML full (first 5000): %s", content[:5000])
+
+    ptm_order_number = ""
+    ptm_token = ""
+    for try_url in [final_url, decrypted_url]:
+        if not try_url:
+            continue
+        qs = parse_qs(urlparse(str(try_url)).query)
+        for key_param in ("ordernumber", "order_number", "orderNo", "orderId"):
+            candidates = qs.get(key_param, [])
+            if candidates and candidates[0]:
+                ptm_order_number = candidates[0]
+                break
+        if ptm_order_number:
+            break
+        token_candidates = qs.get("token", [])
+        if token_candidates and token_candidates[0]:
+            ptm_token = token_candidates[0]
+
+    # --- Step 3a: Fetch JS bundles from PTMPAY to discover API endpoints ---
+    js_api_endpoints = []
+    js_patterns = re.findall(r'src="(/js/[^"]+\.js)"', content)
+    base_url = "https://new-pay.ptmpays.com"
+    for js_path in js_patterns[:3]:  # Try up to 3 JS files
+        js_url = base_url + js_path
+        try:
+            logger.warning("BANKPAY scrape: fetching JS bundle %s", js_url[:120])
+            resp_js = session.get(js_url, timeout=timeout)
+            if resp_js.status_code == 200:
+                js_content = resp_js.text
+                # Search for API endpoint patterns in JS
+                api_matches = re.findall(r'["\'\`](/api/[^"\'`\s]{3,80})["\'\`]', js_content)
+                for api_path in api_matches:
+                    full_url = base_url + api_path
+                    if full_url not in js_api_endpoints:
+                        js_api_endpoints.append(full_url)
+                logger.warning("BANKPAY scrape: found %d API endpoints in JS %s", len(js_api_endpoints), js_path[:60])
+        except Exception as e:
+            logger.warning("BANKPAY scrape: JS fetch failed %s: %s", js_path, str(e))
+    logger.warning("BANKPAY scrape: all JS API endpoints: %s", js_api_endpoints[:20])
+
+    # --- Step 3b: Try discovered JS API endpoints with ordernumber + token ---
+    if ptm_order_number and js_api_endpoints:
+        for api_url in js_api_endpoints:
+            if "static" in api_url or "chunk" in api_url.lower():
+                continue
+            # Replace or append ordernumber param
+            if "?" in api_url:
+                call_url = api_url
+                if "ordernumber" not in call_url and "orderNumber" not in call_url:
+                    call_url += f"&ordernumber={ptm_order_number}"
+            else:
+                call_url = f"{api_url}?ordernumber={ptm_order_number}"
+            for auth_headers in [
+                {"Authorization": f"Bearer {ptm_token}"} if ptm_token else {},
+                {"x-token": ptm_token} if ptm_token else {},
+                {"x-access-token": ptm_token} if ptm_token else {},
+                {},  # no auth
+            ]:
+                try:
+                    logger.warning("BANKPAY scrape: trying JS API %s with auth=%s", call_url[:180], list(auth_headers.keys()))
+                    resp_api = session.get(call_url, timeout=timeout, allow_redirects=True, headers=auth_headers or None)
+                    api_ct = resp_api.headers.get("Content-Type", "").lower()
+                    if resp_api.status_code == 200:
+                        if "application/json" in api_ct:
+                            api_data = resp_api.json()
+                            logger.warning("BANKPAY scrape: JS API returned JSON keys=%s", list(api_data.keys())[:15])
+
+                            def _extract_qr_from_json(r, d):
+                                """Extract QR URL + amount from JSON response."""
+                                prepay = str(d.get("prepay") or "").replace(",", "").strip()
+                                if prepay:
+                                    r["display_amount"] = prepay
+                                next_block = d.get("next", {}) if isinstance(d.get("next"), dict) else {}
+                                qr_url = (
+                                    next_block.get("qrcode")
+                                    or next_block.get("data")
+                                    or next_block.get("img_data")
+                                    or ""
+                                ).strip()
+                                if qr_url:
+                                    try:
+                                        logger.warning("BANKPAY scrape: fetching QR from JS API %s", qr_url[:200])
+                                        resp_qr = session.get(qr_url, timeout=timeout, allow_redirects=True)
+                                        resp_qr.raise_for_status()
+                                        img_ct = resp_qr.headers.get("Content-Type", "").lower()
+                                        if img_ct.startswith("image/"):
+                                            b64 = base64.b64encode(resp_qr.content).decode()
+                                            r["qr_image"] = f"data:{img_ct};base64,{b64}"
+                                            logger.warning("BANKPAY scrape: QR from JS API OK, b64_len=%s", len(b64))
+                                    except Exception as e:
+                                        logger.warning("BANKPAY scrape: JS API QR fetch failed: %s", str(e))
+                                # Also check danarapay qr fields
+                                for qr_key in ("qr_image", "qrImage", "qr_url", "qrUrl", "qris_image", "qrisImage"):
+                                    danarapay_qr = d.get(qr_key, "")
+                                    if danarapay_qr and isinstance(danarapay_qr, str) and danarapay_qr.startswith("http"):
+                                        try:
+                                            resp_qr = session.get(danarapay_qr, timeout=timeout)
+                                            resp_qr.raise_for_status()
+                                            img_ct2 = resp_qr.headers.get("Content-Type", "").lower()
+                                            if img_ct2.startswith("image/") or len(resp_qr.content) > 100:
+                                                b64 = base64.b64encode(resp_qr.content).decode()
+                                                r["qr_image"] = f"data:image/png;base64,{b64}"
+                                        except Exception:
+                                            pass
+
+                            _extract_qr_from_json(result, api_data)
+                            if result["qr_image"]:
+                                return result
+                            for key in ("data", "result", "info", "checkout", "payment"):
+                                if isinstance(api_data.get(key), dict):
+                                    _extract_qr_from_json(result, api_data[key])
+                                    if result["qr_image"]:
+                                        return result
+                        elif api_ct.startswith("image/"):
+                            b64 = base64.b64encode(resp_api.content).decode()
+                            result["qr_image"] = f"data:{api_ct};base64,{b64}"
+                            logger.warning("BANKPAY scrape: JS API returned image, b64_len=%s", len(b64))
+                            return result
+                    elif resp_api.status_code == 403:
+                        pass  # try next auth
+                    else:
+                        logger.warning("BANKPAY scrape: JS API %s status=%s", call_url[:120], resp_api.status_code)
+                except Exception as e:
+                    logger.warning("BANKPAY scrape: JS API %s failed: %s", call_url[:100], str(e))
+
+    # --- Step 3c: If QR already found via JS API above, return ---
+    if result["qr_image"]:
+        logger.warning("BANKPAY scrape: done via JS API, qr_image=%s display_amount=%s", bool(result["qr_image"]), result["display_amount"])
+        return result
+
+    # Try to find payment_id in HTML (for MoneyCome API)
+    payment_id_match = re.search(r'payment[_-]?id["\'\s:=]+([A-Za-z0-9_-]{8,})', content, re.IGNORECASE)
+    if payment_id_match:
+        payment_id = payment_id_match.group(1)
+        logger.warning("BANKPAY scrape: found payment_id in HTML: %s", payment_id)
+
+        mc_api = f"https://openapi.moneycome.tech/api/checkout/payment/info?payment_id={payment_id}"
+        try:
+            logger.warning("BANKPAY scrape: trying MoneyCome API %s", mc_api)
+            resp_mc = session.get(mc_api, timeout=timeout, allow_redirects=True)
+            mc_ct = resp_mc.headers.get("Content-Type", "").lower()
+            if resp_mc.status_code == 200 and "application/json" in mc_ct:
+                mc_data = resp_mc.json()
+                logger.warning("BANKPAY scrape: MoneyCome API response keys=%s", list(mc_data.keys())[:15])
+                prepay = str(mc_data.get("prepay") or "").replace(",", "").strip()
+                if prepay:
+                    result["display_amount"] = prepay
+                next_block = mc_data.get("next", {}) if isinstance(mc_data.get("next"), dict) else {}
+                qr_url = (
+                    next_block.get("qrcode")
+                    or next_block.get("data")
+                    or next_block.get("img_data")
+                    or ""
+                ).strip()
+                if qr_url:
+                    logger.warning("BANKPAY scrape: fetching QR from MoneyCome %s", qr_url[:200])
+                    try:
+                        resp_qr = session.get(qr_url, timeout=timeout, allow_redirects=True)
+                        resp_qr.raise_for_status()
+                        img_ct = resp_qr.headers.get("Content-Type", "").lower()
+                        if img_ct.startswith("image/"):
+                            b64 = base64.b64encode(resp_qr.content).decode()
+                            result["qr_image"] = f"data:{img_ct};base64,{b64}"
+                            logger.warning("BANKPAY scrape: QR from MoneyCome OK, b64_len=%s", len(b64))
+                            return result
+                    except Exception as e:
+                        logger.warning("BANKPAY scrape: MoneyCome QR fetch failed: %s", str(e))
+                if result["qr_image"] or result["display_amount"]:
+                    return result
+            else:
+                logger.warning("BANKPAY scrape: MoneyCome API not JSON, status=%s ct=%s", resp_mc.status_code, mc_ct)
+        except Exception as e:
+            logger.warning("BANKPAY scrape: MoneyCome API failed: %s", str(e))
+
+    # --- Step 3d: Try PTMPAY API with Bearer token (fallback) ---
+    if ptm_order_number:
+        ptm_api_base = "https://new-pay.ptmpays.com"
+        api_endpoints = [
+            f"{ptm_api_base}/api/qris?ordernumber={ptm_order_number}",
+            f"{ptm_api_base}/api/order/qris?ordernumber={ptm_order_number}",
+            f"{ptm_api_base}/api/order/qr?orderNumber={ptm_order_number}",
+        ]
+        for qr_api_url in api_endpoints:
+            try:
+                logger.warning("BANKPAY scrape: trying PTMPAY API %s", qr_api_url)
+                headers = {}
+                if ptm_token:
+                    headers["Authorization"] = f"Bearer {ptm_token}"
+                resp4 = session.get(qr_api_url, timeout=timeout, allow_redirects=True, headers=headers or None)
+                qr_ct = resp4.headers.get("Content-Type", "").lower()
+                if resp4.status_code == 200 and qr_ct.startswith("image/"):
+                    b64 = base64.b64encode(resp4.content).decode()
+                    result["qr_image"] = f"data:{qr_ct};base64,{b64}"
+                    logger.warning("BANKPAY scrape: got QR from PTMPAY API %s, b64_len=%s", qr_api_url, len(b64))
+                    return result
+                logger.warning("BANKPAY scrape: PTMPAY API %s not image, status=%s ct=%s", qr_api_url, resp4.status_code, qr_ct)
+            except Exception as e:
+                logger.warning("BANKPAY scrape: PTMPAY API %s failed: %s", qr_api_url, str(e))
+
+    # --- Step 4: Scrape HTML page (base64 img + display_amount) ---
+    m = re.search(r'<img[^>]*\ssrc="(data:image/[^"]*base64,[^"]+)"', content, re.IGNORECASE)
     if m:
         result["qr_image"] = m.group(1)
-        logger.warning("BANKPAY scrape: found QR image, length=%s", len(result["qr_image"]))
+        logger.warning("BANKPAY scrape: found QR image in HTML, length=%s", len(result["qr_image"]))
     else:
-        logger.warning("BANKPAY scrape: QR image NOT found in HTML (first 300 chars): %s", html[:300])
-    m2 = re.search(r'<span\s+class="top_a_b"[^>]*>([\d.]+)</span>', html, re.IGNORECASE)
+        logger.warning("BANKPAY scrape: QR image NOT found (first 300 chars): %s", content[:300])
+    m2 = re.search(r'<span\s+class="top_a_b"[^>]*>([\d.]+)</span>', content, re.IGNORECASE)
     if m2:
         result["display_amount"] = m2.group(1).strip()
         logger.warning("BANKPAY scrape: found display_amount=%s", result["display_amount"])
@@ -3814,7 +4071,11 @@ class BankPayDepositInitiateQRView(APIView):
                 dep.payment_url = pay_url
                 dep.save(update_fields=["payment_url"])
 
-            scraped = _scrape_bankpay_payment_page(pay_url) if pay_url else {}
+            scraped = {}
+            if pay_url:
+                logger.warning("BANKPAY-QR: scraping pay_url=%s...", pay_url[:120])
+                scraped = _scrape_bankpay_payment_page(pay_url)
+                logger.warning("BANKPAY-QR: scrape done qr_image=%s display_amount=%s", bool(scraped.get("qr_image")), scraped.get("display_amount"))
 
             return Response(
                 {
