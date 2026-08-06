@@ -29,14 +29,14 @@ class ReviewImageInline(admin.TabularInline):
 
 @admin.register(Review)
 class ReviewAdmin(admin.ModelAdmin):
-    list_display = ["id", "image_preview", "user", "is_approved", "is_hidden", "created_at", "updated_at"]
+    list_display = ["id", "image_preview", "user", "user_phone", "is_approved", "is_hidden", "created_at", "updated_at"]
     list_filter = ["is_approved", "is_hidden", "created_at"]
-    search_fields = ["id", "user__id", "user__username", "user__full_name", "text"]
+    search_fields = ["id", "user__id", "user__username", "user__full_name", "user__phone", "text"]
     inlines = [ReviewImageInline]
     actions = ["approve_reviews"]
-    readonly_fields = ["review_images_preview", "created_at", "updated_at"]
+    readonly_fields = ["review_images_preview", "user_phone", "created_at", "updated_at"]
     fieldsets = (
-        (None, {"fields": ("user", "text", "is_approved", "is_hidden")}),
+        (None, {"fields": ("user", "user_phone", "text", "is_approved", "is_hidden")}),
         ("Preview Gambar", {"fields": ("review_images_preview",)}),
         ("Timestamps", {"fields": ("created_at", "updated_at")}),
     )
@@ -57,6 +57,11 @@ class ReviewAdmin(admin.ModelAdmin):
             return "-"
 
     image_preview.short_description = "Gambar"
+
+    def user_phone(self, obj):
+        return obj.user.phone if obj.user_id else "-"
+
+    user_phone.short_description = "Phone"
 
     def review_images_preview(self, obj):
         if not obj:
