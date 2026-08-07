@@ -140,6 +140,14 @@ class QRISGateway(models.Model):
         # Auto-decode QR from uploaded image if raw_data is empty
         if self.qris_image and not self.qris_raw_data:
             self._decode_qr_from_image()
+        # If image file is missing but raw_data exists, clear the broken image reference
+        if self.qris_image and self.qris_raw_data:
+            import os
+            try:
+                if not os.path.exists(self.qris_image.path):
+                    self.qris_image = None
+            except Exception:
+                pass
         super().save(*args, **kwargs)
 
     def _decode_qr_from_image(self):
@@ -152,14 +160,14 @@ class QRISGateway(models.Model):
             import cv2
             import numpy as np
         except ImportError:
-            logger.warning("QRISGateway: opencv not installed, skip auto-decode")
+            logger.info("QRISGateway: opencv not installed, skip auto-decode")
             return
 
         try:
             # Try filesystem path first
             file_path = self.qris_image.path
             if not os.path.exists(file_path):
-                logger.warning("QRISGateway: file not found at path=%s", file_path)
+                logger.info("QRISGateway: image file not found, skip decode (path=%s)", file_path)
                 return
 
             # Read file bytes and decode via numpy (more reliable than cv2.imread path)

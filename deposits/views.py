@@ -4292,19 +4292,23 @@ class QRISDepositInitiateView(APIView):
         user = request.user
         order_num = f"DQRS{_now_wib().strftime('%y%m%d%H%M%S')}{uuid.uuid4().hex[:6].upper()}"
 
-        from .integrations.qris import overlay_text_on_image, generate_unique_amount_code
+        from .integrations.qris import convert_static_to_dynamic, generate_unique_amount_code
 
         # Generate 3-digit unique code for nominal matching
         unique_code = generate_unique_amount_code()  # 100-399
         qris_amount = int(amount) + unique_code  # nominal yang harus dibayar user
 
-        # Copy QR gambar asli (tanpa overlay), QR tetap bersih
+        # Konversi static QRIS -> dynamic QRIS (tag 01: 11→12 + inject amount + CRC)
+        try:
+            dynamic_qris = convert_static_to_dynamic(qris_gw.qris_raw_data, Decimal(qris_amount))
+        except Exception as e:
+            logger.error("QRIS convert_static_to_dynamic error: %s", e)
+            return Response({"detail": "Gagal mengkonversi QRIS static ke dynamic."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        # Generate QR image dari dynamic QRIS string (tanpa overlay)
+        from .integrations.qris import generate_qr_image_file
         qr_filename = f"{order_num}.png"
-        
-        if qris_gw.qris_image and os.path.exists(qris_gw.qris_image.path):
-            qr_image_url = overlay_text_on_image(qris_gw.qris_image.path, "", "qris/dynamic", qr_filename)
-        else:
-            qr_image_url = qris_gw.qris_image.url if qris_gw.qris_image else ""
+        qr_image_url = generate_qr_image_file(dynamic_qris, "qris/dynamic", qr_filename)
 
         qris_gw.used_count = qris_gw.used_count + 1
         qris_gw.save(update_fields=["used_count"])
@@ -4341,6 +4345,7 @@ class QRISDepositInitiateView(APIView):
                 "unique_code": unique_code,
                 "qris_amount": qris_amount,
                 "requested_amount": int(amount),
+                "dynamic_qris": dynamic_qris,
             },
             payment_url=qr_image_url or "",
         )

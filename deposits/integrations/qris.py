@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 # QRIS Tag IDs
 TAG_PAYLOAD_FORMAT = "00"
-# Merchant Account Info tag range: 02-51 (varies per acquirer)
+TAG_POINT_OF_INITIATION = "01"  # 11=static, 12=dynamic
 TAG_MERCHANT_CATEGORY_CODE = "52"
 TAG_TRANSACTION_CURRENCY = "53"
 TAG_TRANSACTION_AMOUNT = "54"
@@ -101,31 +101,66 @@ def build_qris_string(tags: dict) -> str:
 def convert_static_to_dynamic(
     qris_string: str,
     amount: Decimal,
-    order_num: str,
+    order_num: str = "",
 ) -> str:
     """
-    Convert a static QRIS string to dynamic:
-    - Add/modify tag 54 (transaction amount - the actual amount user must pay)
-    - Add/modify tag 62 (additional data with unique tx reference ID)
-    - Recalculate tag 63 (CRC)
+    Convert static QRIS ke dynamic (sesuai reference qris-dinamis):
+    1. Parse TLV dengan preserve order
+    2. Ganti tag 01: 11 → 12
+    3. Sisipkan tag 54 (amount) sebelum tag 58
+    4. Skip tag 63, recalculate CRC16
     
     Returns the modified QRIS string.
     """
-    tags = parse_qris_tags(qris_string)
+    # Parse TLV preserving original order (as list of (tag, value) tuples)
+    elements = _parse_tlv_preserve_order(qris_string)
+    
+    # Managed tags to skip
+    managed_tags = {"54", "55", "56", "57", "63"}
+    
+    result = []
+    amount_inserted = False
+    
+    for tag, value in elements:
+        if tag in managed_tags:
+            continue
+        if tag == "01":
+            # Static → Dynamic
+            result.append(("01", "12"))
+            continue
+        # Insert amount before tag 58 (Country Code)
+        if tag == "58" and not amount_inserted:
+            amount_str = str(int(amount))
+            result.append((TAG_TRANSACTION_AMOUNT, amount_str))
+            amount_inserted = True
+        result.append((tag, value))
+    
+    # Build string without CRC
+    payload = ""
+    for tag, value in result:
+        payload += f"{tag}{len(value):02d}{value}"
+    
+    # CRC
+    crc = calculate_qris_crc(payload + TAG_CRC + "04")
+    return payload + f"{TAG_CRC}04{crc}"
 
-    # Remove CRC so we can rebuild
-    tags.pop(TAG_CRC, None)
 
-    # Inject transaction amount (tag 54) - the actual amount to pay
-    # Amount must be integer for QRIS
-    amount_str = f"{int(amount)}"
-    tags[TAG_TRANSACTION_AMOUNT] = amount_str
-
-    # Inject additional data (tag 62) with unique reference ID sub-tag 01
-    ref_id = f"01{len(order_num):02d}{order_num}"
-    tags[TAG_ADDITIONAL_DATA] = ref_id
-
-    return build_qris_string(tags)
+def _parse_tlv_preserve_order(data: str):
+    """Parse QRIS TLV, preserve original order. Returns list of (tag, value)."""
+    elements = []
+    i = 0
+    while i + 4 <= len(data):
+        tag = data[i:i+2]
+        try:
+            length = int(data[i+2:i+4])
+        except ValueError:
+            break
+        if i + 4 + length > len(data):
+            break
+        value = data[i+4:i+4+length]
+        elements.append((tag, value))
+        i += 4 + length
+    return elements
 
 
 def generate_qr_image(qris_string: str, box_size: int = 10, border: int = 4) -> Optional[str]:
@@ -231,9 +266,9 @@ def generate_unique_code(length: int = 6) -> str:
 
 
 def generate_unique_amount_code() -> int:
-    """Generate 3-digit unique code (100-399) to add to deposit amount."""
+    """Generate 3-digit unique code (100-300) to add to deposit amount."""
     import secrets
-    return secrets.randbelow(300) + 100  # 100-399, maksimal 400
+    return secrets.randbelow(201) + 100  # 100-300
 
 
 def overlay_text_on_image(source_path: str, text: str, save_dir: str, filename: str) -> str:
@@ -305,5 +340,5 @@ def _generate_qr_fallback(data: str) -> str:
 
 
 def sanitize_qris_string(raw: str) -> str:
-    """Clean up a QRIS string from whitespace/newlines."""
-    return re.sub(r'\s+', '', raw).strip()
+    """Clean up a QRIS string — remove newlines only, preserve spaces in values."""
+    return re.sub(r'[\r\n]+', '', raw).strip()
