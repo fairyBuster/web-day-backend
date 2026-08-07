@@ -27,3 +27,5 @@ urllib3==2.5.0
 whitenoise==6.11.0
 pycryptodome
 Pillow==12.0.0
+qrcode==8.2
+opencv-python-headless

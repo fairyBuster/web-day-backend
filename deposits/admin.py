@@ -1,16 +1,23 @@
 from django.contrib import admin
-from .models import GatewaySettings, Deposit
+from .models import GatewaySettings, Deposit, QRISGateway
+from django.contrib import messages
+from django.db import transaction as db_transaction
+from django.utils import timezone
 
 
 @admin.register(GatewaySettings)
 class GatewaySettingsAdmin(admin.ModelAdmin):
     list_display = (
-        'default_wallet_type', 'app_domain', 'min_deposit_amount', 'max_deposit_amount', 'usd_gateway_min_deposit_amount', 'usd_gateway_max_deposit_amount', 'jayapay_enabled', 'jayapay_ph_enabled', 'klikpay_enabled', 'usd_gateway_enabled', 'ppaypros_enabled', 'clienthub_enabled', 'sitransferhub_enabled', 'atpay_enabled', 'bankpay_enabled', 'updated_at'
+        'default_wallet_type', 'app_domain', 'min_deposit_amount', 'max_deposit_amount', 'usd_gateway_min_deposit_amount', 'usd_gateway_max_deposit_amount', 'jayapay_enabled', 'jayapay_ph_enabled', 'klikpay_enabled', 'usd_gateway_enabled', 'ppaypros_enabled', 'clienthub_enabled', 'sitransferhub_enabled', 'atpay_enabled', 'bankpay_enabled', 'qris_enabled', 'updated_at'
     )
     readonly_fields = ('updated_at',)
+
+    def has_add_permission(self, request):
+        # Singleton: jangan izinkan tambah record baru kalau sudah ada
+        return not GatewaySettings.objects.exists()
     fieldsets = (
         ('Global', {
-            'fields': ('default_wallet_type', 'app_domain', 'min_deposit_amount', 'max_deposit_amount', 'jayapay_enabled', 'jayapay_ph_enabled', 'klikpay_enabled', 'usd_gateway_enabled', 'ppaypros_enabled', 'clienthub_enabled', 'sitransferhub_enabled', 'atpay_enabled', 'bankpay_enabled')
+            'fields': ('default_wallet_type', 'app_domain', 'min_deposit_amount', 'max_deposit_amount', 'jayapay_enabled', 'jayapay_ph_enabled', 'klikpay_enabled', 'usd_gateway_enabled', 'ppaypros_enabled', 'clienthub_enabled', 'sitransferhub_enabled', 'atpay_enabled', 'bankpay_enabled', 'qris_enabled')
         }),
         ('Jayapay', {
             'fields': (
@@ -112,17 +119,121 @@ class GatewaySettingsAdmin(admin.ModelAdmin):
             ),
             'description': 'Konfigurasi BankPay untuk deposit IDR. Sign MD5, callback return OK plain text.',
         }),
+        ('QRIS Manual', {
+            'fields': (
+                'qris_min_deposit_amount',
+                'qris_max_deposit_amount',
+                'qris_expired_minutes',
+            ),
+            'description': 'QRIS Manual: upload QR static di menu QRIS Gateway, sistem akan konversi ke dynamic saat deposit.',
+        }),
+    )
+
+
+@admin.register(QRISGateway)
+class QRISGatewayAdmin(admin.ModelAdmin):
+    list_display = ('label', 'is_active', 'used_count', 'max_use_count', 'created_at')
+    list_filter = ('is_active',)
+    search_fields = ('label', 'qris_raw_data')
+    readonly_fields = ('used_count', 'created_at', 'updated_at')
+    fieldsets = (
+        (None, {
+            'fields': ('label', 'is_active', 'max_use_count', 'used_count')
+        }),
+        ('QRIS Data', {
+            'fields': ('qris_image', 'qris_raw_data'),
+            'description': 'Upload gambar QR dan/atau paste raw QRIS string hasil scan (dimulai dengan 000201...). '
+                           'QRIS static akan otomatis dikonversi jadi dynamic dengan nominal deposit saat user request.'
+        }),
     )
 
 
 @admin.register(Deposit)
 class DepositAdmin(admin.ModelAdmin):
-    list_display = ('order_num', 'user', 'gateway', 'amount', 'amount_currency_code', 'credited_amount', 'credited_currency_code', 'wallet_type', 'status', 'created_at')
+    list_display = ('order_num', 'user', 'gateway', 'amount_display', 'unique_code', 'amount_currency_code', 'credited_amount', 'credited_currency_code', 'wallet_type', 'status', 'expired_status', 'created_at')
     list_filter = ('gateway', 'status', 'wallet_type')
     search_fields = ('order_num', 'user__phone', 'user__username')
-    readonly_fields = ('created_at', 'updated_at', 'payment_url', 'request_params', 'response_payload', 'callback_payload', 'callback_at')
+    readonly_fields = ('created_at', 'updated_at', 'payment_url', 'request_params', 'response_payload', 'callback_payload', 'callback_at', 'expired_at')
     autocomplete_fields = ('user', 'transaction')
     list_select_related = ('user', 'transaction')
+    actions = ['accept_qris_deposit', 'reject_qris_deposit']
 
     def get_queryset(self, request):
         return super().get_queryset(request).select_related('user', 'transaction')
+
+    @admin.display(description='Jumlah', ordering='amount')
+    def amount_display(self, obj):
+        val = obj.display_amount
+        if obj.gateway == 'QRIS' and obj.unique_code:
+            return f'Rp {val:,.0f} (kode: {obj.unique_code})'
+        return f'Rp {val:,.0f}'
+
+    @admin.display(description='Kode Unik', ordering='request_params')
+    def unique_code(self, obj):
+        return obj.unique_code or '-'
+
+    @admin.display(description='Expired', ordering='expired_at')
+    def expired_status(self, obj):
+        if obj.expired_at:
+            if obj.is_expired:
+                return 'EXPIRED'
+            return obj.expired_at.strftime('%H:%M')
+        return '-'
+
+    @admin.action(description='Terima deposit QRIS (credit saldo user)')
+    def accept_qris_deposit(self, request, queryset):
+        from deposits.views import _ppaypros_complete_deposit
+        accepted = 0
+        skipped_expired = 0
+        for dep in queryset.filter(gateway='QRIS', status='PENDING'):
+            if dep.is_expired:
+                skipped_expired += 1
+                continue
+            trx = dep.transaction
+            if not trx:
+                continue
+            with db_transaction.atomic():
+                trx = type(trx).objects.select_for_update().get(pk=trx.pk)
+                if trx.status == 'COMPLETED':
+                    continue
+                _ppaypros_complete_deposit(trx, dep)
+                dep.callback_payload = {
+                    "accepted_by": request.user.username,
+                    "accepted_at": timezone.now().isoformat(),
+                    "method": "admin_bulk_accept",
+                }
+                dep.callback_at = timezone.now()
+                dep.save(update_fields=['callback_payload', 'callback_at'])
+                accepted += 1
+        if accepted:
+            msg = f'{accepted} deposit QRIS berhasil diterima, saldo user sudah di-credit.'
+            if skipped_expired:
+                msg += f' {skipped_expired} deposit expired dilewati.'
+            self.message_user(request, msg, messages.SUCCESS)
+        else:
+            msg = 'Tidak ada deposit QRIS pending yang bisa diterima.'
+            if skipped_expired:
+                msg += f' ({skipped_expired} expired).'
+            self.message_user(request, msg, messages.WARNING)
+
+    @admin.action(description='Tolak deposit QRIS')
+    def reject_qris_deposit(self, request, queryset):
+        from deposits.views import _ppaypros_mark_deposit_failed
+        rejected = 0
+        for dep in queryset.filter(gateway='QRIS', status='PENDING'):
+            trx = dep.transaction
+            if not trx:
+                continue
+            _ppaypros_mark_deposit_failed(trx, dep, reason='Ditolak admin')
+            dep.callback_payload = {
+                "rejected_by": request.user.username,
+                "rejected_at": timezone.now().isoformat(),
+                "reason": "Ditolak admin",
+            }
+            dep.callback_at = timezone.now()
+            dep.save(update_fields=['callback_payload', 'callback_at'])
+            rejected += 1
+        if rejected:
+            self.message_user(request, f'{rejected} deposit QRIS ditolak.', messages.SUCCESS)
+        else:
+            self.message_user(request, 'Tidak ada deposit QRIS pending yang bisa ditolak.', messages.WARNING)

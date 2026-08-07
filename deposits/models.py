@@ -1,6 +1,8 @@
 from django.db import models
 from django.conf import settings
+from django.utils import timezone
 from products.models import Transaction
+from .integrations.qris import sanitize_qris_string
 
 
 class GatewaySettings(models.Model):
@@ -22,6 +24,7 @@ class GatewaySettings(models.Model):
     sitransferhub_enabled = models.BooleanField(default=False)
     atpay_enabled = models.BooleanField(default=False)
     bankpay_enabled = models.BooleanField(default=False)
+    qris_enabled = models.BooleanField(default=False)
 
     # Jayapay config
     jayapay_merchant_code = models.CharField(max_length=100, blank=True, default='')
@@ -97,6 +100,11 @@ class GatewaySettings(models.Model):
     bankpay_key = models.CharField(max_length=255, blank=True, default='', help_text='MERCHANT_KEY untuk signature MD5')
     bankpay_return_url = models.CharField(max_length=512, blank=True, default='', help_text='URL redirect setelah pembayaran selesai')
 
+    # QRIS Gateway config (manual upload, static-to-dynamic)
+    qris_min_deposit_amount = models.DecimalField(max_digits=15, decimal_places=2, default=10000, help_text='Minimal nominal deposit QRIS')
+    qris_max_deposit_amount = models.DecimalField(max_digits=15, decimal_places=2, default=5000000, help_text='Maksimal nominal deposit QRIS (0 = tidak dibatasi)')
+    qris_expired_minutes = models.PositiveIntegerField(default=30, help_text='QR kadaluarsa setelah berapa menit (0 = tidak kadaluarsa)')
+
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
@@ -105,6 +113,96 @@ class GatewaySettings(models.Model):
     class Meta:
         verbose_name = 'Gateway Settings'
         verbose_name_plural = 'Gateway Settings'
+
+
+class QRISGateway(models.Model):
+    """Menyimpan QRIS static yang di-upload manual oleh admin.
+    QRIS static akan dikonversi ke dynamic saat user melakukan deposit."""
+
+    label = models.CharField(max_length=100, help_text='Label/nama QRIS (contoh: QRIS BCA, ShopeePay)')
+    qris_image = models.ImageField(upload_to='qris/images/', blank=True, null=True, help_text='Upload gambar QRIS static')
+    qris_raw_data = models.TextField(blank=True, default='', help_text='Raw QRIS string hasil scan (0002010102...)')
+    is_active = models.BooleanField(default=True, help_text='Aktifkan QR ini untuk digunakan')
+    max_use_count = models.PositiveIntegerField(default=0, help_text='Maksimal berapa kali QR ini bisa dipakai (0 = unlimited)')
+    used_count = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"QRIS: {self.label} ({'active' if self.is_active else 'inactive'})"
+
+    def clean(self):
+        if self.qris_raw_data:
+            self.qris_raw_data = sanitize_qris_string(self.qris_raw_data)
+
+    def save(self, *args, **kwargs):
+        self.clean()
+        # Auto-decode QR from uploaded image if raw_data is empty
+        if self.qris_image and not self.qris_raw_data:
+            self._decode_qr_from_image()
+        super().save(*args, **kwargs)
+
+    def _decode_qr_from_image(self):
+        """Try to decode QR code from uploaded image using OpenCV."""
+        import logging
+        logger = logging.getLogger(__name__)
+        import os
+
+        try:
+            import cv2
+            import numpy as np
+        except ImportError:
+            logger.warning("QRISGateway: opencv not installed, skip auto-decode")
+            return
+
+        try:
+            # Try filesystem path first
+            file_path = self.qris_image.path
+            if not os.path.exists(file_path):
+                logger.warning("QRISGateway: file not found at path=%s", file_path)
+                return
+
+            # Read file bytes and decode via numpy (more reliable than cv2.imread path)
+            with open(file_path, 'rb') as f:
+                file_bytes = np.frombuffer(f.read(), np.uint8)
+            img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+            if img is None:
+                logger.warning("QRISGateway: cannot decode image for label=%s, path=%s", self.label, file_path)
+                return
+
+            detector = cv2.QRCodeDetector()
+            data, bbox, _ = detector.detectAndDecode(img)
+            if data:
+                self.qris_raw_data = sanitize_qris_string(data)
+                logger.info("QRISGateway: auto-decoded QR from image for label=%s", self.label)
+            else:
+                logger.warning("QRISGateway: no QR found in image for label=%s", self.label)
+        except Exception as e:
+            logger.warning("QRISGateway: failed to decode QR from image: %s", e)
+
+    @classmethod
+    def get_random_active(cls):
+        """Ambil satu QRIS aktif secara random."""
+        qs = list(cls.objects.filter(is_active=True))
+        if not qs:
+            return None
+        import random
+        return random.choice(qs)
+
+    @property
+    def is_available(self):
+        """Cek apakah QR ini masih bisa digunakan."""
+        if not self.is_active:
+            return False
+        if self.max_use_count > 0 and self.used_count >= self.max_use_count:
+            return False
+        return True
+
+    class Meta:
+        verbose_name = 'QRIS Gateway'
+        verbose_name_plural = 'QRIS Gateway'
+        ordering = ['-created_at']
+        db_table = 'deposits_qris_gateway'
 
 
 class Deposit(models.Model):
@@ -125,6 +223,7 @@ class Deposit(models.Model):
         ('SITRANSFERHUB', 'SiTransfer Hub'),
         ('ATPAY', 'ATPAY'),
         ('BANKPAY', 'BankPay'),
+        ('QRIS', 'QRIS Manual'),
     ]
     WALLET_CHOICES = [
         ('BALANCE', 'Balance'),
@@ -148,12 +247,36 @@ class Deposit(models.Model):
     response_payload = models.JSONField(null=True, blank=True)
     callback_payload = models.JSONField(null=True, blank=True)
     callback_at = models.DateTimeField(null=True, blank=True)
+    expired_at = models.DateTimeField(null=True, blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
         return f"{self.order_num} - {self.gateway} - {self.user_id}"
+
+    @property
+    def display_amount(self):
+        """Tampilkan amount dengan kode unik untuk QRIS."""
+        if self.gateway == 'QRIS' and self.request_params:
+            qris_amount = self.request_params.get('qris_amount')
+            if qris_amount:
+                return qris_amount
+        return self.amount
+
+    @property
+    def unique_code(self):
+        """Kode unik untuk deposit QRIS."""
+        if self.gateway == 'QRIS' and self.request_params:
+            return self.request_params.get('unique_code')
+        return None
+
+    @property
+    def is_expired(self):
+        """Cek apakah deposit sudah expired."""
+        if self.expired_at and timezone.now() > self.expired_at:
+            return True
+        return False
 
     class Meta:
         db_table = 'deposits'

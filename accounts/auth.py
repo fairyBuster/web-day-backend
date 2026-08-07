@@ -58,6 +58,20 @@ class BannedAwareSessionAuthentication(SessionAuthentication):
         enforce_user_access(user)
         return user, auth
 
+    def enforce_csrf(self, request):
+        """
+        Skip CSRF enforcement for DRF views marked with csrf_exempt.
+        DRF's default enforce_csrf passes callback=None to Django's
+        CsrfViewMiddleware.process_view(), which causes getattr(None, 'csrf_exempt', False)
+        to always return False -- ignoring the decorator entirely.
+        """
+        view = getattr(request, 'resolver_match', None)
+        if view is not None:
+            view_func = getattr(view, 'func', None)
+            if view_func is not None and getattr(view_func, 'csrf_exempt', False):
+                return
+        super().enforce_csrf(request)
+
 
 class PhoneOrUsernameBackend(ModelBackend):
     """

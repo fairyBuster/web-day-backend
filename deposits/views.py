@@ -1,6 +1,9 @@
 from django.conf import settings
 from django.utils import timezone
+from django.utils.decorators import method_decorator
+from django.views.decorators.csrf import csrf_exempt
 from django.db import transaction as db_transaction
+import os
 from django.shortcuts import redirect
 from rest_framework.views import APIView
 from rest_framework.pagination import PageNumberPagination
@@ -23,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 
 from products.models import Transaction
 from products.serializers import TransactionSerializer
-from .models import GatewaySettings, Deposit
+from .models import GatewaySettings, Deposit, QRISGateway
 from .integrations.ppaypros import (
     amount_to_points as ppaypros_amount_to_points,
     extract_payment_data as ppaypros_extract_payment_data,
@@ -4231,3 +4234,235 @@ def _bankpay_apply_payin_success(trx: Transaction, dep: Deposit | None, payload:
         _grant_deposit_cashback(trx.user, trx, credited_amount=credited_amount, currency_code=currency_code)
     except Exception:
         pass
+
+# ============================================================
+# QRIS Gateway Views (manual upload, static-to-dynamic)
+# ============================================================
+
+@method_decorator(csrf_exempt, name='dispatch')
+class QRISDepositInitiateView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_scope = "deposit_initiate"
+
+    @extend_schema(
+        summary="Inisiasi deposit via QRIS Manual (Static-to-Dynamic QR)",
+        request={
+            "application/json": {
+                "type": "object",
+                "properties": {
+                    "amount": {"type": "number", "example": 50000},
+                    "wallet_type": {"type": "string", "enum": ["BALANCE", "BALANCE_DEPOSIT"], "example": "BALANCE"},
+                },
+                "required": ["amount"],
+            }
+        },
+    )
+    def post(self, request):
+        gs = GatewaySettings.objects.order_by("-updated_at").first()
+        enabled = bool(gs and gs.qris_enabled)
+        min_qris = (gs.qris_min_deposit_amount or Decimal("0")) if gs else Decimal("0")
+        max_qris = (gs.qris_max_deposit_amount or Decimal("0")) if gs else Decimal("0")
+
+        if not enabled:
+            return Response({"detail": "QRIS Manual tidak aktif"}, status=status.HTTP_400_BAD_REQUEST)
+
+        qris_gw = QRISGateway.get_random_active()
+        if not qris_gw:
+            return Response({"detail": "Tidak ada QRIS aktif. Silakan hubungi admin."}, status=status.HTTP_400_BAD_REQUEST)
+        if not qris_gw.qris_raw_data:
+            return Response({"detail": "QRIS raw data kosong. Silakan hubungi admin."}, status=status.HTTP_400_BAD_REQUEST)
+
+        wallet_type = (request.data.get("wallet_type") or gs.default_wallet_type or "BALANCE").strip().upper()
+        if wallet_type not in ("BALANCE", "BALANCE_DEPOSIT"):
+            return Response({"detail": "wallet_type tidak valid"}, status=status.HTTP_400_BAD_REQUEST)
+
+        amount_raw = request.data.get("amount")
+        try:
+            amount = Decimal(str(amount_raw)).quantize(Decimal("0.01"))
+            if amount <= 0:
+                raise InvalidOperation()
+        except Exception:
+            return Response({"detail": "amount tidak valid"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if min_qris > 0 and amount < min_qris:
+            return Response({"detail": f"Minimal deposit QRIS adalah {min_qris}"}, status=status.HTTP_400_BAD_REQUEST)
+        if max_qris > 0 and amount > max_qris:
+            return Response({"detail": f"Maksimal deposit QRIS adalah {max_qris}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = request.user
+        order_num = f"DQRS{_now_wib().strftime('%y%m%d%H%M%S')}{uuid.uuid4().hex[:6].upper()}"
+
+        from .integrations.qris import overlay_text_on_image, generate_unique_amount_code
+
+        # Generate 3-digit unique code for nominal matching
+        unique_code = generate_unique_amount_code()  # 100-399
+        qris_amount = int(amount) + unique_code  # nominal yang harus dibayar user
+
+        # Copy QR gambar asli (tanpa overlay), QR tetap bersih
+        qr_filename = f"{order_num}.png"
+        
+        if qris_gw.qris_image and os.path.exists(qris_gw.qris_image.path):
+            qr_image_url = overlay_text_on_image(qris_gw.qris_image.path, "", "qris/dynamic", qr_filename)
+        else:
+            qr_image_url = qris_gw.qris_image.url if qris_gw.qris_image else ""
+
+        qris_gw.used_count = qris_gw.used_count + 1
+        qris_gw.save(update_fields=["used_count"])
+
+        trx = Transaction.objects.create(
+            user=user,
+            product=None,
+            type="DEPOSIT",
+            amount=amount,
+            currency_code="IDR",
+            description=f"Deposit via QRIS ({wallet_type})",
+            status="PENDING",
+            wallet_type=wallet_type,
+            trx_id=order_num,
+        )
+
+        # Hitung expired time
+        expired_minutes = gs.qris_expired_minutes if gs else 30
+        expired_at = _now_wib() + timedelta(minutes=expired_minutes) if expired_minutes > 0 else None
+
+        dep = Deposit.objects.create(
+            user=user,
+            gateway="QRIS",
+            order_num=order_num,
+            amount=amount,
+            amount_currency_code="IDR",
+            wallet_type=wallet_type,
+            status="PENDING",
+            transaction=trx,
+            expired_at=expired_at,
+            request_params={
+                "qris_label": qris_gw.label,
+                "qris_gateway_id": qris_gw.pk,
+                "unique_code": unique_code,
+                "qris_amount": qris_amount,
+                "requested_amount": int(amount),
+            },
+            payment_url=qr_image_url or "",
+        )
+
+        logger.warning(
+            "QRIS initiate: order=%s amount=%s label=%s gw_id=%s",
+            order_num, amount, qris_gw.label, qris_gw.pk,
+        )
+
+        return Response(
+            {
+                "order_num": order_num,
+                "unique_code": unique_code,
+                "amount": f"{amount:.2f}",
+                "qris_amount": qris_amount,
+                "qris_label": qris_gw.label,
+                "qr_image": qr_image_url,
+                "expired_at": expired_at.isoformat() if expired_at else None,
+                "expired_minutes": expired_minutes,
+                "message": f"Silakan transfer tepat Rp {qris_amount:,} (kode unik: {unique_code})",
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+@method_decorator(csrf_exempt, name='dispatch')
+class QRISDepositAcceptView(APIView):
+    permission_classes = [permissions.IsAdminUser]
+
+    @extend_schema(
+        summary="Accept deposit QRIS secara manual (admin callback)",
+        request={
+            "application/json": {
+                "type": "object",
+                "properties": {
+                    "order_num": {"type": "string", "example": "DQRS260807120000A1B2C3"},
+                },
+                "required": ["order_num"],
+            }
+        },
+    )
+    def post(self, request):
+        order_num = (request.data.get("order_num") or "").strip()
+        if not order_num:
+            return Response({"detail": "order_num wajib diisi"}, status=status.HTTP_400_BAD_REQUEST)
+
+        trx = Transaction.objects.filter(trx_id=order_num, type="DEPOSIT").first()
+        dep = Deposit.objects.filter(order_num=order_num, gateway="QRIS").first()
+
+        if not trx or not dep:
+            return Response({"detail": "Deposit tidak ditemukan"}, status=status.HTTP_404_NOT_FOUND)
+        if dep.status == "COMPLETED":
+            return Response({"detail": "Deposit sudah selesai", "status": "COMPLETED"}, status=status.HTTP_200_OK)
+        if dep.status == "FAILED":
+            return Response({"detail": "Deposit sudah gagal, tidak bisa di-accept"}, status=status.HTTP_400_BAD_REQUEST)
+        if dep.is_expired:
+            return Response({"detail": "Deposit sudah expired, tidak bisa di-accept"}, status=status.HTTP_400_BAD_REQUEST)
+
+        _ppaypros_complete_deposit(trx, dep)
+
+        dep.callback_payload = {
+            "accepted_by": request.user.username,
+            "accepted_at": timezone.now().isoformat(),
+            "method": "manual_accept",
+        }
+        dep.callback_at = timezone.now()
+        dep.save(update_fields=["callback_payload", "callback_at"])
+
+        logger.warning("QRIS manual accept: order=%s by=%s", order_num, request.user.username)
+
+        return Response(
+            {
+                "order_num": order_num,
+                "status": "COMPLETED",
+                "credited_amount": f"{dep.credited_amount:.2f}" if dep.credited_amount else f"{trx.amount:.2f}",
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+@method_decorator(csrf_exempt, name='dispatch')
+class QRISDepositRejectView(APIView):
+    permission_classes = [permissions.IsAdminUser]
+
+    @extend_schema(
+        summary="Tolak deposit QRIS secara manual",
+        request={
+            "application/json": {
+                "type": "object",
+                "properties": {
+                    "order_num": {"type": "string", "example": "DQRS260807120000A1B2C3"},
+                    "reason": {"type": "string", "example": "Pembayaran tidak sesuai"},
+                },
+                "required": ["order_num"],
+            }
+        },
+    )
+    def post(self, request):
+        order_num = (request.data.get("order_num") or "").strip()
+        reason = (request.data.get("reason") or "Ditolak admin").strip()
+
+        if not order_num:
+            return Response({"detail": "order_num wajib diisi"}, status=status.HTTP_400_BAD_REQUEST)
+
+        trx = Transaction.objects.filter(trx_id=order_num, type="DEPOSIT").first()
+        dep = Deposit.objects.filter(order_num=order_num, gateway="QRIS").first()
+
+        if not trx or not dep:
+            return Response({"detail": "Deposit tidak ditemukan"}, status=status.HTTP_404_NOT_FOUND)
+
+        _ppaypros_mark_deposit_failed(trx, dep, reason=reason)
+
+        dep.callback_payload = {
+            "rejected_by": request.user.username,
+            "rejected_at": timezone.now().isoformat(),
+            "reason": reason,
+        }
+        dep.callback_at = timezone.now()
+        dep.save(update_fields=["callback_payload", "callback_at"])
+
+        return Response(
+            {"order_num": order_num, "status": "FAILED", "reason": reason},
+            status=status.HTTP_200_OK,
+        )
+
