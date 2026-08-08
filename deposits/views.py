@@ -4264,7 +4264,7 @@ class QRISDepositInitiateView(APIView):
         max_qris = (gs.qris_max_deposit_amount or Decimal("0")) if gs else Decimal("0")
 
         if not enabled:
-            return Response({"detail": "QRIS Manual tidak aktif"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": "Layanan sedang tidak tersedia"}, status=status.HTTP_400_BAD_REQUEST)
 
         qris_gw = QRISGateway.get_random_active()
         if not qris_gw:
