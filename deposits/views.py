@@ -98,6 +98,12 @@ def _strip_backticks(value: str) -> str:
     return (value or "").replace("`", "").strip()
 
 
+def _looks_like_html(text: str) -> bool:
+    """Deteksi apakah string merupakan HTML error page dari provider."""
+    t = text.strip().lower()
+    return t.startswith("<!doctype") or t.startswith("<html") or "<html" in t
+
+
 def _redact_provider_payload_for_log(value):
     if isinstance(value, dict):
         out = {}
@@ -3946,14 +3952,18 @@ class BankPayDepositInitiateView(APIView):
             )
 
         _ppaypros_mark_deposit_failed(trx, dep)
+
+        raw_msg = str(response_payload.get("msg") or "").strip()
+        detail_msg = "Layanan sedang tidak tersedia" if _looks_like_html(raw_msg) else (raw_msg or "BankPay payin gagal")
+
         logger.warning(
             "BANKPAY payin rejected locally: order=%s detail=%s provider=%s",
             order_num,
-            response_payload.get("msg") or "BankPay payin gagal",
+            detail_msg,
             json.dumps(_redact_provider_payload_for_log(response_payload), ensure_ascii=False),
         )
         return Response(
-            {"detail": response_payload.get("msg") or "BankPay payin gagal", "provider": response_payload},
+            {"detail": detail_msg, "provider": response_payload},
             status=status.HTTP_400_BAD_REQUEST,
         )
 
@@ -4094,8 +4104,12 @@ class BankPayDepositInitiateQRView(APIView):
             )
 
         _ppaypros_mark_deposit_failed(trx, dep)
+
+        raw_msg = str(response_payload.get("msg") or "").strip()
+        detail_msg = "Layanan sedang tidak tersedia" if _looks_like_html(raw_msg) else (raw_msg or "BankPay payin gagal")
+
         return Response(
-            {"detail": response_payload.get("msg") or "BankPay payin gagal", "provider": response_payload},
+            {"detail": detail_msg, "provider": response_payload},
             status=status.HTTP_400_BAD_REQUEST,
         )
 
