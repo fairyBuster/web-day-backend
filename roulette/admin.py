@@ -1,4 +1,6 @@
 from django.contrib import admin
+from django import forms
+from django.contrib.admin.widgets import AutocompleteSelect
 from .models import RouletteSettings, RoulettePrize, RouletteTicketWallet, RouletteTicketLedger, RouletteSpin
 
 
@@ -69,12 +71,41 @@ class RoulettePrizeAdmin(admin.ModelAdmin):
     )
 
 
+class UserPhoneAutocompleteSelect(AutocompleteSelect):
+    """AutocompleteSelect yang menampilkan nomor phone user (bukan email)."""
+
+    def get_label(self, value):
+        from accounts.models import User
+        user = User.objects.filter(pk=value).first()
+        if user:
+            return f"{user.phone} | {user.username or user.email}"
+        return super().get_label(value)
+
+
+class RouletteTicketWalletAdminForm(forms.ModelForm):
+    class Meta:
+        model = RouletteTicketWallet
+        fields = "__all__"
+        widgets = {
+            "user": UserPhoneAutocompleteSelect(
+                RouletteTicketWallet._meta.get_field("user"),
+                admin.site,
+            ),
+        }
+
+
 @admin.register(RouletteTicketWallet)
 class RouletteTicketWalletAdmin(admin.ModelAdmin):
-    list_display = ("id", "user", "balance", "updated_at")
-    search_fields = ("user__phone", "user__email")
+    list_display = ("id", "user_display", "balance", "updated_at")
+    search_fields = ("user__phone", "user__username", "user__email")
     readonly_fields = ("updated_at",)
     autocomplete_fields = ("user",)
+    form = RouletteTicketWalletAdminForm
+    list_select_related = ("user",)
+
+    @admin.display(description="User", ordering="user__phone")
+    def user_display(self, obj):
+        return f"{obj.user.phone} | {obj.user.username or obj.user.email}"
 
     def save_model(self, request, obj, form, change):
         prev_balance = None
