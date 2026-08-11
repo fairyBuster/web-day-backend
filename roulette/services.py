@@ -165,7 +165,13 @@ def spin(user):
             current = getattr(user_locked, balance_field)
             setattr(user_locked, balance_field, current + prize_amount)
             user_locked.save(update_fields=[balance_field])
+        else:
+            # Hadiah fisik (prize_type NONE, misal emas): tidak credit saldo,
+            # tapi tetap dicatat sebagai transaction BONUS untuk bukti kemenangan.
+            wallet_type = "BALANCE"
 
+        # Selalu catat transaction jika ada prize (termasuk hadiah fisik / zonk berhadiah)
+        if prize:
             trx_id = f"RLT-{timezone.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
             trx = Transaction.objects.create(
                 user=user_locked,
