@@ -86,12 +86,6 @@ class RouletteTicketWalletAdminForm(forms.ModelForm):
     class Meta:
         model = RouletteTicketWallet
         fields = "__all__"
-        widgets = {
-            "user": UserPhoneAutocompleteSelect(
-                RouletteTicketWallet._meta.get_field("user"),
-                admin.site,
-            ),
-        }
 
 
 @admin.register(RouletteTicketWallet)
@@ -102,6 +96,14 @@ class RouletteTicketWalletAdmin(admin.ModelAdmin):
     autocomplete_fields = ("user",)
     form = RouletteTicketWalletAdminForm
     list_select_related = ("user",)
+
+    def get_form(self, request, obj=None, change=False, **kwargs):
+        form = super().get_form(request, obj, change, **kwargs)
+        form.base_fields["user"].widget = UserPhoneAutocompleteSelect(
+            RouletteTicketWallet._meta.get_field("user"),
+            self.admin_site,
+        )
+        return form
 
     @admin.display(description="User", ordering="user__phone")
     def user_display(self, obj):

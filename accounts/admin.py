@@ -1,6 +1,7 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 from django.contrib.auth.forms import UserChangeForm
+from django.contrib.admin.views.autocomplete import AutocompleteJsonView
 from django.utils.html import format_html
 from django.urls import path, reverse
 from django.shortcuts import redirect
@@ -49,6 +50,13 @@ class PhoneOTPAdmin(admin.ModelAdmin):
             return "VERIFYNOW"
         return "VERIFYWAY"
     source_display.short_description = 'Provider'
+
+
+class UserAutocompleteJsonView(AutocompleteJsonView):
+    """Hasil dropdown autocomplete user menampilkan nomor phone, bukan email."""
+
+    def get_label(self, obj):
+        return f"{obj.phone} | {obj.username or obj.email}"
 
 
 @admin.register(User)
@@ -116,6 +124,9 @@ class UserAdmin(BaseUserAdmin):
                  name='accounts_user_decode_response'),
         ]
         return custom_urls + urls
+
+    def autocomplete_view(self, request):
+        return UserAutocompleteJsonView.as_view(model_admin=self)(request)
     
     def balance_display(self, obj):
         url = reverse('admin:accounts_user_modify_balance', args=[obj.id, 'balance'])
