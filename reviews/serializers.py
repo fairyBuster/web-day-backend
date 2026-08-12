@@ -1,4 +1,5 @@
 import os
+import re
 
 from PIL import Image
 
@@ -6,6 +7,23 @@ from django.db import transaction
 from rest_framework import serializers
 
 from .models import Review, ReviewImage, ReviewLike
+
+# Pola payload XSS umum
+_SCRIPT_TAG_RE = re.compile(r"<\s*/?\s*script\b[^>]*>", re.IGNORECASE)
+_EVENT_HANDLER_RE = re.compile(r"\son[a-z]+\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]+)", re.IGNORECASE)
+_JAVASCRIPT_PROTOCOL_RE = re.compile(r"\bjavascript\s*:", re.IGNORECASE)
+_HTML_TAG_RE = re.compile(r"<[^>]*>")
+
+
+def sanitize_review_text(value: str) -> str:
+    """Hilangkan payload XSS dari teks ulasan (tag script, event handler, javascript: URL, tag HTML)."""
+    if not value:
+        return value
+    value = _SCRIPT_TAG_RE.sub("", value)
+    value = _EVENT_HANDLER_RE.sub("", value)
+    value = _JAVASCRIPT_PROTOCOL_RE.sub("", value)
+    value = _HTML_TAG_RE.sub("", value)
+    return value
 
 
 class MultiImageField(serializers.ListField):
@@ -71,6 +89,10 @@ class ReviewCreateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("Teks ulasan minimal 3 karakter.")
         if len(value) > 2000:
             raise serializers.ValidationError("Teks ulasan maksimal 2000 karakter.")
+        # Sanitasi XSS sebelum disimpan
+        value = sanitize_review_text(value).strip()
+        if len(value) < 3:
+            raise serializers.ValidationError("Teks ulasan minimal 3 karakter setelah filter.")
         return value
 
     def validate_images(self, images):

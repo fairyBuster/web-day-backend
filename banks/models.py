@@ -105,6 +105,13 @@ class UserBank(models.Model):
         return f"{self.user.phone} - {self.bank.name} {self.account_number}"
 
     def save(self, *args, **kwargs):
+        from accounts.models import sanitize_user_text
+
+        # Sanitasi XSS untuk field teks yang diisi user
+        self.account_name = sanitize_user_text(self.account_name or "")
+        self.account_number = sanitize_user_text(self.account_number or "")
+        self.phone = sanitize_user_text(self.phone or "")
+
         # Jika ini adalah bank pertama user, set sebagai default
         if not UserBank.objects.filter(user=self.user).exists():
             self.is_default = True

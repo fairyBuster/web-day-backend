@@ -66,6 +66,11 @@ class SupportChatMessage(models.Model):
     message = models.TextField()
     created_at = models.DateTimeField(auto_now_add=True)
 
+    def save(self, *args, **kwargs):
+        from accounts.models import sanitize_user_text
+        self.message = sanitize_user_text(self.message or "")
+        super().save(*args, **kwargs)
+
     class Meta:
         ordering = ['created_at']
 

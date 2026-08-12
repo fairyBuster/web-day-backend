@@ -2,8 +2,27 @@ from django.contrib.auth.models import AbstractUser
 from django.db import models
 from django.utils import timezone
 import random
+import re
 import string
 from django.contrib.auth.hashers import make_password, check_password
+
+
+# Pola payload XSS umum untuk field teks user
+_XSS_SCRIPT_TAG_RE = re.compile(r"<\s*/?\s*(script|iframe|object|embed)\b[^>]*>", re.IGNORECASE)
+_XSS_EVENT_HANDLER_RE = re.compile(r"\son[a-z]+\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]+)", re.IGNORECASE)
+_XSS_JS_PROTOCOL_RE = re.compile(r"\bjavascript\s*:", re.IGNORECASE)
+_XSS_HTML_TAG_RE = re.compile(r"<[^>]*>")
+
+
+def sanitize_user_text(value):
+    """Hilangkan payload XSS dari field teks user (full_name, telegram, username, dll)."""
+    if not value:
+        return value
+    value = _XSS_SCRIPT_TAG_RE.sub("", value)
+    value = _XSS_EVENT_HANDLER_RE.sub("", value)
+    value = _XSS_JS_PROTOCOL_RE.sub("", value)
+    value = _XSS_HTML_TAG_RE.sub("", value)
+    return value
 
 
 # General setting untuk referral code
@@ -264,6 +283,13 @@ class User(AbstractUser):
     
     def __str__(self):
         return self.email
+
+    def save(self, *args, **kwargs):
+        # Sanitasi XSS untuk field teks yang diisi user
+        self.full_name = sanitize_user_text(self.full_name or "")
+        self.telegram = sanitize_user_text(self.telegram or "")
+        self.username = sanitize_user_text(self.username or "")
+        super().save(*args, **kwargs)
     
     class Meta:
         verbose_name = 'User'
@@ -404,6 +430,12 @@ class UserAddress(models.Model):
         verbose_name_plural = 'User Addresses'
 
     def save(self, *args, **kwargs):
+        # Sanitasi XSS untuk field alamat yang diisi user
+        self.recipient_name = sanitize_user_text(self.recipient_name or "")
+        self.address_details = sanitize_user_text(self.address_details or "")
+        self.house_number = sanitize_user_text(self.house_number or "")
+        self.phone_number = sanitize_user_text(self.phone_number or "")
+
         if self.is_primary:
             # Set other addresses of this user to not primary
             UserAddress.objects.filter(user=self.user, is_primary=True).update(is_primary=False)
