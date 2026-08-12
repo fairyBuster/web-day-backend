@@ -52,6 +52,22 @@ if NGROK_DOMAINS:
 # Admin URL base path (do not use default '/admin')
 ADMIN_URL = os.environ.get('ADMIN_URL', 'backend-admin').strip()
 
+# ---------------------------------------------------------------------------
+# Security hardening — cookie flags
+# ---------------------------------------------------------------------------
+# Session cookie (dipakai admin panel): HttpOnly + SameSite=Lax selalu.
+# Secure hanya aktif di production (DEBUG=False) supaya tetap jalan di http://localhost saat dev.
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = 'Lax'
+SESSION_COOKIE_SECURE = not DEBUG
+
+# CSRF cookie: Secure mengikuti production, SameSite=Lax.
+# HttpOnly=True mencegah JS membaca token (paling aman terhadap XSS).
+CSRF_COOKIE_HTTPONLY = True
+CSRF_COOKIE_SAMESITE = 'Lax'
+CSRF_COOKIE_SECURE = not DEBUG
+# ---------------------------------------------------------------------------
+
 
 # Application definition
 
