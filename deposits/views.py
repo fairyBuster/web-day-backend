@@ -67,6 +67,11 @@ from .integrations.bankpay import (
     post_form as bankpay_post_form,
     format_apply_date as bankpay_format_apply_date,
 )
+from .integrations.reepay import (
+    post_json as reepay_post_json,
+    verify_callback_signature as reepay_verify_callback_signature,
+    extract_callback_field as reepay_extract_callback_field,
+)
 from withdrawal.integrations.jayapay import sign_params_legacy
 from .integrations.klikpay import build_params as klikpay_build_params, sign_params as klikpay_sign_params, send_prepaid_request as klikpay_send_prepaid
 from .utils import verify_jayapay_signature
@@ -4484,4 +4489,239 @@ class QRISDepositRejectView(APIView):
             {"order_num": order_num, "status": "FAILED", "reason": reason},
             status=status.HTTP_200_OK,
         )
+
+
+# ============================================================
+# Reepay Gateway Views (HMAC-SHA256)
+# ============================================================
+
+def _reepay_raw_body(request) -> str:
+    raw = request.body or b""
+    try:
+        return raw.decode("utf-8")
+    except Exception:
+        return ""
+
+
+def _reepay_callback_payload(request) -> dict:
+    raw = _reepay_raw_body(request)
+    if raw:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    if isinstance(getattr(request, "data", None), dict):
+        return request.data
+    return {}
+
+
+def _reepay_verify_callback(request, secret: str) -> bool:
+    timestamp = (request.META.get("HTTP_X_TIMESTAMP") or "").strip()
+    signature = (request.META.get("HTTP_X_SIGNATURE") or "").strip()
+    webhook_path = request.path
+    raw_body = _reepay_raw_body(request)
+    return reepay_verify_callback_signature(secret, timestamp, webhook_path, raw_body, signature)
+
+
+def _reepay_handle_payment_callback(request, payload: dict):
+    """Proses callback payment.* dari Reepay (deposit)."""
+    gs = GatewaySettings.objects.order_by("-updated_at").first()
+    secret_key = (gs.reepay_secret_key or "").strip() if gs else ""
+
+    event = str(reepay_extract_callback_field(payload, "event") or "").strip()
+    merchant_ref = str(reepay_extract_callback_field(payload, "merchant_ref") or "").strip()
+
+    if not merchant_ref:
+        return
+
+    sign_valid = _reepay_verify_callback(request, secret_key)
+
+    trx = Transaction.objects.filter(trx_id=merchant_ref).first()
+    dep = Deposit.objects.filter(order_num=merchant_ref, gateway="REEPAY").first()
+
+    if dep:
+        cb = dict(payload)
+        cb["_sign_valid"] = sign_valid
+        dep.callback_payload = cb
+        dep.callback_at = timezone.now()
+        dep.save(update_fields=["callback_payload", "callback_at"])
+
+    if not trx or not sign_valid:
+        return
+
+    if event == "payment.paid":
+        paid_amount = None
+        amount_val = reepay_extract_callback_field(payload, "amount")
+        if amount_val is not None:
+            try:
+                paid_amount = Decimal(str(amount_val)).quantize(Decimal("0.01"))
+            except Exception:
+                paid_amount = None
+        _ppaypros_complete_deposit(trx, dep, paid_amount=paid_amount)
+    elif event in ("payment.failed", "payment.expired"):
+        _ppaypros_mark_deposit_failed(trx, dep)
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class ReepayDepositInitiateView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_scope = "deposit_initiate"
+
+    @extend_schema(
+        summary="Inisiasi deposit via Reepay",
+        request={
+            "application/json": {
+                "type": "object",
+                "properties": {
+                    "amount": {"type": "number", "example": 100000},
+                    "wallet_type": {"type": "string", "enum": ["BALANCE", "BALANCE_DEPOSIT"], "example": "BALANCE"},
+                    "expiry_period": {"type": "integer", "example": 1440},
+                },
+                "required": ["amount"],
+            }
+        },
+    )
+    def post(self, request):
+        gs = GatewaySettings.objects.order_by("-updated_at").first()
+        enabled = bool(gs and gs.reepay_enabled)
+        api_url = (gs.reepay_api_url or "https://api.roguecdn.online").strip() if gs else ""
+        api_key = (gs.reepay_api_key or "").strip() if gs else ""
+        secret_key = (gs.reepay_secret_key or "").strip() if gs else ""
+        min_deposit_amount = (gs.min_deposit_amount or Decimal("0")) if gs else Decimal("0")
+        max_deposit_amount = (gs.max_deposit_amount or Decimal("0")) if gs else Decimal("0")
+
+        if not enabled:
+            return Response({"detail": "Reepay tidak aktif"}, status=status.HTTP_400_BAD_REQUEST)
+        if not api_key or not secret_key:
+            return Response({"detail": "Konfigurasi Reepay belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
+
+        wallet_type = (request.data.get("wallet_type") or gs.default_wallet_type or "BALANCE").strip().upper()
+        if wallet_type not in ("BALANCE", "BALANCE_DEPOSIT"):
+            return Response({"detail": "wallet_type tidak valid"}, status=status.HTTP_400_BAD_REQUEST)
+
+        amount_raw = request.data.get("amount")
+        try:
+            amount = Decimal(str(amount_raw)).quantize(Decimal("0.01"))
+            if amount <= 0:
+                raise InvalidOperation()
+        except Exception:
+            return Response({"detail": "amount tidak valid"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if min_deposit_amount and min_deposit_amount > 0 and amount < min_deposit_amount:
+            return Response({"detail": f"Minimal deposit adalah {min_deposit_amount}"}, status=status.HTTP_400_BAD_REQUEST)
+        if max_deposit_amount and max_deposit_amount > 0 and amount > max_deposit_amount:
+            return Response({"detail": f"Maksimal deposit adalah {max_deposit_amount}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = request.user
+        order_num = f"DRP{_now_wib().strftime('%y%m%d%H%M%S')}{uuid.uuid4().hex[:8].upper()}"
+        # Reepay hanya menerima nominal integer IDR
+        amount_int = int(round(float(amount)))
+
+        trx = Transaction.objects.create(
+            user=user,
+            product=None,
+            type="DEPOSIT",
+            amount=amount,
+            currency_code="IDR",
+            description=f"Deposit via Reepay ({wallet_type})",
+            status="PENDING",
+            wallet_type=wallet_type,
+            trx_id=order_num,
+        )
+
+        payload = {
+            "amount": amount_int,
+            "method": "",
+            "merchant_ref": order_num,
+            "customer_name": (user.full_name or user.username or "")[:100],
+            "customer_email": (getattr(user, "email", "") or "")[:100],
+            "customer_phone": (getattr(user, "phone", "") or "")[:32],
+            "description": f"Deposit Reepay ({wallet_type})"[:100],
+        }
+        expiry_period = request.data.get("expiry_period")
+        if expiry_period is not None:
+            try:
+                payload["expiry_period"] = int(expiry_period)
+            except Exception:
+                pass
+
+        dep = Deposit.objects.create(
+            user=user,
+            gateway="REEPAY",
+            order_num=order_num,
+            amount=amount,
+            amount_currency_code="IDR",
+            wallet_type=wallet_type,
+            status="PENDING",
+            transaction=trx,
+            request_params=payload,
+        )
+
+        resp_data, http_status = reepay_post_json(
+            api_key, secret_key, "/merchant/payment/create", payload, base_url=api_url
+        )
+
+        dep.response_payload = resp_data
+        dep.save(update_fields=["response_payload"])
+
+        if resp_data.get("success"):
+            data = resp_data.get("data") if isinstance(resp_data.get("data"), dict) else {}
+            pay_url = (data.get("pay_url") or "").strip()
+            ref_id = (data.get("ref_id") or "").strip()
+            if pay_url:
+                dep.payment_url = pay_url
+                dep.save(update_fields=["payment_url"])
+
+            return Response(
+                {
+                    "order_num": order_num,
+                    "ref_id": ref_id,
+                    "amount": amount_int,
+                    "pay_url": pay_url or None,
+                    "expires_at": data.get("expires_at"),
+                    "provider": resp_data,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        _ppaypros_mark_deposit_failed(trx, dep)
+
+        detail_msg = (
+            resp_data.get("message")
+            or resp_data.get("detail")
+            or resp_data.get("msg")
+            or ""
+        )
+        if isinstance(detail_msg, str) and _looks_like_html(detail_msg):
+            detail_msg = "Layanan sedang tidak tersedia"
+
+        return Response(
+            {"detail": detail_msg or "Reepay payin gagal", "provider": resp_data},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class ReepayDepositCallbackView(APIView):
+    permission_classes = [permissions.AllowAny]
+    throttle_scope = "gateway_callback"
+
+    @extend_schema(summary="Callback Reepay untuk update status deposit")
+    def post(self, request):
+        payload = _reepay_callback_payload(request)
+        event = str(reepay_extract_callback_field(payload, "event") or "").strip()
+
+        # Webhook Reepay hanya 1 URL: route event withdraw.* ke handler withdrawal
+        if event.startswith("withdraw."):
+            try:
+                from withdrawal.views import _reepay_handle_withdraw_callback
+                _reepay_handle_withdraw_callback(request, payload)
+            except Exception as e:
+                logger.warning("REEPAY: gagal route withdraw callback: %s", e)
+            return HttpResponse("OK", content_type="text/plain")
+
+        _reepay_handle_payment_callback(request, payload)
+        return HttpResponse("OK", content_type="text/plain")
 

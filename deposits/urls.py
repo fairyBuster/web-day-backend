@@ -29,6 +29,8 @@ from .views import (
     QRISDepositInitiateView,
     QRISDepositAcceptView,
     QRISDepositRejectView,
+    ReepayDepositInitiateView,
+    ReepayDepositCallbackView,
 )
 
 urlpatterns = [
@@ -61,5 +63,7 @@ urlpatterns = [
     path('qris/initiate/', QRISDepositInitiateView.as_view(), name='deposit-qris-initiate'),
     path('qris/accept/', QRISDepositAcceptView.as_view(), name='deposit-qris-accept'),
     path('qris/reject/', QRISDepositRejectView.as_view(), name='deposit-qris-reject'),
+    path('reepay/initiate/', ReepayDepositInitiateView.as_view(), name='deposit-reepay-initiate'),
+    path('reepay/callback/', ReepayDepositCallbackView.as_view(), name='deposit-reepay-callback'),
     path('transactions/', DepositTransactionsListView.as_view(), name='deposit-transactions-list'),
 ]

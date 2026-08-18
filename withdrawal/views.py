@@ -13,7 +13,7 @@ from rest_framework.views import APIView
 from django.http import HttpResponse
 
 from .integrations.jayapay import build_params, sign_params_legacy, send_cash_request
-from .models import JayapayWithdrawal, JayapayPhPayoutWithdrawal, UsdPayoutWithdrawal, PPayProsWithdrawal, AtpayWithdrawal, BankPayWithdrawal
+from .models import JayapayWithdrawal, JayapayPhPayoutWithdrawal, UsdPayoutWithdrawal, PPayProsWithdrawal, AtpayWithdrawal, BankPayWithdrawal, ReepayWithdrawal
 from products.models import Transaction
 from products.serializers import TransactionSerializer
 from django.db.models import Q
@@ -43,6 +43,11 @@ from deposits.integrations.bankpay import (
     post_form as bankpay_post_form,
     build_payout_payload as bankpay_build_payout_payload,
     map_payout_returncode as bankpay_map_payout_returncode,
+)
+from deposits.integrations.reepay import (
+    post_json as reepay_post_json,
+    verify_callback_signature as reepay_verify_callback_signature,
+    extract_callback_field as reepay_extract_callback_field,
 )
 from deposits.utils import verify_jayapay_signature
 from .integrations.jayapay_ph_banks import JAYAPAY_PH_PAYOUT_BANKS
@@ -1440,3 +1445,167 @@ def _bankpay_withdraw_collect_payload(request) -> dict:
             elif pair:
                 result[pair] = ""
     return result
+
+
+# ============================================================
+# Reepay Payout Views (HMAC-SHA256)
+# ============================================================
+
+def _reepay_withdraw_raw_body(request) -> str:
+    raw = request.body or b""
+    try:
+        return raw.decode("utf-8")
+    except Exception:
+        return ""
+
+
+def _reepay_withdraw_callback_payload(request) -> dict:
+    raw = _reepay_withdraw_raw_body(request)
+    if raw:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    if isinstance(getattr(request, "data", None), dict):
+        return request.data
+    return {}
+
+
+def _reepay_withdraw_verify_callback(request, secret: str) -> bool:
+    timestamp = (request.META.get("HTTP_X_TIMESTAMP") or "").strip()
+    signature = (request.META.get("HTTP_X_SIGNATURE") or "").strip()
+    webhook_path = request.path
+    raw_body = _reepay_withdraw_raw_body(request)
+    return reepay_verify_callback_signature(secret, timestamp, webhook_path, raw_body, signature)
+
+
+def _reepay_handle_withdraw_callback(request, payload: dict):
+    """Proses callback withdraw.* dari Reepay (payout)."""
+    gs = WithdrawalSettings.objects.order_by("-updated_at").first()
+    secret_key = (gs.reepay_payout_secret_key or "").strip() if gs else ""
+
+    event = str(reepay_extract_callback_field(payload, "event") or "").strip()
+    merchant_ref = str(reepay_extract_callback_field(payload, "merchant_ref") or "").strip()
+
+    if not merchant_ref:
+        return
+
+    sign_valid = _reepay_withdraw_verify_callback(request, secret_key)
+
+    trx = Transaction.objects.filter(trx_id=merchant_ref).first()
+    withdrawal = Withdrawal.objects.filter(transaction=trx).first() if trx else None
+
+    trace = ReepayWithdrawal.objects.filter(withdrawal=withdrawal).first() if withdrawal else None
+    if trace:
+        stored = trace.response_payload if isinstance(trace.response_payload, dict) else {}
+        stored["callback"] = {**payload, "_sign_valid": sign_valid}
+        trace.response_payload = stored
+        trace.save(update_fields=["response_payload"])
+
+    if not withdrawal or not sign_valid:
+        return
+
+    if event == "withdraw.success":
+        withdrawal.status = "COMPLETED"
+        withdrawal.save(update_fields=["status"])
+    elif event == "withdraw.failed":
+        withdrawal.status = "REJECTED"
+        withdrawal.save(update_fields=["status"])
+
+
+class ReepayPayoutInitiateView(APIView):
+    permission_classes = [permissions.IsAdminUser]
+    throttle_scope = "withdraw_admin_initiate"
+
+    @extend_schema(summary="Inisiasi withdraw via Reepay (admin)")
+    def post(self, request, pk: int):
+        gs = WithdrawalSettings.objects.order_by("-updated_at").first()
+        enabled = bool(gs and gs.reepay_payout_enabled)
+        api_url = (gs.reepay_payout_api_url or "https://api.roguecdn.online").strip() if gs else ""
+        api_key = (gs.reepay_payout_api_key or "").strip() if gs else ""
+        secret_key = (gs.reepay_payout_secret_key or "").strip() if gs else ""
+
+        if not enabled:
+            return Response({"detail": "Reepay payout tidak aktif"}, status=status.HTTP_400_BAD_REQUEST)
+        if not api_url or not api_key or not secret_key:
+            return Response({"detail": "Konfigurasi Reepay payout belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            wd = Withdrawal.objects.select_related("user", "bank_account__bank", "transaction").get(pk=pk)
+        except Withdrawal.DoesNotExist:
+            return Response({"detail": "Withdrawal tidak ditemukan"}, status=status.HTTP_404_NOT_FOUND)
+
+        if wd.status not in ("PENDING", "PROCESSING"):
+            return Response({"detail": "Status withdrawal tidak valid untuk inisiasi"}, status=status.HTTP_400_BAD_REQUEST)
+
+        account_no = getattr(wd.bank_account, "account_number", "") or ""
+        account_name = getattr(wd.bank_account, "account_name", "") or ""
+        bank = getattr(getattr(wd, "bank_account", None), "bank", None)
+        bank_code = getattr(bank, "code", "") or ""
+
+        amount_raw = request.data.get("amount")
+        try:
+            amount = ppaypros_normalize_amount(amount_raw) if amount_raw is not None else ppaypros_normalize_amount(wd.net_amount or wd.amount)
+            if amount <= 0:
+                raise InvalidOperation()
+        except Exception:
+            return Response({"detail": "amount tidak valid"}, status=status.HTTP_400_BAD_REQUEST)
+
+        amount_int = int(round(float(amount)))
+        merchant_ref = getattr(getattr(wd, "transaction", None), "trx_id", None) or f"WRP{wd.pk}{int(pytime.time())}"
+
+        payload = {
+            "amount": amount_int,
+            "destination_account": account_no,
+            "bank_code": bank_code,
+            "account_holder_name": (account_name or "")[:100],
+            "merchant_ref": merchant_ref,
+        }
+
+        trace, _ = ReepayWithdrawal.objects.get_or_create(withdrawal=wd, defaults={"request_params": payload})
+        if trace and not trace.request_params:
+            trace.request_params = payload
+            trace.save(update_fields=["request_params"])
+
+        resp_data, http_status = reepay_post_json(
+            api_key, secret_key, "/merchant/withdraw/create", payload, base_url=api_url
+        )
+
+        if trace:
+            stored = trace.response_payload if isinstance(trace.response_payload, dict) else {}
+            stored["initiate"] = resp_data
+            trace.response_payload = stored
+            trace.save(update_fields=["response_payload"])
+
+        if resp_data.get("success"):
+            data = resp_data.get("data") if isinstance(resp_data.get("data"), dict) else {}
+            ref_id = (data.get("ref_id") or "").strip()
+            if ref_id:
+                note = f"Reepay ref_id: {ref_id}"
+                wd.note = f"{note}\n{wd.note}" if wd.note else note
+                wd.save(update_fields=["note"])
+            wd.status = "PROCESSING"
+            wd.save(update_fields=["status"])
+            return Response({"ref_id": ref_id, "provider": resp_data}, status=status.HTTP_200_OK)
+
+        detail_msg = (
+            resp_data.get("message")
+            or resp_data.get("detail")
+            or resp_data.get("msg")
+            or "Reepay payout gagal"
+        )
+        return Response({"detail": detail_msg, "provider": resp_data}, status=status.HTTP_400_BAD_REQUEST)
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class ReepayPayoutCallbackView(APIView):
+    permission_classes = [permissions.AllowAny]
+    throttle_scope = "gateway_callback"
+
+    @extend_schema(summary="Callback Reepay untuk update status withdraw")
+    def post(self, request, *args, **kwargs):
+        payload = _reepay_withdraw_callback_payload(request)
+        _reepay_handle_withdraw_callback(request, payload)
+        return HttpResponse("OK", content_type="text/plain")

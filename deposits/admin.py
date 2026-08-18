@@ -8,7 +8,7 @@ from django.utils import timezone
 @admin.register(GatewaySettings)
 class GatewaySettingsAdmin(admin.ModelAdmin):
     list_display = (
-        'default_wallet_type', 'app_domain', 'min_deposit_amount', 'max_deposit_amount', 'usd_gateway_min_deposit_amount', 'usd_gateway_max_deposit_amount', 'jayapay_enabled', 'jayapay_ph_enabled', 'klikpay_enabled', 'usd_gateway_enabled', 'ppaypros_enabled', 'clienthub_enabled', 'sitransferhub_enabled', 'atpay_enabled', 'bankpay_enabled', 'qris_enabled', 'updated_at'
+        'default_wallet_type', 'app_domain', 'min_deposit_amount', 'max_deposit_amount', 'usd_gateway_min_deposit_amount', 'usd_gateway_max_deposit_amount', 'jayapay_enabled', 'jayapay_ph_enabled', 'klikpay_enabled', 'usd_gateway_enabled', 'ppaypros_enabled', 'clienthub_enabled', 'sitransferhub_enabled', 'atpay_enabled', 'bankpay_enabled', 'qris_enabled', 'reepay_enabled', 'updated_at'
     )
     readonly_fields = ('updated_at',)
 
@@ -17,7 +17,7 @@ class GatewaySettingsAdmin(admin.ModelAdmin):
         return not GatewaySettings.objects.exists()
     fieldsets = (
         ('Global', {
-            'fields': ('default_wallet_type', 'app_domain', 'min_deposit_amount', 'max_deposit_amount', 'jayapay_enabled', 'jayapay_ph_enabled', 'klikpay_enabled', 'usd_gateway_enabled', 'ppaypros_enabled', 'clienthub_enabled', 'sitransferhub_enabled', 'atpay_enabled', 'bankpay_enabled', 'qris_enabled')
+            'fields': ('default_wallet_type', 'app_domain', 'min_deposit_amount', 'max_deposit_amount', 'jayapay_enabled', 'jayapay_ph_enabled', 'klikpay_enabled', 'usd_gateway_enabled', 'ppaypros_enabled', 'clienthub_enabled', 'sitransferhub_enabled', 'atpay_enabled', 'bankpay_enabled', 'qris_enabled', 'reepay_enabled')
         }),
         ('Jayapay', {
             'fields': (
@@ -126,6 +126,15 @@ class GatewaySettingsAdmin(admin.ModelAdmin):
                 'qris_expired_minutes',
             ),
             'description': 'QRIS Manual: upload QR static di menu QRIS Gateway, sistem akan konversi ke dynamic saat deposit.',
+        }),
+        ('Reepay', {
+            'fields': (
+                'reepay_api_url',
+                'reepay_api_key',
+                'reepay_secret_key',
+                'reepay_return_url',
+            ),
+            'description': 'Konfigurasi Reepay (RogueCDN). Auth HMAC-SHA256 via header X-API-Key, X-Timestamp, X-Signature.',
         }),
     )
 

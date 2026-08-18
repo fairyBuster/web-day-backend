@@ -408,4 +408,49 @@
       <p style="color: #999;">BankPay payout tidak aktif. Aktifkan di WithdrawalSettings dan isi konfigurasi member_id/key.</p>
     {% endif %}
   </div>
+
+  <!-- Reepay Payout Section -->
+  <div class="module" style="margin-top: 30px; border: 1px solid #ccc; border-radius: 5px; padding: 20px;">
+    <h2>Process via Reepay</h2>
+    {% if reepay_payout_enabled %}
+      <form method="post" action="{{ process_reepay_url }}">
+        {% csrf_token %}
+        <fieldset class="module aligned">
+          <div class="form-row">
+            <div>
+              <label for="id_rp_bank_code">Bank Code</label>
+              <input type="text" id="id_rp_bank_code" name="bank_code" value="{{ reepay_payout_initial.bank_code }}" />
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div>
+              <label for="id_rp_destination_account">Account Number</label>
+              <input type="text" id="id_rp_destination_account" name="destination_account" value="{{ reepay_payout_initial.destination_account }}" required />
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div>
+              <label for="id_rp_account_holder_name">Account Holder Name</label>
+              <input type="text" id="id_rp_account_holder_name" name="account_holder_name" value="{{ reepay_payout_initial.account_holder_name }}" />
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div>
+              <label for="id_rp_amount">Amount</label>
+              <input type="number" step="1" id="id_rp_amount" name="amount" value="{{ reepay_payout_initial.amount }}" required />
+            </div>
+          </div>
+        </fieldset>
+
+        <div class="submit-row">
+          <button type="submit" class="default">Submit to Reepay</button>
+        </div>
+      </form>
+    {% else %}
+      <p style="color: #999;">Reepay payout tidak aktif. Aktifkan di WithdrawalSettings dan isi konfigurasi api_key/secret_key.</p>
+    {% endif %}
+  </div>
 {% endblock %}

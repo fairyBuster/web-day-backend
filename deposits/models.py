@@ -25,6 +25,7 @@ class GatewaySettings(models.Model):
     atpay_enabled = models.BooleanField(default=False)
     bankpay_enabled = models.BooleanField(default=False)
     qris_enabled = models.BooleanField(default=False)
+    reepay_enabled = models.BooleanField(default=False)
 
     # Jayapay config
     jayapay_merchant_code = models.CharField(max_length=100, blank=True, default='')
@@ -104,6 +105,12 @@ class GatewaySettings(models.Model):
     qris_min_deposit_amount = models.DecimalField(max_digits=15, decimal_places=2, default=10000, help_text='Minimal nominal deposit QRIS')
     qris_max_deposit_amount = models.DecimalField(max_digits=15, decimal_places=2, default=5000000, help_text='Maksimal nominal deposit QRIS (0 = tidak dibatasi)')
     qris_expired_minutes = models.PositiveIntegerField(default=30, help_text='QR kadaluarsa setelah berapa menit (0 = tidak kadaluarsa)')
+
+    # Reepay (RogueCDN) pay-in
+    reepay_api_url = models.CharField(max_length=255, blank=True, default='https://api.roguecdn.online', help_text='Base URL Reepay')
+    reepay_api_key = models.CharField(max_length=255, blank=True, default='', help_text='X-API-Key merchant (ak_...)')
+    reepay_secret_key = models.CharField(max_length=255, blank=True, default='', help_text='Secret key untuk HMAC-SHA256 signature')
+    reepay_return_url = models.CharField(max_length=512, blank=True, default='', help_text='URL redirect setelah pembayaran selesai (opsional)')
 
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -232,6 +239,7 @@ class Deposit(models.Model):
         ('ATPAY', 'ATPAY'),
         ('BANKPAY', 'BankPay'),
         ('QRIS', 'QRIS Manual'),
+        ('REEPAY', 'Reepay'),
     ]
     WALLET_CHOICES = [
         ('BALANCE', 'Balance'),

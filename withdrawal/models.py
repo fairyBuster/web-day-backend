@@ -60,6 +60,11 @@ class WithdrawalSettings(models.Model):
     bankpay_payout_member_id = models.CharField(max_length=100, blank=True, default='', help_text='Merchant ID dari BankPay')
     bankpay_payout_key = models.CharField(max_length=255, blank=True, default='', help_text='MERCHANT_KEY untuk signature MD5 payout')
 
+    reepay_payout_enabled = models.BooleanField(default=False)
+    reepay_payout_api_url = models.CharField(max_length=255, blank=True, default='https://api.roguecdn.online', help_text='Base URL Reepay')
+    reepay_payout_api_key = models.CharField(max_length=255, blank=True, default='', help_text='X-API-Key merchant (ak_...)')
+    reepay_payout_secret_key = models.CharField(max_length=255, blank=True, default='', help_text='Secret key untuk HMAC-SHA256 signature payout')
+
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -273,3 +278,18 @@ class BankPayWithdrawal(models.Model):
 
     def __str__(self):
         return f"BankPay payout for Withdrawal #{self.withdrawal.pk}"
+
+
+class ReepayWithdrawal(models.Model):
+    withdrawal = models.OneToOneField(Withdrawal, on_delete=models.CASCADE, related_name='reepay_withdrawal')
+    request_params = models.JSONField(default=dict)
+    response_payload = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'withdrawal_reepay'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"Reepay payout for Withdrawal #{self.withdrawal.pk}"
