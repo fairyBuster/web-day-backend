@@ -4,6 +4,7 @@ from django.urls import path, reverse
 from django.shortcuts import redirect
 from django.template.response import TemplateResponse
 from .models import Withdrawal, WithdrawalSettings, WithdrawalJayapay, WithdrawalService, UsdPayoutWithdrawal, JayapayPhPayoutWithdrawal, PPayProsWithdrawal, AtpayWithdrawal, BankPayWithdrawal, ReepayWithdrawal
+from banks.models import Bank
 from .integrations.jayapay import build_params, sign_params, sign_params_legacy, send_cash_request
 from .integrations.jayapay_banks import JAYAPAY_BANKS
 from .integrations.jayapay_ph_banks import JAYAPAY_PH_PAYOUT_BANKS
@@ -975,6 +976,14 @@ class WithdrawalAdmin(admin.ModelAdmin):
                 except Exception as e:
                     bankpay_bank_codes_error = str(e)
             reepay_bank_codes, reepay_bank_codes_error = _fetch_reepay_bank_codes(gs)
+            if not reepay_bank_codes:
+                # Fallback ke daftar bank lokal (kode standar sama dengan Reepay) agar tetap dropdown
+                reepay_bank_codes = [
+                    {"bank_code": b.code, "bank_name": b.name}
+                    for b in Bank.objects.order_by("name")
+                ]
+                if not reepay_bank_codes_error:
+                    reepay_bank_codes_error = "API bank Reepay tidak tersedia, memakai daftar bank lokal"
             atpay_bank_code_set = {
                 item["bank_code"]
                 for item in atpay_bank_codes
