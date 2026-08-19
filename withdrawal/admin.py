@@ -4,7 +4,6 @@ from django.urls import path, reverse
 from django.shortcuts import redirect
 from django.template.response import TemplateResponse
 from .models import Withdrawal, WithdrawalSettings, WithdrawalJayapay, WithdrawalService, UsdPayoutWithdrawal, JayapayPhPayoutWithdrawal, PPayProsWithdrawal, AtpayWithdrawal, BankPayWithdrawal, ReepayWithdrawal
-from banks.models import Bank
 from .integrations.jayapay import build_params, sign_params, sign_params_legacy, send_cash_request
 from .integrations.jayapay_banks import JAYAPAY_BANKS
 from .integrations.jayapay_ph_banks import JAYAPAY_PH_PAYOUT_BANKS
@@ -35,6 +34,54 @@ USD_PAYOUT_BANK_CODE_CHOICES = (
     ("CASH", "cashapp wallet"),
     ("VENMO", "venmo"),
     ("PAYPAL", "paypal"),
+)
+
+# Daftar bank Reepay (bankCode -> bankName). Dipakai sebagai fallback saat API
+# /merchant/withdraw/banks tidak bisa diakses (mis. kena block Cloudflare).
+REEPAY_FALLBACK_BANK_CODES = (
+    ("014", "Bank Central Asia (BCA)"),
+    ("009", "Bank Negara Indonesia (BNI)"),
+    ("002", "Bank Rakyat Indonesia (BRI)"),
+    ("008", "Bank Mandiri"),
+    ("013", "Bank Permata"),
+    ("022", "Bank CIMB Niaga"),
+    ("4510", "Bank Syariah Indonesia (BSI)"),
+    ("200", "Bank Tabungan Negara (BTN)"),
+    ("019", "Bank Panin"),
+    ("028", "Bank OCBC NISP"),
+    ("426", "Bank Mega"),
+    ("016", "Bank Maybank"),
+    ("147", "Bank Muamalat Indonesia"),
+    ("041", "HSBC"),
+    ("011", "Bank Danamon"),
+    ("046", "Bank DBS Indonesia"),
+    ("031", "Citibank"),
+    ("050", "Standard Chartered Bank"),
+    ("023", "TMRW / Bank UOB Indonesia"),
+    ("067", "Deutsche Bank"),
+    ("069", "Bank of China"),
+    ("1450", "Bank BNP Paribas"),
+    ("535", "Seabank (Bank Kesejahteraan Ekonomi)"),
+    ("542", "Bank Jago (ARTOS)"),
+    ("5010", "Blu / BCA Digital"),
+    ("567", "Allo Bank"),
+    ("490", "Neo Commerce (BNC)"),
+    ("484", "LINE Bank / KEB Hana"),
+    ("213", "Bank BTPN"),
+    ("441", "Wokee / Bukopin"),
+    ("087", "Bank Ekonomi Raharja"),
+    ("097", "Bank Mayapada"),
+    ("153", "Bank Sinarmas"),
+    ("152", "Bank Shinhan Indonesia"),
+    ("212", "Bank Woori Saudara"),
+    ("494", "Bank Agroniaga"),
+    ("466", "Bank Andara"),
+    ("10001", "OVO"),
+    ("10002", "DANA"),
+    ("10003", "GOPAY"),
+    ("10008", "SHOPEEPAY"),
+    ("10009", "LINKAJA"),
+    ("10007", "NATIONALNOBU"),
 )
 
 
@@ -977,13 +1024,17 @@ class WithdrawalAdmin(admin.ModelAdmin):
                     bankpay_bank_codes_error = str(e)
             reepay_bank_codes, reepay_bank_codes_error = _fetch_reepay_bank_codes(gs)
             if not reepay_bank_codes:
-                # Fallback ke daftar bank lokal (kode standar sama dengan Reepay) agar tetap dropdown
+                # Fallback ke daftar bank umum (kode standar sama dengan Reepay) agar dropdown tetap rapi
                 reepay_bank_codes = [
-                    {"bank_code": b.code, "bank_name": b.name}
-                    for b in Bank.objects.order_by("name")
+                    {"bank_code": c, "bank_name": n}
+                    for c, n in REEPAY_FALLBACK_BANK_CODES
                 ]
+                wd_bank_code = getattr(getattr(obj.bank_account, 'bank', None), 'code', '') or ''
+                wd_bank_name = getattr(getattr(obj.bank_account, 'bank', None), 'name', '') or ''
+                if wd_bank_code and not any(b["bank_code"] == wd_bank_code for b in reepay_bank_codes):
+                    reepay_bank_codes.insert(0, {"bank_code": wd_bank_code, "bank_name": wd_bank_name})
                 if not reepay_bank_codes_error:
-                    reepay_bank_codes_error = "API bank Reepay tidak tersedia, memakai daftar bank lokal"
+                    reepay_bank_codes_error = "API bank Reepay tidak tersedia, memakai daftar bank umum"
             atpay_bank_code_set = {
                 item["bank_code"]
                 for item in atpay_bank_codes

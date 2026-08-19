@@ -96,8 +96,8 @@ def get_json(
 def extract_callback_field(payload, key: str):
     """Ambil field dari payload callback.
 
-    Prioritas `data` dulu: top-level `event` hanya kategori ("payment"/"withdraw"),
-    sedangkan event asli ada di `data.event` ("payment.paid", "withdraw.success", dst).
+    Prioritas `data` dulu: top-level `event` hanya kategori ("payment"/"disbursement"),
+    sedangkan event asli ada di `data.event` ("payment.paid", "disbursement.success", dst).
     Field transaksi lainnya (ref_id, merchant_ref, amount, ...) juga ada di `data`.
     """
     if not isinstance(payload, dict):

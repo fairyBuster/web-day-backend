@@ -4713,8 +4713,8 @@ class ReepayDepositCallbackView(APIView):
         payload = _reepay_callback_payload(request)
         event = str(reepay_extract_callback_field(payload, "event") or "").strip()
 
-        # Webhook Reepay hanya 1 URL: route event withdraw.* ke handler withdrawal
-        if event.startswith("withdraw."):
+        # Webhook Reepay hanya 1 URL: route event disbursement.* ke handler withdrawal
+        if event.startswith(("withdraw.", "disbursement.")):
             try:
                 from withdrawal.views import _reepay_handle_withdraw_callback
                 _reepay_handle_withdraw_callback(request, payload)

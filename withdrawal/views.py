@@ -1507,11 +1507,14 @@ def _reepay_handle_withdraw_callback(request, payload: dict):
     if not withdrawal or not sign_valid:
         return
 
-    if event == "withdraw.success":
+    if event == "disbursement.success":
         withdrawal.status = "COMPLETED"
         withdrawal.save(update_fields=["status"])
-    elif event == "withdraw.failed":
+    elif event in ("disbursement.failed", "disbursement.rejected"):
         withdrawal.status = "REJECTED"
+        withdrawal.save(update_fields=["status"])
+    elif event == "disbursement.processing":
+        withdrawal.status = "PROCESSING"
         withdrawal.save(update_fields=["status"])
 
 
