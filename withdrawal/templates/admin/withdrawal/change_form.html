@@ -419,7 +419,18 @@
           <div class="form-row">
             <div>
               <label for="id_rp_bank_code">Bank Code</label>
-              <input type="text" id="id_rp_bank_code" name="bank_code" value="{{ reepay_payout_initial.bank_code }}" />
+              {% if reepay_bank_codes %}
+                <select id="id_rp_bank_code" name="bank_code" required>
+                  {% for b in reepay_bank_codes %}
+                    <option value="{{ b.bank_code }}" {% if reepay_payout_initial.bank_code == b.bank_code %}selected{% endif %}>
+                      {{ b.bank_code }} - {{ b.bank_name }}
+                    </option>
+                  {% endfor %}
+                </select>
+              {% else %}
+                <input type="text" id="id_rp_bank_code" name="bank_code" value="{{ reepay_payout_initial.bank_code }}" />
+              {% endif %}
+              {% if reepay_bank_codes_error %}<p style="color:#b00; margin-top: 6px;">Gagal mengambil daftar bank Reepay: {{ reepay_bank_codes_error }}</p>{% endif %}
             </div>
           </div>
 

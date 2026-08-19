@@ -13,7 +13,7 @@ from .integrations.ppaypros import build_payout_payload as ppaypros_build_payout
 from deposits.integrations.ppaypros import amount_to_points as ppaypros_amount_to_points, generate_sign as ppaypros_generate_sign, parse_data_field as ppaypros_parse_data_field, post_json as ppaypros_post_json, verify_sign as ppaypros_verify_sign
 from deposits.integrations.atpay import build_bank_code_payload as atpay_build_bank_code_payload, build_payout_payload as atpay_build_payout_payload, build_payout_query_payload as atpay_build_payout_query_payload, map_payout_trade_status as atpay_map_payout_trade_status, normalize_amount as atpay_normalize_amount, normalize_sign_type as atpay_normalize_sign_type, post_json as atpay_post_json, sign_payload as atpay_sign_payload, verify_payload as atpay_verify_payload
 from deposits.integrations.bankpay import generate_sign as bankpay_generate_sign, post_form as bankpay_post_form, build_payout_payload as bankpay_build_payout_payload, fetch_bank_list as bankpay_fetch_bank_list
-from deposits.integrations.reepay import post_json as reepay_post_json
+from deposits.integrations.reepay import post_json as reepay_post_json, get_json as reepay_get_json
 from django.utils.html import format_html
 import json
 import logging
@@ -83,6 +83,42 @@ def _fetch_atpay_bank_codes(gs):
         return results, ""
     except Exception as exc:
         logger.warning("Failed to fetch ATPAY bank codes: %s", exc, exc_info=True)
+        return [], str(exc)
+
+
+def _fetch_reepay_bank_codes(gs):
+    enabled = bool(gs and getattr(gs, "reepay_payout_enabled", False))
+    api_url = (getattr(gs, "reepay_payout_api_url", "") or "https://api.roguecdn.online").strip() if gs else ""
+    api_key = (getattr(gs, "reepay_payout_api_key", "") or "").strip() if gs else ""
+    secret_key = (getattr(gs, "reepay_payout_secret_key", "") or "").strip() if gs else ""
+    if not enabled or not api_url or not api_key or not secret_key:
+        return [], ""
+    try:
+        resp_data, http_status = reepay_get_json(api_key, secret_key, "/merchant/withdraw/banks", base_url=api_url)
+        if http_status != 200 or not isinstance(resp_data, dict) or not resp_data.get("success"):
+            return [], str(resp_data.get("message") or resp_data.get("detail") or f"HTTP {http_status}")
+        data = resp_data.get("data")
+        results = []
+        if isinstance(data, dict):
+            # Format map: {bankCode: bankName, ...}
+            for code, name in data.items():
+                code = str(code or "").strip()
+                name = str(name or "").strip()
+                if code:
+                    results.append({"bank_code": code, "bank_name": name})
+        elif isinstance(data, list):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                code = str(item.get("bank_code") or item.get("bankCode") or "").strip()
+                name = str(item.get("bank_name") or item.get("bankName") or "").strip()
+                if code:
+                    results.append({"bank_code": code, "bank_name": name})
+        if not results:
+            return [], "Daftar bank Reepay kosong"
+        return results, ""
+    except Exception as exc:
+        logger.warning("Failed to fetch Reepay bank codes: %s", exc, exc_info=True)
         return [], str(exc)
 
 
@@ -938,6 +974,7 @@ class WithdrawalAdmin(admin.ModelAdmin):
                     )
                 except Exception as e:
                     bankpay_bank_codes_error = str(e)
+            reepay_bank_codes, reepay_bank_codes_error = _fetch_reepay_bank_codes(gs)
             atpay_bank_code_set = {
                 item["bank_code"]
                 for item in atpay_bank_codes
@@ -1029,6 +1066,8 @@ class WithdrawalAdmin(admin.ModelAdmin):
                 },
                 'process_bankpay_url': reverse('admin:withdrawal_withdrawal_process_bankpay', args=(obj.id,)),
                 'reepay_payout_enabled': bool(gs and gs.reepay_payout_enabled),
+                'reepay_bank_codes': reepay_bank_codes,
+                'reepay_bank_codes_error': reepay_bank_codes_error,
                 'reepay_payout_initial': {
                     'bank_code': getattr(getattr(obj.bank_account, 'bank', None), 'code', '') or '',
                     'destination_account': obj.bank_account.account_number if obj.bank_account else '',
