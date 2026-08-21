@@ -81,6 +81,9 @@ from datetime import datetime, time, timedelta
 
 logger = logging.getLogger(__name__)
 
+# Pesan umum saat payment gateway (deposit) sedang non-aktif
+PG_INACTIVE_MESSAGE = "Pengisian ulang tertunda hari ini. Silakan coba 30 menit selanjutnya"
+
 
 def format_datetime(dt):
     return dt.strftime('%Y%m%d%H%M%S')
@@ -864,7 +867,7 @@ class JayapayDepositInitiateView(APIView):
         max_deposit_amount = (gs.max_deposit_amount or Decimal('0')) if gs else Decimal('0')
 
         if not jayapay_enabled:
-            return Response({'detail': 'Jayapay tidak aktif'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": PG_INACTIVE_MESSAGE}, status=status.HTTP_400_BAD_REQUEST)
         if not merchant_code or not private_key:
             return Response({'detail': 'Konfigurasi Jayapay belum lengkap'}, status=status.HTTP_400_BAD_REQUEST)
         if not app_domain:
@@ -1035,7 +1038,7 @@ class JayapayDepositInitiateDirectMethodView(APIView):
         max_deposit_amount = (gs.max_deposit_amount or Decimal('0')) if gs else Decimal('0')
 
         if not jayapay_enabled:
-            return Response({'detail': 'Jayapay tidak aktif'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": PG_INACTIVE_MESSAGE}, status=status.HTTP_400_BAD_REQUEST)
         if not merchant_code or not private_key:
             return Response({'detail': 'Konfigurasi Jayapay belum lengkap'}, status=status.HTTP_400_BAD_REQUEST)
         if not app_domain:
@@ -1376,7 +1379,7 @@ class JayapayPhDepositInitiateView(APIView):
         app_domain = (gs.app_domain or '').strip() if gs else ''
 
         if not enabled:
-            return Response({'detail': 'Jayapay PH tidak aktif'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": PG_INACTIVE_MESSAGE}, status=status.HTTP_400_BAD_REQUEST)
         if not mch_no or not private_key:
             return Response({'detail': 'Konfigurasi Jayapay PH belum lengkap'}, status=status.HTTP_400_BAD_REQUEST)
         if not app_domain:
@@ -1642,7 +1645,7 @@ class KlikpayDepositInitiateView(APIView):
         max_deposit_amount = (gs.max_deposit_amount or Decimal('0')) if gs else Decimal('0')
 
         if not klikpay_enabled:
-            return Response({'detail': 'Klikpay tidak aktif'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": PG_INACTIVE_MESSAGE}, status=status.HTTP_400_BAD_REQUEST)
         if not api_url or not merchant_code or not private_key:
             return Response({'detail': 'Konfigurasi Klikpay belum lengkap'}, status=status.HTTP_400_BAD_REQUEST)
         if not app_domain:
@@ -1852,7 +1855,7 @@ class UsdGatewayDepositInitiateView(APIView):
         max_deposit_amount = (gs.usd_gateway_max_deposit_amount or Decimal('0')) if gs else Decimal('0')
 
         if not enabled:
-            return Response({'detail': 'USD Gateway tidak aktif'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": PG_INACTIVE_MESSAGE}, status=status.HTTP_400_BAD_REQUEST)
         if not api_url or not mer_no or not sign_key:
             return Response({'detail': 'Konfigurasi USD Gateway belum lengkap'}, status=status.HTTP_400_BAD_REQUEST)
         if not app_domain:
@@ -2333,7 +2336,7 @@ class PPayProsDepositInitiateView(APIView):
         max_deposit_amount = (gs.max_deposit_amount or Decimal("0")) if gs else Decimal("0")
 
         if not enabled:
-            return Response({"detail": "PPay Pros tidak aktif"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": PG_INACTIVE_MESSAGE}, status=status.HTTP_400_BAD_REQUEST)
         if not api_url or not mch_no or not app_id or not private_key:
             return Response({"detail": "Konfigurasi PPay Pros belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
         if not app_domain:
@@ -2499,7 +2502,7 @@ class PPayProsDepositInitiateQRView(APIView):
         max_deposit_amount = (gs.max_deposit_amount or Decimal("0")) if gs else Decimal("0")
 
         if not enabled:
-            return Response({"detail": "PPay Pros tidak aktif"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": PG_INACTIVE_MESSAGE}, status=status.HTTP_400_BAD_REQUEST)
         if not api_url or not mch_no or not app_id or not private_key:
             return Response({"detail": "Konfigurasi PPay Pros belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
         if not app_domain:
@@ -2698,7 +2701,7 @@ class PPayProsDepositQueryView(APIView):
         app_id = (gs.ppaypros_app_id or "").strip() if gs else ""
         private_key = (gs.ppaypros_private_key or "").strip() if gs else ""
         if not enabled:
-            return Response({"detail": "PPay Pros tidak aktif"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": PG_INACTIVE_MESSAGE}, status=status.HTTP_400_BAD_REQUEST)
         if not api_url or not mch_no or not app_id or not private_key:
             return Response({"detail": "Konfigurasi PPay Pros belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -2840,7 +2843,7 @@ class AtpayDepositInitiateView(APIView):
         max_deposit_amount = (gs.max_deposit_amount or Decimal("0")) if gs else Decimal("0")
 
         if not enabled:
-            return Response({"detail": "ATPAY tidak aktif"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": PG_INACTIVE_MESSAGE}, status=status.HTTP_400_BAD_REQUEST)
         if not api_url or not merchant_no:
             return Response({"detail": "Konfigurasi ATPAY belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
         if sign_type == "MD5" and not secret_key:
@@ -2992,7 +2995,7 @@ class AtpayDepositInitiateDirectVAView(APIView):
         max_deposit_amount = (gs.max_deposit_amount or Decimal("0")) if gs else Decimal("0")
 
         if not enabled:
-            return Response({"detail": "ATPAY tidak aktif"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": PG_INACTIVE_MESSAGE}, status=status.HTTP_400_BAD_REQUEST)
         if not api_url or not merchant_no:
             return Response({"detail": "Konfigurasi ATPAY belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
         if sign_type == "MD5" and not secret_key:
@@ -3179,7 +3182,7 @@ class AtpayDepositQueryView(APIView):
         private_key = (gs.atpay_private_key or "").strip() if gs else ""
         public_key = (gs.atpay_public_key or "").strip() if gs else ""
         if not enabled:
-            return Response({"detail": "ATPAY tidak aktif"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": PG_INACTIVE_MESSAGE}, status=status.HTTP_400_BAD_REQUEST)
         if not api_url or not merchant_no:
             return Response({"detail": "Konfigurasi ATPAY belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -3289,7 +3292,7 @@ class ClientHubDepositInitiateView(APIView):
         max_deposit_amount = (gs.max_deposit_amount or Decimal("0")) if gs else Decimal("0")
 
         if not enabled:
-            return Response({"detail": "ClientHub tidak aktif"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": PG_INACTIVE_MESSAGE}, status=status.HTTP_400_BAD_REQUEST)
         if not base_url or not client_id or not secret_key:
             return Response({"detail": "Konfigurasi ClientHub belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
         if not app_domain:
@@ -3543,7 +3546,7 @@ class SiTransferHubDepositInitiateView(APIView):
         max_deposit_amount = (gs.max_deposit_amount or Decimal("0")) if gs else Decimal("0")
 
         if not enabled:
-            return Response({"detail": "SiTransfer Hub tidak aktif"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": PG_INACTIVE_MESSAGE}, status=status.HTTP_400_BAD_REQUEST)
         if not base_url or not client_id or not secret_key:
             return Response({"detail": "Konfigurasi SiTransfer Hub belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
         if not app_domain:
@@ -3843,7 +3846,7 @@ class BankPayDepositInitiateView(APIView):
         max_deposit_amount = (gs.max_deposit_amount or Decimal("0")) if gs else Decimal("0")
 
         if not enabled:
-            return Response({"detail": "BankPay tidak aktif"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": PG_INACTIVE_MESSAGE}, status=status.HTTP_400_BAD_REQUEST)
         if not api_url or not member_id or not key:
             return Response({"detail": "Konfigurasi BankPay belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
         if not app_domain:
@@ -4003,7 +4006,7 @@ class BankPayDepositInitiateQRView(APIView):
         max_deposit_amount = (gs.max_deposit_amount or Decimal("0")) if gs else Decimal("0")
 
         if not enabled:
-            return Response({"detail": "BankPay tidak aktif"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": PG_INACTIVE_MESSAGE}, status=status.HTTP_400_BAD_REQUEST)
         if not api_url or not member_id or not key:
             return Response({"detail": "Konfigurasi BankPay belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
         if not app_domain:
@@ -4283,7 +4286,7 @@ class QRISDepositInitiateView(APIView):
         max_qris = (gs.qris_max_deposit_amount or Decimal("0")) if gs else Decimal("0")
 
         if not enabled:
-            return Response({"detail": "Layanan sedang tidak tersedia"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": PG_INACTIVE_MESSAGE}, status=status.HTTP_400_BAD_REQUEST)
 
         qris_gw = QRISGateway.get_random_active()
         if not qris_gw:
@@ -4593,7 +4596,7 @@ class ReepayDepositInitiateView(APIView):
         max_deposit_amount = (gs.max_deposit_amount or Decimal("0")) if gs else Decimal("0")
 
         if not enabled:
-            return Response({"detail": "Reepay tidak aktif"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": PG_INACTIVE_MESSAGE}, status=status.HTTP_400_BAD_REQUEST)
         if not api_key or not secret_key:
             return Response({"detail": "Konfigurasi Reepay belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -4724,4 +4727,78 @@ class ReepayDepositCallbackView(APIView):
 
         _reepay_handle_payment_callback(request, payload)
         return HttpResponse("OK", content_type="text/plain")
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class ReepayDepositSelectMethodView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_scope = "deposit_initiate"
+
+    @extend_schema(
+        summary="Pilih metode pembayaran Reepay langsung via API (tanpa halaman pembayaran)",
+        request={
+            "application/json": {
+                "type": "object",
+                "properties": {
+                    "ref_id": {"type": "string", "example": "TXN260815AB12CD34"},
+                    "method": {"type": "string", "enum": ["QRIS", "BRI", "PERMATA"], "example": "QRIS"},
+                },
+                "required": ["ref_id", "method"],
+            }
+        },
+    )
+    def post(self, request):
+        gs = GatewaySettings.objects.order_by("-updated_at").first()
+        enabled = bool(gs and gs.reepay_enabled)
+        api_url = (gs.reepay_api_url or "https://api.roguecdn.online").strip() if gs else ""
+        api_key = (gs.reepay_api_key or "").strip() if gs else ""
+        secret_key = (gs.reepay_secret_key or "").strip() if gs else ""
+
+        if not enabled:
+            return Response({"detail": PG_INACTIVE_MESSAGE}, status=status.HTTP_400_BAD_REQUEST)
+        if not api_key or not secret_key:
+            return Response({"detail": "Konfigurasi Reepay belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
+
+        ref_id = str(request.data.get("ref_id") or "").strip()
+        method = str(request.data.get("method") or "").strip().upper()
+
+        if not ref_id:
+            return Response({"detail": "ref_id wajib diisi"}, status=status.HTTP_400_BAD_REQUEST)
+        if method not in ("QRIS", "BRI", "PERMATA"):
+            return Response({"detail": "method harus salah satu dari QRIS, BRI, PERMATA"}, status=status.HTTP_400_BAD_REQUEST)
+
+        resp_data, _http_status = reepay_post_json(
+            api_key,
+            secret_key,
+            f"/merchant/payment/{ref_id}/select-method",
+            {"method": method},
+            base_url=api_url,
+        )
+
+        if resp_data.get("success"):
+            data = resp_data.get("data") if isinstance(resp_data.get("data"), dict) else {}
+            return Response(
+                {
+                    "ref_id": (data.get("ref_id") or "").strip(),
+                    "merchant_ref": (data.get("merchant_ref") or "").strip(),
+                    "method": (data.get("method") or method).strip(),
+                    "pay_data": (data.get("pay_data") or "").strip(),
+                    "pay_data_type": (data.get("pay_data_type") or "").strip(),
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        detail_msg = (
+            resp_data.get("message")
+            or resp_data.get("detail")
+            or resp_data.get("msg")
+            or ""
+        )
+        if isinstance(detail_msg, str) and _looks_like_html(detail_msg):
+            detail_msg = "Layanan sedang tidak tersedia"
+
+        return Response(
+            {"detail": detail_msg or "Gagal memilih metode pembayaran", "provider": resp_data},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
