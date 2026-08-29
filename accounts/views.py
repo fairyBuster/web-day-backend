@@ -939,6 +939,57 @@ class ChangePasswordWithOldPasswordAndOTPView(APIView):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
+class ChangePasswordWithOldPasswordView(APIView):
+    """Ubah password dengan verifikasi password lama (tanpa OTP)."""
+    permission_classes = (AllowAny,)
+    throttle_scope = 'auth_password_change'
+
+    @extend_schema(
+        tags=[USER_TAG],
+        request=ChangePasswordWithOldPasswordAndOTPSerializer,
+        responses={
+            200: OpenApiResponse(
+                response=inline_serializer(
+                    name='ChangePasswordResponse',
+                    fields={
+                        'detail': serializers.CharField(),
+                    },
+                ),
+                description='Password berhasil diubah'
+            ),
+            400: OpenApiResponse(description='Validasi gagal'),
+        },
+        examples=[
+            OpenApiExample(
+                'Request Example',
+                value={
+                    'phone': '08129990010',
+                    'old_password': 'oldpass',
+                    'new_password': '123456',
+                    'new_password_confirm': '123456',
+                },
+                request_only=True,
+            ),
+            OpenApiExample(
+                'Success Response',
+                value={'detail': 'Password berhasil diubah.'},
+                response_only=True,
+            ),
+        ],
+        description='Ubah password dengan verifikasi password lama (tanpa OTP).'
+    )
+    def post(self, request):
+        data = request.data.copy()
+        phone = normalize_phone(data.get('phone'))
+        data['phone'] = phone
+
+        serializer = ChangePasswordWithOldPasswordAndOTPSerializer(data=data)
+        if serializer.is_valid():
+            serializer.save()
+            return Response({'detail': 'Password berhasil diubah.'}, status=status.HTTP_200_OK)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
 @method_decorator(csrf_exempt, name='dispatch')
 class ChangeWithdrawPinWithOldPinAndOTPView(APIView):
     permission_classes = (AllowAny,)
@@ -1232,12 +1283,13 @@ class DownlineOverviewView(APIView):
         levels_data = {}
         current_level = [user]
         rank_title_map = dict(RankLevel.objects.all().values_list('rank', 'title'))
-        default_rank_title = 'Belum Rank'
+        default_rank_title = 'Rank 0'
         settings_obj = GeneralSetting.objects.order_by('-updated_at').first()
         active_def = get_active_member_definition(settings_obj)
 
         for level in range(1, max_level + 1):
-            downlines_qs = User.objects.filter(referral_by__in=current_level)
+            # Anggota terbaru tampil paling atas (urutan tanggal daftar)
+            downlines_qs = User.objects.filter(referral_by__in=current_level).order_by('-created_at')
             
             if search_query:
                 search_query = search_query.strip()
@@ -1622,7 +1674,7 @@ class DownlineListView(APIView):
         settings_obj = GeneralSetting.objects.order_by('-updated_at').first()
         active_def = get_active_member_definition(settings_obj)
         rank_title_map = dict(RankLevel.objects.all().values_list('rank', 'title'))
-        default_rank_title = 'Belum Rank'
+        default_rank_title = 'Rank 0'
 
         # Parse filter params
         try:
@@ -1745,7 +1797,7 @@ class AdminDownlineOverviewView(APIView):
         levels_data = {}
         current_level = [target_user]
         rank_title_map = dict(RankLevel.objects.all().values_list('rank', 'title'))
-        default_rank_title = 'Belum Rank'
+        default_rank_title = 'Rank 0'
         settings_obj = GeneralSetting.objects.order_by('-updated_at').first()
         active_def = get_active_member_definition(settings_obj)
 
@@ -2760,6 +2812,10 @@ class RankStatusView(APIView):
         current_level = RankLevel.objects.filter(rank=current_rank).first() if current_rank is not None else None
         current_title = current_level.title if current_level else None
 
+        # Basis evaluasi rank yang aktif (dari GeneralSetting) — mis. "downlines_active"
+        flags = get_rank_evaluation_flags()
+        progress_basis = next((k for k, v in flags.items() if v), None)
+
         next_level = None
         if current_rank is None:
             next_level = RankLevel.objects.order_by('rank').first()
@@ -2781,6 +2837,7 @@ class RankStatusView(APIView):
             'next_required_downlines_active': next_level.downlines_active_required if next_level else None,
             'next_required_deposit_self_total': str(next_level.deposit_self_total_required) if next_level else None,
             'next_required_team_deposit_level_1_total': str(next_level.team_deposit_level_1_total_required) if next_level else None,
+            'progress_basis': progress_basis,
         }, status=status.HTTP_200_OK)
 
 

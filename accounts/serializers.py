@@ -281,17 +281,19 @@ class AccountInfoSerializer(serializers.ModelSerializer):
     active_investments_count = serializers.SerializerMethodField()
 
     avatar = serializers.SerializerMethodField()
+    rank_title = serializers.SerializerMethodField()
+    total_claimed_profit = serializers.SerializerMethodField()
 
     class Meta:
         model = User
         fields = ('id', 'username', 'email', 'full_name', 'phone', 'telegram', 'avatar', 'balance', 
                  'balance_deposit', 'balance_hold', 'balance_cashback', 'referral_by_username', 'referral_by_phone', 
                  'root_parent_username', 'root_parent_phone',
-                 'referral_code', 'rank', 'created_at', 'updated_at', 'ip_address', 'active_investments_count')
+                 'referral_code', 'rank', 'rank_title', 'created_at', 'updated_at', 'ip_address', 'active_investments_count', 'total_claimed_profit')
         read_only_fields = ('id', 'username', 'email', 'full_name', 'phone', 'telegram', 'balance', 
                            'balance_deposit', 'balance_hold', 'balance_cashback', 'referral_by_username', 'referral_by_phone', 
                            'root_parent_username', 'root_parent_phone',
-                           'referral_code', 'rank', 'created_at', 'updated_at', 'active_investments_count')
+                           'referral_code', 'rank', 'rank_title', 'created_at', 'updated_at', 'active_investments_count', 'total_claimed_profit')
 
     def get_avatar(self, obj):
         if obj.avatar:
@@ -301,8 +303,22 @@ class AccountInfoSerializer(serializers.ModelSerializer):
             return obj.avatar.url
         return None
 
+    def get_rank_title(self, obj):
+        """Judul rank user (contoh: "Rank 0") dari konfigurasi RankLevel"""
+        rank_title_map = dict(
+            RankLevel.objects.all().values_list('rank', 'title')
+        )
+        return rank_title_map.get(obj.rank) or 'Rank 0'
+
     def get_active_investments_count(self, obj):
         return Investment.objects.filter(user=obj, status='ACTIVE').count()
+
+    def get_total_claimed_profit(self, obj):
+        """Total profit yang sudah diterima dari SEMUA investasi (awal sampai akhir)"""
+        total = Investment.objects.filter(user=obj).aggregate(
+            total=Sum('total_claimed_profit')
+        )['total'] or 0
+        return str(total)
 
     def get_ip_address(self, obj):
         request = self.context.get('request')

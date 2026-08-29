@@ -3,8 +3,8 @@ from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.permissions import AllowAny, IsAdminUser, IsAuthenticated
 from drf_spectacular.utils import extend_schema_view, extend_schema, OpenApiResponse
 
-from .models import News
-from .serializers import NewsSerializer
+from .models import News, NewsCategory
+from .serializers import NewsSerializer, NewsCategorySerializer
 
 USER_TAG = "User API"
 ADMIN_TAG = "Admin API"
@@ -33,5 +33,27 @@ class NewsViewSet(viewsets.ModelViewSet):
         qs = super().get_queryset()
         user = getattr(self, 'request', None).user if getattr(self, 'request', None) else None
         if not user or not getattr(user, 'is_staff', False):
-            return qs.filter(is_published=True)
-        return qs
+            qs = qs.filter(is_published=True)
+        category = self.request.query_params.get('category')
+        if category:
+            qs = qs.filter(category__slug=category)
+        return qs.select_related('category')
+
+
+@extend_schema_view(
+    list=extend_schema(tags=[USER_TAG], responses={200: OpenApiResponse(description='List of news categories')}),
+    retrieve=extend_schema(tags=[USER_TAG], responses={200: OpenApiResponse(description='News category detail')}),
+    create=extend_schema(tags=[ADMIN_TAG]),
+    update=extend_schema(tags=[ADMIN_TAG]),
+    partial_update=extend_schema(tags=[ADMIN_TAG]),
+    destroy=extend_schema(tags=[ADMIN_TAG])
+)
+class NewsCategoryViewSet(viewsets.ModelViewSet):
+    queryset = NewsCategory.objects.all()
+    serializer_class = NewsCategorySerializer
+    lookup_field = 'slug'
+
+    def get_permissions(self):
+        if self.action in ['list', 'retrieve']:
+            return [AllowAny()]
+        return [IsAdminUser()]

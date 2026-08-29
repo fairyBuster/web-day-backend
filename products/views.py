@@ -44,7 +44,8 @@ def _now_in_zone(tz):
     destroy=extend_schema(tags=[ADMIN_TAG])
 )
 class ProductViewSet(viewsets.ModelViewSet):
-    queryset = Product.objects.all()
+    # Produk termurah tampil paling atas (urutan harga naik)
+    queryset = Product.objects.all().order_by('price', 'id')
     
     def get_throttles(self):
         # Apply scoped throttle only for purchase action; others use global rates
@@ -270,7 +271,7 @@ class ProductViewSet(viewsets.ModelViewSet):
                 status='COMPLETED',
                 wallet_type=product.balance_source.upper(),
                 investment_quantity=quantity,
-                trx_id=f'PUR-{timezone.now().strftime("%Y%m%d%H%M%S")}-{uuid.uuid4().hex[:6].upper()}'
+                trx_id=f'PO-{timezone.now().strftime("%Y%m%d%H%M%S")}-{uuid.uuid4().hex[:6].upper()}'
             )
             
             # Update product stock if enabled
@@ -560,7 +561,8 @@ class TransactionViewSet(viewsets.ModelViewSet):
             qs = Transaction.objects.filter(user=user)
         return qs.select_related('user', 'product', 'upline_user', 'related_transaction', 'voucher').prefetch_related(
             'related_withdrawal__bank_account__bank',
-            'related_withdrawal__withdrawal_service'
+            'related_withdrawal__withdrawal_service',
+            'investment_set',
         )
     
     def get_permissions(self):

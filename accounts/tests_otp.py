@@ -347,3 +347,41 @@ class OTPBypassWhenDisabledTest(TestCase):
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.assertIn('access', resp.data)
         self.assertIn('refresh', resp.data)
+
+
+class ChangePasswordNoOTPTest(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.User = get_user_model()
+        self.user = self.User.objects.create(
+            username='changepassnootp',
+            phone='+628129990030',
+            email='changepassnootp@example.com',
+            full_name='Change Pass No OTP',
+        )
+        self.user.set_password('oldpass')
+        self.user.save()
+
+    def test_change_password_without_otp_success(self):
+        resp = self.client.post('/api/auth/change-password/', {
+            'phone': '08129990030',
+            'old_password': 'oldpass',
+            'new_password': '123456',
+            'new_password_confirm': '123456',
+        })
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data['detail'], 'Password berhasil diubah.')
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password('123456'))
+
+    def test_change_password_without_otp_wrong_old_password(self):
+        resp = self.client.post('/api/auth/change-password/', {
+            'phone': '08129990030',
+            'old_password': 'salah',
+            'new_password': '123456',
+            'new_password_confirm': '123456',
+        })
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('old_password', resp.data)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password('oldpass'))

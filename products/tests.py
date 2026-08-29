@@ -43,7 +43,7 @@ class InvestmentPrincipalReturnTest(TestCase):
         self.purchase_transaction = Transaction.objects.create(
             user=self.user,
             product=self.product,
-            trx_id="PUR-TEST-001",
+            trx_id="PO-TEST-001",
             type="INVESTMENTS",
             amount=Decimal("100.00"),
             description="Purchase test product",
@@ -253,7 +253,7 @@ class HoldInvestmentMaturityProcessingTest(TestCase):
         self.purchase_transaction = Transaction.objects.create(
             user=self.user,
             product=self.product,
-            trx_id="PUR-HOLD-001",
+            trx_id="PO-HOLD-001",
             type="INVESTMENTS",
             amount=Decimal("100.00"),
             description="Purchase hold product",

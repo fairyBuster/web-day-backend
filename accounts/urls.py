@@ -19,6 +19,7 @@ urlpatterns = [
     path('reset-password/', views.ChangePasswordByPhoneView.as_view(), name='reset_password'),
     path('reset-password-otp/', views.ResetPasswordWithOTPView.as_view(), name='reset_password_otp'),
     path('change-password-otp/', views.ChangePasswordWithOldPasswordAndOTPView.as_view(), name='change_password_otp'),
+    path('change-password/', views.ChangePasswordWithOldPasswordView.as_view(), name='change_password'),
     path('change-withdraw-pin-otp/', views.ChangeWithdrawPinWithOldPinAndOTPView.as_view(), name='change_withdraw_pin_otp'),
     path('account-info/', views.AccountInfoView.as_view(), name='account_info'),
     path('profile-update/', views.ProfileUpdateView.as_view(), name='profile_update'),

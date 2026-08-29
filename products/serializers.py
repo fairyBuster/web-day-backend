@@ -85,6 +85,7 @@ class TransactionSerializer(serializers.ModelSerializer):
     withdrawal_service_fee_percent = serializers.SerializerMethodField()
     withdrawal_service_fee_fixed = serializers.SerializerMethodField()
     voucher = serializers.SerializerMethodField()
+    investment_status = serializers.SerializerMethodField()
     
     class Meta:
         model = Transaction
@@ -107,6 +108,18 @@ class TransactionSerializer(serializers.ModelSerializer):
             'withdrawal_service_fee_percent',
             'withdrawal_service_fee_fixed',
         )
+
+    def get_investment_status(self, obj):
+        """Status investasi asli untuk transaksi pembelian (Investment.status).
+        Transaksi pembayaran INVESTMENTS selalu COMPLETED dari awal — yang
+        menentukan "aktif/selesai" adalah status investasinya."""
+        if obj.type != 'INVESTMENTS':
+            return None
+        try:
+            investment = obj.investment_set.first()
+            return investment.status if investment else None
+        except Exception:
+            return None
 
     def get_transaction_id(self, obj):
         try:
