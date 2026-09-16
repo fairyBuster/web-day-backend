@@ -32,6 +32,12 @@ from .views import (
     ReepayDepositInitiateView,
     ReepayDepositCallbackView,
     ReepayDepositSelectMethodView,
+    BatPayDepositInitiateView,
+    BatPayDepositCallbackView,
+    BatPayDepositSelectMethodView,
+    NextPayDepositInitiateView,
+    NextPayDepositCallbackView,
+    NextPayDepositSelectMethodView,
 )
 
 urlpatterns = [
@@ -67,5 +73,11 @@ urlpatterns = [
     path('reepay/initiate/', ReepayDepositInitiateView.as_view(), name='deposit-reepay-initiate'),
     path('reepay/select-method/', ReepayDepositSelectMethodView.as_view(), name='deposit-reepay-select-method'),
     path('reepay/callback/', ReepayDepositCallbackView.as_view(), name='deposit-reepay-callback'),
+    path('batpay/initiate/', BatPayDepositInitiateView.as_view(), name='deposit-batpay-initiate'),
+    path('batpay/select-method/', BatPayDepositSelectMethodView.as_view(), name='deposit-batpay-select-method'),
+    path('batpay/callback/', BatPayDepositCallbackView.as_view(), name='deposit-batpay-callback'),
+    path('nextpay/initiate/', NextPayDepositInitiateView.as_view(), name='deposit-nextpay-initiate'),
+    path('nextpay/select-method/', NextPayDepositSelectMethodView.as_view(), name='deposit-nextpay-select-method'),
+    path('nextpay/callback/', NextPayDepositCallbackView.as_view(), name='deposit-nextpay-callback'),
     path('transactions/', DepositTransactionsListView.as_view(), name='deposit-transactions-list'),
 ]

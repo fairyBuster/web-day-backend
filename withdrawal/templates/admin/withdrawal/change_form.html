@@ -464,4 +464,115 @@
       <p style="color: #999;">Reepay payout tidak aktif. Aktifkan di WithdrawalSettings dan isi konfigurasi api_key/secret_key.</p>
     {% endif %}
   </div>
+
+  <!-- BatPay Payout Section -->
+  <div class="module" style="margin-top: 30px; border: 1px solid #ccc; border-radius: 5px; padding: 20px;">
+    <h2>Process via BatPay</h2>
+    {% if batpay_payout_enabled %}
+      <form method="post" action="{{ process_batpay_url }}">
+        {% csrf_token %}
+        <fieldset class="module aligned">
+          <div class="form-row">
+            <div>
+              <label for="id_bp_bank_code">Bank Code</label>
+              {% if batpay_bank_codes %}
+                <select id="id_bp_bank_code" name="bank_code" required>
+                  {% for b in batpay_bank_codes %}
+                    <option value="{{ b.bank_code }}" {% if batpay_payout_initial.bank_code == b.bank_code %}selected{% endif %}>
+                      {{ b.bank_code }} - {{ b.bank_name }}
+                    </option>
+                  {% endfor %}
+                </select>
+              {% else %}
+                <input type="text" id="id_bp_bank_code" name="bank_code" value="{{ batpay_payout_initial.bank_code }}" />
+              {% endif %}
+              {% if batpay_bank_codes_error %}<p style="color:#b00; margin-top: 6px;">Gagal mengambil daftar bank BatPay: {{ batpay_bank_codes_error }}</p>{% endif %}
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div>
+              <label for="id_bp_destination_account">Account Number</label>
+              <input type="text" id="id_bp_destination_account" name="destination_account" value="{{ batpay_payout_initial.destination_account }}" required />
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div>
+              <label for="id_bp_account_holder_name">Account Holder Name</label>
+              <input type="text" id="id_bp_account_holder_name" name="account_holder_name" value="{{ batpay_payout_initial.account_holder_name }}" />
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div>
+              <label for="id_bp_amount">Amount</label>
+              <input type="number" step="1" id="id_bp_amount" name="amount" value="{{ batpay_payout_initial.amount }}" required />
+            </div>
+          </div>
+        </fieldset>
+
+        <div class="submit-row">
+          <button type="submit" class="default">Submit to BatPay</button>
+        </div>
+      </form>
+    {% else %}
+      <p style="color: #999;">BatPay payout tidak aktif. Aktifkan di WithdrawalSettings dan isi konfigurasi api_key/secret_key.</p>
+    {% endif %}
+  </div>
+  <!-- NextPay Payout Section -->
+  <div class="module" style="margin-top: 30px; border: 1px solid #ccc; border-radius: 5px; padding: 20px;">
+    <h2>Process via NextPay</h2>
+    {% if nextpay_payout_enabled %}
+      <form method="post" action="{{ process_nextpay_url }}">
+        {% csrf_token %}
+        <fieldset class="module aligned">
+          <div class="form-row">
+            <div>
+              <label for="id_np_bank_code">Bank Code</label>
+              {% if nextpay_bank_codes %}
+                <select id="id_np_bank_code" name="bank_code" required>
+                  {% for b in nextpay_bank_codes %}
+                    <option value="{{ b.bank_code }}" {% if nextpay_payout_initial.bank_code == b.bank_code %}selected{% endif %}>
+                      {{ b.bank_code }} - {{ b.bank_name }}
+                    </option>
+                  {% endfor %}
+                </select>
+              {% else %}
+                <input type="text" id="id_np_bank_code" name="bank_code" value="{{ nextpay_payout_initial.bank_code }}" />
+              {% endif %}
+              {% if nextpay_bank_codes_error %}<p style="color:#b00; margin-top: 6px;">Gagal mengambil daftar bank NextPay: {{ nextpay_bank_codes_error }}</p>{% endif %}
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div>
+              <label for="id_np_destination_account">Account Number</label>
+              <input type="text" id="id_np_destination_account" name="destination_account" value="{{ nextpay_payout_initial.destination_account }}" required />
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div>
+              <label for="id_np_account_holder_name">Account Holder Name</label>
+              <input type="text" id="id_np_account_holder_name" name="account_holder_name" value="{{ nextpay_payout_initial.account_holder_name }}" />
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div>
+              <label for="id_np_amount">Amount</label>
+              <input type="number" step="1" id="id_np_amount" name="amount" value="{{ nextpay_payout_initial.amount }}" required />
+            </div>
+          </div>
+        </fieldset>
+
+        <div class="submit-row">
+          <button type="submit" class="default">Submit to NextPay</button>
+        </div>
+      </form>
+    {% else %}
+      <p style="color: #999;">NextPay payout tidak aktif. Aktifkan di WithdrawalSettings dan isi konfigurasi api_key/secret_key.</p>
+    {% endif %}
+  </div>
 {% endblock %}

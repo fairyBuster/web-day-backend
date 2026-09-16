@@ -72,6 +72,16 @@ from .integrations.reepay import (
     verify_callback_signature as reepay_verify_callback_signature,
     extract_callback_field as reepay_extract_callback_field,
 )
+from .integrations.batpay import (
+    post_json as batpay_post_json,
+    verify_callback_signature as batpay_verify_callback_signature,
+    extract_callback_field as batpay_extract_callback_field,
+)
+from .integrations.nextpay import (
+    post_json as nextpay_post_json,
+    verify_callback_signature as nextpay_verify_callback_signature,
+    extract_callback_field as nextpay_extract_callback_field,
+)
 from withdrawal.integrations.jayapay import sign_params_legacy
 from .integrations.klikpay import build_params as klikpay_build_params, sign_params as klikpay_sign_params, send_prepaid_request as klikpay_send_prepaid
 from .utils import verify_jayapay_signature
@@ -4802,3 +4812,617 @@ class ReepayDepositSelectMethodView(APIView):
             status=status.HTTP_400_BAD_REQUEST,
         )
 
+
+# BatPay Gateway Views (HMAC-SHA256, skema sama seperti Reepay)
+# ============================================================
+def _batpay_raw_body(request) -> str:
+    raw = request.body or b""
+    try:
+        return raw.decode("utf-8")
+    except Exception:
+        return ""
+
+
+def _batpay_callback_payload(request) -> dict:
+    raw = _batpay_raw_body(request)
+    if raw:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    if isinstance(getattr(request, "data", None), dict):
+        return request.data
+    return {}
+
+
+def _batpay_verify_callback(request, secret: str) -> bool:
+    timestamp = (request.META.get("HTTP_X_TIMESTAMP") or "").strip()
+    signature = (request.META.get("HTTP_X_SIGNATURE") or "").strip()
+    webhook_path = request.path
+    raw_body = _batpay_raw_body(request)
+    return batpay_verify_callback_signature(secret, timestamp, webhook_path, raw_body, signature)
+
+
+def _batpay_handle_payment_callback(request, payload: dict):
+    """Proses callback payment.paid dari BatPay (deposit)."""
+    gs = GatewaySettings.objects.order_by("-updated_at").first()
+    secret_key = (gs.batpay_secret_key or "").strip() if gs else ""
+
+    event = str(batpay_extract_callback_field(payload, "event") or "").strip()
+    merchant_ref = str(batpay_extract_callback_field(payload, "merchant_ref") or "").strip()
+
+    if not merchant_ref:
+        return
+
+    sign_valid = _batpay_verify_callback(request, secret_key)
+
+    trx = Transaction.objects.filter(trx_id=merchant_ref).first()
+    dep = Deposit.objects.filter(order_num=merchant_ref, gateway="BATPAY").first()
+
+    if dep:
+        cb = dict(payload)
+        cb["_sign_valid"] = sign_valid
+        dep.callback_payload = cb
+        dep.callback_at = timezone.now()
+        dep.save(update_fields=["callback_payload", "callback_at"])
+
+    if not trx or not sign_valid:
+        return
+
+    if event == "payment.paid":
+        paid_amount = None
+        amount_val = batpay_extract_callback_field(payload, "amount")
+        if amount_val is not None:
+            try:
+                paid_amount = Decimal(str(amount_val)).quantize(Decimal("0.01"))
+            except Exception:
+                paid_amount = None
+        _ppaypros_complete_deposit(trx, dep, paid_amount=paid_amount)
+    elif event in ("payment.failed", "payment.expired"):
+        _ppaypros_mark_deposit_failed(trx, dep)
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class BatPayDepositInitiateView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_scope = "deposit_initiate"
+
+    @extend_schema(
+        summary="Inisiasi deposit via BatPay",
+        request={
+            "application/json": {
+                "type": "object",
+                "properties": {
+                    "amount": {"type": "number", "example": 100000},
+                    "wallet_type": {"type": "string", "enum": ["BALANCE", "BALANCE_DEPOSIT"], "example": "BALANCE"},
+                    "expiry_period": {"type": "integer", "example": 1440},
+                },
+                "required": ["amount"],
+            }
+        },
+    )
+    def post(self, request):
+        gs = GatewaySettings.objects.order_by("-updated_at").first()
+        enabled = bool(gs and gs.batpay_enabled)
+        api_url = (gs.batpay_api_url or "https://api.wayrooou.online").strip() if gs else ""
+        api_key = (gs.batpay_api_key or "").strip() if gs else ""
+        secret_key = (gs.batpay_secret_key or "").strip() if gs else ""
+        return_url = (gs.batpay_return_url or "").strip() if gs else ""
+        min_deposit_amount = (gs.min_deposit_amount or Decimal("0")) if gs else Decimal("0")
+        max_deposit_amount = (gs.max_deposit_amount or Decimal("0")) if gs else Decimal("0")
+
+        if not enabled:
+            return Response({"detail": PG_INACTIVE_MESSAGE}, status=status.HTTP_400_BAD_REQUEST)
+        if not api_key or not secret_key:
+            return Response({"detail": "Konfigurasi BatPay belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
+
+        wallet_type = (request.data.get("wallet_type") or gs.default_wallet_type or "BALANCE").strip().upper()
+        if wallet_type not in ("BALANCE", "BALANCE_DEPOSIT"):
+            return Response({"detail": "wallet_type tidak valid"}, status=status.HTTP_400_BAD_REQUEST)
+
+        amount_raw = request.data.get("amount")
+        try:
+            amount = Decimal(str(amount_raw)).quantize(Decimal("0.01"))
+            if amount <= 0:
+                raise InvalidOperation()
+        except Exception:
+            return Response({"detail": "amount tidak valid"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if min_deposit_amount and min_deposit_amount > 0 and amount < min_deposit_amount:
+            return Response({"detail": f"Minimal deposit adalah {min_deposit_amount}"}, status=status.HTTP_400_BAD_REQUEST)
+        if max_deposit_amount and max_deposit_amount > 0 and amount > max_deposit_amount:
+            return Response({"detail": f"Maksimal deposit adalah {max_deposit_amount}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = request.user
+        order_num = f"DBP{_now_wib().strftime('%y%m%d%H%M%S')}{uuid.uuid4().hex[:8].upper()}"
+        # BatPay hanya menerima nominal integer IDR
+        amount_int = int(round(float(amount)))
+
+        trx = Transaction.objects.create(
+            user=user,
+            product=None,
+            type="DEPOSIT",
+            amount=amount,
+            currency_code="IDR",
+            description=f"Deposit via BatPay ({wallet_type})",
+            status="PENDING",
+            wallet_type=wallet_type,
+            trx_id=order_num,
+        )
+
+        payload = {
+            "amount": amount_int,
+            "method": "",
+            "merchant_ref": order_num,
+            "customer_name": (user.full_name or user.username or "")[:100],
+            "customer_email": (getattr(user, "email", "") or "")[:100],
+            "customer_phone": (getattr(user, "phone", "") or "")[:32],
+            "description": f"Deposit BatPay ({wallet_type})"[:100],
+        }
+        if return_url:
+            payload["return_url"] = return_url
+        expiry_period = request.data.get("expiry_period")
+        if expiry_period is not None:
+            try:
+                payload["expiry_period"] = int(expiry_period)
+            except Exception:
+                pass
+
+        dep = Deposit.objects.create(
+            user=user,
+            gateway="BATPAY",
+            order_num=order_num,
+            amount=amount,
+            amount_currency_code="IDR",
+            wallet_type=wallet_type,
+            status="PENDING",
+            transaction=trx,
+            request_params=payload,
+        )
+
+        resp_data, http_status = batpay_post_json(
+            api_key, secret_key, "/gateway/charge/create", payload, base_url=api_url
+        )
+
+        dep.response_payload = resp_data
+        dep.save(update_fields=["response_payload"])
+
+        if resp_data.get("success"):
+            data = resp_data.get("data") if isinstance(resp_data.get("data"), dict) else {}
+            pay_url = (data.get("pay_url") or "").strip()
+            ref_id = (data.get("ref_id") or "").strip()
+            if pay_url:
+                dep.payment_url = pay_url
+                dep.save(update_fields=["payment_url"])
+
+            return Response(
+                {
+                    "order_num": order_num,
+                    "ref_id": ref_id,
+                    "amount": amount_int,
+                    "pay_url": pay_url or None,
+                    "expires_at": data.get("expires_at"),
+                    "provider": resp_data,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        _ppaypros_mark_deposit_failed(trx, dep)
+
+        detail_msg = (
+            resp_data.get("message")
+            or resp_data.get("detail")
+            or resp_data.get("msg")
+            or ""
+        )
+        if isinstance(detail_msg, str) and _looks_like_html(detail_msg):
+            detail_msg = "Layanan sedang tidak tersedia"
+
+        return Response(
+            {"detail": detail_msg or "BatPay payin gagal", "provider": resp_data},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+@method_decorator(csrf_exempt, name="dispatch")
+class BatPayDepositCallbackView(APIView):
+    permission_classes = [permissions.AllowAny]
+    throttle_scope = "gateway_callback"
+
+    @extend_schema(summary="Callback BatPay untuk update status deposit")
+    def post(self, request):
+        payload = _batpay_callback_payload(request)
+        event = str(batpay_extract_callback_field(payload, "event") or "").strip()
+
+        # Webhook BatPay: route event disbursement.* ke handler withdrawal
+        if event.startswith(("withdraw.", "disbursement.")):
+            try:
+                from withdrawal.views import _batpay_handle_withdraw_callback
+                _batpay_handle_withdraw_callback(request, payload)
+            except Exception as e:
+                logger.warning("BATPAY: gagal route withdraw callback: %s", e)
+            return HttpResponse("OK", content_type="text/plain")
+
+        _batpay_handle_payment_callback(request, payload)
+        return HttpResponse("OK", content_type="text/plain")
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class BatPayDepositSelectMethodView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_scope = "deposit_initiate"
+
+    @extend_schema(
+        summary="Pilih metode pembayaran BatPay langsung via API (tanpa halaman pembayaran)",
+        request={
+            "application/json": {
+                "type": "object",
+                "properties": {
+                    "ref_id": {"type": "string", "example": "TXN260815AB12CD34"},
+                    "method": {"type": "string", "enum": ["QRIS", "BRI", "PERMATA", "MANDIRI"], "example": "QRIS"},
+                },
+                "required": ["ref_id", "method"],
+            }
+        },
+    )
+    def post(self, request):
+        gs = GatewaySettings.objects.order_by("-updated_at").first()
+        enabled = bool(gs and gs.batpay_enabled)
+        api_url = (gs.batpay_api_url or "https://api.wayrooou.online").strip() if gs else ""
+        api_key = (gs.batpay_api_key or "").strip() if gs else ""
+        secret_key = (gs.batpay_secret_key or "").strip() if gs else ""
+
+        if not enabled:
+            return Response({"detail": PG_INACTIVE_MESSAGE}, status=status.HTTP_400_BAD_REQUEST)
+        if not api_key or not secret_key:
+            return Response({"detail": "Konfigurasi BatPay belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
+
+        ref_id = str(request.data.get("ref_id") or "").strip()
+        method = str(request.data.get("method") or "").strip().upper()
+
+        if not ref_id:
+            return Response({"detail": "ref_id wajib diisi"}, status=status.HTTP_400_BAD_REQUEST)
+        if method not in ("QRIS", "BRI", "PERMATA", "MANDIRI"):
+            return Response({"detail": "method harus salah satu dari QRIS, BRI, PERMATA, MANDIRI"}, status=status.HTTP_400_BAD_REQUEST)
+
+        resp_data, _http_status = batpay_post_json(
+            api_key,
+            secret_key,
+            f"/gateway/charge/{ref_id}/method",
+            {"method": method},
+            base_url=api_url,
+        )
+
+        if resp_data.get("success"):
+            data = resp_data.get("data") if isinstance(resp_data.get("data"), dict) else {}
+            return Response(
+                {
+                    "ref_id": (data.get("ref_id") or "").strip(),
+                    "merchant_ref": (data.get("merchant_ref") or "").strip(),
+                    "method": (data.get("method") or method).strip(),
+                    "pay_data": (data.get("pay_data") or "").strip(),
+                    "pay_data_type": (data.get("pay_data_type") or "").strip(),
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        detail_msg = (
+            resp_data.get("message")
+            or resp_data.get("detail")
+            or resp_data.get("msg")
+            or ""
+        )
+        if isinstance(detail_msg, str) and _looks_like_html(detail_msg):
+            detail_msg = "Layanan sedang tidak tersedia"
+
+        return Response(
+            {"detail": detail_msg or "Gagal memilih metode pembayaran", "provider": resp_data},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+def _nextpay_raw_body(request) -> str:
+    raw = request.body or b""
+    try:
+        return raw.decode("utf-8")
+    except Exception:
+        return ""
+
+
+def _nextpay_callback_payload(request) -> dict:
+    raw = _nextpay_raw_body(request)
+    if raw:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    if isinstance(getattr(request, "data", None), dict):
+        return request.data
+    return {}
+
+
+def _nextpay_verify_callback(request, secret: str) -> bool:
+    timestamp = (request.META.get("HTTP_X_TIMESTAMP") or "").strip()
+    signature = (request.META.get("HTTP_X_SIGNATURE") or "").strip()
+    webhook_path = request.path
+    raw_body = _nextpay_raw_body(request)
+    return nextpay_verify_callback_signature(secret, timestamp, webhook_path, raw_body, signature)
+
+
+def _nextpay_handle_payment_callback(request, payload: dict):
+    """Proses callback payment.paid dari NextPay (deposit)."""
+    gs = GatewaySettings.objects.order_by("-updated_at").first()
+    secret_key = (gs.nextpay_secret_key or "").strip() if gs else ""
+
+    event = str(nextpay_extract_callback_field(payload, "event") or "").strip()
+    merchant_ref = str(nextpay_extract_callback_field(payload, "merchant_ref") or "").strip()
+
+    if not merchant_ref:
+        return
+
+    sign_valid = _nextpay_verify_callback(request, secret_key)
+
+    trx = Transaction.objects.filter(trx_id=merchant_ref).first()
+    dep = Deposit.objects.filter(order_num=merchant_ref, gateway="NEXTPAY").first()
+
+    if dep:
+        cb = dict(payload)
+        cb["_sign_valid"] = sign_valid
+        dep.callback_payload = cb
+        dep.callback_at = timezone.now()
+        dep.save(update_fields=["callback_payload", "callback_at"])
+
+    if not trx or not sign_valid:
+        return
+
+    if event == "payment.paid":
+        paid_amount = None
+        amount_val = nextpay_extract_callback_field(payload, "amount")
+        if amount_val is not None:
+            try:
+                paid_amount = Decimal(str(amount_val)).quantize(Decimal("0.01"))
+            except Exception:
+                paid_amount = None
+        _ppaypros_complete_deposit(trx, dep, paid_amount=paid_amount)
+    elif event in ("payment.failed", "payment.expired"):
+        _ppaypros_mark_deposit_failed(trx, dep)
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class NextPayDepositInitiateView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_scope = "deposit_initiate"
+
+    @extend_schema(
+        summary="Inisiasi deposit via NextPay",
+        request={
+            "application/json": {
+                "type": "object",
+                "properties": {
+                    "amount": {"type": "number", "example": 100000},
+                    "wallet_type": {"type": "string", "enum": ["BALANCE", "BALANCE_DEPOSIT"], "example": "BALANCE"},
+                    "expiry_period": {"type": "integer", "example": 1440},
+                },
+                "required": ["amount"],
+            }
+        },
+    )
+    def post(self, request):
+        gs = GatewaySettings.objects.order_by("-updated_at").first()
+        enabled = bool(gs and gs.nextpay_enabled)
+        api_url = (gs.nextpay_api_url or "https://api.nextcdn.online").strip() if gs else ""
+        api_key = (gs.nextpay_api_key or "").strip() if gs else ""
+        secret_key = (gs.nextpay_secret_key or "").strip() if gs else ""
+        return_url = (gs.nextpay_return_url or "").strip() if gs else ""
+        min_deposit_amount = (gs.min_deposit_amount or Decimal("0")) if gs else Decimal("0")
+        max_deposit_amount = (gs.max_deposit_amount or Decimal("0")) if gs else Decimal("0")
+
+        if not enabled:
+            return Response({"detail": PG_INACTIVE_MESSAGE}, status=status.HTTP_400_BAD_REQUEST)
+        if not api_key or not secret_key:
+            return Response({"detail": "Konfigurasi NextPay belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
+
+        wallet_type = (request.data.get("wallet_type") or gs.default_wallet_type or "BALANCE").strip().upper()
+        if wallet_type not in ("BALANCE", "BALANCE_DEPOSIT"):
+            return Response({"detail": "wallet_type tidak valid"}, status=status.HTTP_400_BAD_REQUEST)
+
+        amount_raw = request.data.get("amount")
+        try:
+            amount = Decimal(str(amount_raw)).quantize(Decimal("0.01"))
+            if amount <= 0:
+                raise InvalidOperation()
+        except Exception:
+            return Response({"detail": "amount tidak valid"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if min_deposit_amount and min_deposit_amount > 0 and amount < min_deposit_amount:
+            return Response({"detail": f"Minimal deposit adalah {min_deposit_amount}"}, status=status.HTTP_400_BAD_REQUEST)
+        if max_deposit_amount and max_deposit_amount > 0 and amount > max_deposit_amount:
+            return Response({"detail": f"Maksimal deposit adalah {max_deposit_amount}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = request.user
+        order_num = f"DNP{_now_wib().strftime('%y%m%d%H%M%S')}{uuid.uuid4().hex[:8].upper()}"
+        # NextPay hanya menerima nominal integer IDR
+        amount_int = int(round(float(amount)))
+
+        trx = Transaction.objects.create(
+            user=user,
+            product=None,
+            type="DEPOSIT",
+            amount=amount,
+            currency_code="IDR",
+            description=f"Deposit via NextPay ({wallet_type})",
+            status="PENDING",
+            wallet_type=wallet_type,
+            trx_id=order_num,
+        )
+
+        payload = {
+            "amount": amount_int,
+            "method": "",
+            "merchant_ref": order_num,
+            "customer_name": (user.full_name or user.username or "")[:100],
+            "customer_email": (getattr(user, "email", "") or "")[:100],
+            "customer_phone": (getattr(user, "phone", "") or "")[:32],
+            "description": f"Deposit NextPay ({wallet_type})"[:100],
+        }
+        if return_url:
+            payload["return_url"] = return_url
+        expiry_period = request.data.get("expiry_period")
+        if expiry_period is not None:
+            try:
+                payload["expiry_period"] = int(expiry_period)
+            except Exception:
+                pass
+
+        dep = Deposit.objects.create(
+            user=user,
+            gateway="NEXTPAY",
+            order_num=order_num,
+            amount=amount,
+            amount_currency_code="IDR",
+            wallet_type=wallet_type,
+            status="PENDING",
+            transaction=trx,
+            request_params=payload,
+        )
+
+        resp_data, http_status = nextpay_post_json(
+            api_key, secret_key, "/gateway/charge/create", payload, base_url=api_url
+        )
+
+        dep.response_payload = resp_data
+        dep.save(update_fields=["response_payload"])
+
+        if resp_data.get("success"):
+            data = resp_data.get("data") if isinstance(resp_data.get("data"), dict) else {}
+            pay_url = (data.get("pay_url") or "").strip()
+            ref_id = (data.get("ref_id") or "").strip()
+            if pay_url:
+                dep.payment_url = pay_url
+                dep.save(update_fields=["payment_url"])
+
+            return Response(
+                {
+                    "order_num": order_num,
+                    "ref_id": ref_id,
+                    "amount": amount_int,
+                    "pay_url": pay_url or None,
+                    "expires_at": data.get("expires_at"),
+                    "provider": resp_data,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        _ppaypros_mark_deposit_failed(trx, dep)
+
+        detail_msg = (
+            resp_data.get("message")
+            or resp_data.get("detail")
+            or resp_data.get("msg")
+            or ""
+        )
+        if isinstance(detail_msg, str) and _looks_like_html(detail_msg):
+            detail_msg = "Layanan sedang tidak tersedia"
+
+        return Response(
+            {"detail": detail_msg or "NextPay payin gagal", "provider": resp_data},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+@method_decorator(csrf_exempt, name="dispatch")
+class NextPayDepositCallbackView(APIView):
+    permission_classes = [permissions.AllowAny]
+    throttle_scope = "gateway_callback"
+
+    @extend_schema(summary="Callback NextPay untuk update status deposit")
+    def post(self, request):
+        payload = _nextpay_callback_payload(request)
+        event = str(nextpay_extract_callback_field(payload, "event") or "").strip()
+
+        # Webhook NextPay: route event disbursement.* ke handler withdrawal
+        if event.startswith(("withdraw.", "disbursement.")):
+            try:
+                from withdrawal.views import _nextpay_handle_withdraw_callback
+                _nextpay_handle_withdraw_callback(request, payload)
+            except Exception as e:
+                logger.warning("NEXTPAY: gagal route withdraw callback: %s", e)
+            return HttpResponse("OK", content_type="text/plain")
+
+        _nextpay_handle_payment_callback(request, payload)
+        return HttpResponse("OK", content_type="text/plain")
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class NextPayDepositSelectMethodView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_scope = "deposit_initiate"
+
+    @extend_schema(
+        summary="Pilih metode pembayaran NextPay langsung via API (tanpa halaman pembayaran)",
+        request={
+            "application/json": {
+                "type": "object",
+                "properties": {
+                    "ref_id": {"type": "string", "example": "TXN260815AB12CD34"},
+                    "method": {"type": "string", "enum": ["QRIS", "BRI", "PERMATA", "MANDIRI"], "example": "QRIS"},
+                },
+                "required": ["ref_id", "method"],
+            }
+        },
+    )
+    def post(self, request):
+        gs = GatewaySettings.objects.order_by("-updated_at").first()
+        enabled = bool(gs and gs.nextpay_enabled)
+        api_url = (gs.nextpay_api_url or "https://api.nextcdn.online").strip() if gs else ""
+        api_key = (gs.nextpay_api_key or "").strip() if gs else ""
+        secret_key = (gs.nextpay_secret_key or "").strip() if gs else ""
+
+        if not enabled:
+            return Response({"detail": PG_INACTIVE_MESSAGE}, status=status.HTTP_400_BAD_REQUEST)
+        if not api_key or not secret_key:
+            return Response({"detail": "Konfigurasi NextPay belum lengkap"}, status=status.HTTP_400_BAD_REQUEST)
+
+        ref_id = str(request.data.get("ref_id") or "").strip()
+        method = str(request.data.get("method") or "").strip().upper()
+
+        if not ref_id:
+            return Response({"detail": "ref_id wajib diisi"}, status=status.HTTP_400_BAD_REQUEST)
+        if method not in ("QRIS", "BRI", "PERMATA", "MANDIRI"):
+            return Response({"detail": "method harus salah satu dari QRIS, BRI, PERMATA, MANDIRI"}, status=status.HTTP_400_BAD_REQUEST)
+
+        resp_data, _http_status = nextpay_post_json(
+            api_key,
+            secret_key,
+            f"/gateway/charge/{ref_id}/method",
+            {"method": method},
+            base_url=api_url,
+        )
+
+        if resp_data.get("success"):
+            data = resp_data.get("data") if isinstance(resp_data.get("data"), dict) else {}
+            return Response(
+                {
+                    "ref_id": (data.get("ref_id") or "").strip(),
+                    "merchant_ref": (data.get("merchant_ref") or "").strip(),
+                    "method": (data.get("method") or method).strip(),
+                    "pay_data": (data.get("pay_data") or "").strip(),
+                    "pay_data_type": (data.get("pay_data_type") or "").strip(),
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        detail_msg = (
+            resp_data.get("message")
+            or resp_data.get("detail")
+            or resp_data.get("msg")
+            or ""
+        )
+        if isinstance(detail_msg, str) and _looks_like_html(detail_msg):
+            detail_msg = "Layanan sedang tidak tersedia"
+
+        return Response(
+            {"detail": detail_msg or "Gagal memilih metode pembayaran", "provider": resp_data},
+            status=status.HTTP_400_BAD_REQUEST,
+        )

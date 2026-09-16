@@ -3,7 +3,7 @@ from django.conf import settings
 from django.urls import path, reverse
 from django.shortcuts import redirect
 from django.template.response import TemplateResponse
-from .models import Withdrawal, WithdrawalSettings, WithdrawalJayapay, WithdrawalService, UsdPayoutWithdrawal, JayapayPhPayoutWithdrawal, PPayProsWithdrawal, AtpayWithdrawal, BankPayWithdrawal, ReepayWithdrawal
+from .models import Withdrawal, WithdrawalSettings, WithdrawalJayapay, WithdrawalService, UsdPayoutWithdrawal, JayapayPhPayoutWithdrawal, PPayProsWithdrawal, AtpayWithdrawal, BankPayWithdrawal, ReepayWithdrawal, BatPayWithdrawal, NextPayWithdrawal
 from .integrations.jayapay import build_params, sign_params, sign_params_legacy, send_cash_request
 from .integrations.jayapay_banks import JAYAPAY_BANKS
 from .integrations.jayapay_ph_banks import JAYAPAY_PH_PAYOUT_BANKS
@@ -14,6 +14,8 @@ from deposits.integrations.ppaypros import amount_to_points as ppaypros_amount_t
 from deposits.integrations.atpay import build_bank_code_payload as atpay_build_bank_code_payload, build_payout_payload as atpay_build_payout_payload, build_payout_query_payload as atpay_build_payout_query_payload, map_payout_trade_status as atpay_map_payout_trade_status, normalize_amount as atpay_normalize_amount, normalize_sign_type as atpay_normalize_sign_type, post_json as atpay_post_json, sign_payload as atpay_sign_payload, verify_payload as atpay_verify_payload
 from deposits.integrations.bankpay import generate_sign as bankpay_generate_sign, post_form as bankpay_post_form, build_payout_payload as bankpay_build_payout_payload, fetch_bank_list as bankpay_fetch_bank_list
 from deposits.integrations.reepay import post_json as reepay_post_json
+from deposits.integrations.batpay import post_json as batpay_post_json, get_json as batpay_get_json
+from deposits.integrations.nextpay import post_json as nextpay_post_json, get_json as nextpay_get_json
 from django.utils.html import format_html
 import json
 import logging
@@ -142,7 +144,7 @@ class WithdrawalAdmin(admin.ModelAdmin):
     list_filter = ('status', 'created_at')
     search_fields = ('user__phone', 'bank_account__account_number')
     readonly_fields = ('created_at', 'updated_at')
-    actions = ['process_withdrawal_jayapay', 'process_withdrawal_bankpay', 'process_withdrawal_reepay']
+    actions = ['process_withdrawal_jayapay', 'process_withdrawal_bankpay', 'process_withdrawal_reepay', 'process_withdrawal_batpay', 'process_withdrawal_nextpay']
     change_form_template = 'admin/withdrawal/change_form.html'
     autocomplete_fields = ('user', 'bank_account', 'transaction')
     list_select_related = ('user', 'bank_account', 'transaction', 'withdrawal_service')
@@ -206,6 +208,16 @@ class WithdrawalAdmin(admin.ModelAdmin):
                 '<int:pk>/process-reepay/',
                 self.admin_site.admin_view(self.process_reepay_view),
                 name='withdrawal_withdrawal_process_reepay',
+            ),
+            path(
+                '<int:pk>/process-batpay/',
+                self.admin_site.admin_view(self.process_batpay_view),
+                name='withdrawal_withdrawal_process_batpay',
+            ),
+            path(
+                '<int:pk>/process-nextpay/',
+                self.admin_site.admin_view(self.process_nextpay_view),
+                name='withdrawal_withdrawal_process_nextpay',
             ),
         ]
         return custom + urls
@@ -972,6 +984,165 @@ class WithdrawalAdmin(admin.ModelAdmin):
 
         return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
 
+    def process_batpay_view(self, request, pk: int):
+        try:
+            wd = Withdrawal.objects.select_related('bank_account__bank', 'user', 'transaction').get(pk=pk)
+        except Withdrawal.DoesNotExist:
+            self.message_user(request, 'Withdrawal tidak ditemukan', level=messages.ERROR)
+            return redirect(reverse('admin:withdrawal_withdrawal_changelist'))
+
+        gs = WithdrawalSettings.objects.order_by("-updated_at").first()
+        enabled = bool(gs and gs.batpay_payout_enabled)
+        api_url = (gs.batpay_payout_api_url or "https://api.wayrooou.online").strip() if gs else ""
+        api_key = (gs.batpay_payout_api_key or "").strip() if gs else ""
+        secret_key = (gs.batpay_payout_secret_key or "").strip() if gs else ""
+
+        if not enabled:
+            self.message_user(request, 'BatPay payout tidak aktif', level=messages.ERROR)
+            return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+        if not api_url or not api_key or not secret_key:
+            self.message_user(request, 'Konfigurasi BatPay payout belum lengkap', level=messages.ERROR)
+            return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+
+        if request.method == "POST":
+            bank_code = (request.POST.get("bank_code") or (getattr(wd.bank_account.bank, "code", "") if wd.bank_account else "")).strip()
+            destination_account = (request.POST.get("destination_account") or (wd.bank_account.account_number if wd.bank_account else "")).strip()
+            account_holder_name = (request.POST.get("account_holder_name") or (wd.bank_account.account_name if wd.bank_account else "")).strip()
+            amount_raw = (request.POST.get("amount") or "").strip() or str(wd.net_amount or wd.amount)
+
+            if not destination_account or not amount_raw:
+                self.message_user(request, 'Account Number dan Amount wajib diisi', level=messages.ERROR)
+                return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+
+            try:
+                amount = Decimal(str(amount_raw))
+                if amount <= 0:
+                    raise InvalidOperation()
+            except Exception:
+                self.message_user(request, 'Amount tidak valid', level=messages.ERROR)
+                return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+
+            amount_int = int(round(float(amount)))
+            merchant_ref = wd.transaction.trx_id if wd.transaction else f"WBP{wd.id}{int(time.time())}"
+
+            payload = {
+                "amount": amount_int,
+                "destination_account": destination_account,
+                "bank_code": bank_code,
+                "account_holder_name": account_holder_name[:100],
+                "merchant_ref": merchant_ref,
+            }
+
+            trace, _ = BatPayWithdrawal.objects.get_or_create(withdrawal=wd, defaults={"request_params": payload})
+            if trace and not trace.request_params:
+                trace.request_params = payload
+                trace.save(update_fields=["request_params"])
+
+            resp_data, _ = batpay_post_json(api_key, secret_key, "/gateway/payout/create", payload, base_url=api_url)
+
+            if trace:
+                stored = trace.response_payload if isinstance(trace.response_payload, dict) else {}
+                stored["initiate"] = _redact_for_log(resp_data)
+                trace.response_payload = stored
+                trace.save(update_fields=["response_payload"])
+
+            if resp_data.get("success"):
+                data = resp_data.get("data") if isinstance(resp_data.get("data"), dict) else {}
+                ref_id = (data.get("ref_id") or "").strip()
+                if ref_id:
+                    note = f"BatPay ref_id: {ref_id}"
+                    wd.note = (note + chr(10) + wd.note) if wd.note else note
+                    wd.save(update_fields=["note"])
+                wd.status = 'PROCESSING'
+                wd.save(update_fields=['status'])
+                self.message_user(request, f"Withdrawal #{wd.id} dikirim ke BatPay", level=messages.SUCCESS)
+                return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+
+            detail_msg = resp_data.get("message") or resp_data.get("detail") or resp_data.get("msg") or "BatPay payout gagal"
+            self.message_user(request, f"BatPay gagal: {detail_msg}", level=messages.ERROR)
+            return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+
+        return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+    def process_nextpay_view(self, request, pk: int):
+        try:
+            wd = Withdrawal.objects.select_related('bank_account__bank', 'user', 'transaction').get(pk=pk)
+        except Withdrawal.DoesNotExist:
+            self.message_user(request, 'Withdrawal tidak ditemukan', level=messages.ERROR)
+            return redirect(reverse('admin:withdrawal_withdrawal_changelist'))
+
+        gs = WithdrawalSettings.objects.order_by("-updated_at").first()
+        enabled = bool(gs and gs.nextpay_payout_enabled)
+        api_url = (gs.nextpay_payout_api_url or "https://api.nextcdn.online").strip() if gs else ""
+        api_key = (gs.nextpay_payout_api_key or "").strip() if gs else ""
+        secret_key = (gs.nextpay_payout_secret_key or "").strip() if gs else ""
+
+        if not enabled:
+            self.message_user(request, 'NextPay payout tidak aktif', level=messages.ERROR)
+            return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+        if not api_url or not api_key or not secret_key:
+            self.message_user(request, 'Konfigurasi NextPay payout belum lengkap', level=messages.ERROR)
+            return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+
+        if request.method == "POST":
+            bank_code = (request.POST.get("bank_code") or (getattr(wd.bank_account.bank, "code", "") if wd.bank_account else "")).strip()
+            destination_account = (request.POST.get("destination_account") or (wd.bank_account.account_number if wd.bank_account else "")).strip()
+            account_holder_name = (request.POST.get("account_holder_name") or (wd.bank_account.account_name if wd.bank_account else "")).strip()
+            amount_raw = (request.POST.get("amount") or "").strip() or str(wd.net_amount or wd.amount)
+
+            if not destination_account or not amount_raw:
+                self.message_user(request, 'Account Number dan Amount wajib diisi', level=messages.ERROR)
+                return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+
+            try:
+                amount = Decimal(str(amount_raw))
+                if amount <= 0:
+                    raise InvalidOperation()
+            except Exception:
+                self.message_user(request, 'Amount tidak valid', level=messages.ERROR)
+                return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+
+            amount_int = int(round(float(amount)))
+            merchant_ref = wd.transaction.trx_id if wd.transaction else f"WNP{wd.id}{int(time.time())}"
+
+            payload = {
+                "amount": amount_int,
+                "destination_account": destination_account,
+                "bank_code": bank_code,
+                "account_holder_name": account_holder_name[:100],
+                "merchant_ref": merchant_ref,
+            }
+
+            trace, _ = NextPayWithdrawal.objects.get_or_create(withdrawal=wd, defaults={"request_params": payload})
+            if trace and not trace.request_params:
+                trace.request_params = payload
+                trace.save(update_fields=["request_params"])
+
+            resp_data, _ = nextpay_post_json(api_key, secret_key, "/gateway/payout/create", payload, base_url=api_url)
+
+            if trace:
+                stored = trace.response_payload if isinstance(trace.response_payload, dict) else {}
+                stored["initiate"] = _redact_for_log(resp_data)
+                trace.response_payload = stored
+                trace.save(update_fields=["response_payload"])
+
+            if resp_data.get("success"):
+                data = resp_data.get("data") if isinstance(resp_data.get("data"), dict) else {}
+                ref_id = (data.get("ref_id") or "").strip()
+                if ref_id:
+                    note = f"NextPay ref_id: {ref_id}"
+                    wd.note = (note + chr(10) + wd.note) if wd.note else note
+                    wd.save(update_fields=["note"])
+                wd.status = 'PROCESSING'
+                wd.save(update_fields=['status'])
+                self.message_user(request, f"Withdrawal #{wd.id} dikirim ke NextPay", level=messages.SUCCESS)
+                return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+
+            detail_msg = resp_data.get("message") or resp_data.get("detail") or resp_data.get("msg") or "NextPay payout gagal"
+            self.message_user(request, f"NextPay gagal: {detail_msg}", level=messages.ERROR)
+            return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+
+        return redirect(reverse('admin:withdrawal_withdrawal_change', args=(wd.id,)))
+
     def render_change_form(self, request, context, add=False, change=False, form_url='', obj=None):
         if obj:
             gs = WithdrawalSettings.objects.order_by("-updated_at").first()
@@ -991,6 +1162,52 @@ class WithdrawalAdmin(admin.ModelAdmin):
                 {"bank_code": c, "bank_name": n}
                 for c, n in REEPAY_FALLBACK_BANK_CODES
             ]
+            # Daftar bank BatPay: fetch dari API, fallback ke daftar statis (kode sama dengan Reepay)
+            batpay_bank_codes, batpay_bank_codes_error = [], ""
+            if gs and gs.batpay_payout_enabled and gs.batpay_payout_api_key and gs.batpay_payout_secret_key:
+                try:
+                    _resp, _ = batpay_get_json(
+                        (gs.batpay_payout_api_key or "").strip(),
+                        (gs.batpay_payout_secret_key or "").strip(),
+                        "/gateway/payout/banks",
+                        base_url=(gs.batpay_payout_api_url or "https://api.wayrooou.online").strip(),
+                    )
+                    _items = _resp.get("data", {}).get("items") if isinstance(_resp, dict) and isinstance(_resp.get("data"), dict) else None
+                    if _items:
+                        batpay_bank_codes = [
+                            {"bank_code": b.get("bank_code"), "bank_name": b.get("bank_name")}
+                            for b in _items if b.get("bank_code")
+                        ]
+                except Exception as e:
+                    batpay_bank_codes_error = str(e)
+            if not batpay_bank_codes:
+                batpay_bank_codes = [
+                    {"bank_code": c, "bank_name": n}
+                    for c, n in REEPAY_FALLBACK_BANK_CODES
+                ]
+            # Daftar bank NextPay: fetch dari API, fallback ke daftar statis (kode sama dengan Reepay)
+            nextpay_bank_codes, nextpay_bank_codes_error = [], ""
+            if gs and gs.nextpay_payout_enabled and gs.nextpay_payout_api_key and gs.nextpay_payout_secret_key:
+                try:
+                    _resp, _ = nextpay_get_json(
+                        (gs.nextpay_payout_api_key or "").strip(),
+                        (gs.nextpay_payout_secret_key or "").strip(),
+                        "/gateway/payout/banks",
+                        base_url=(gs.nextpay_payout_api_url or "https://api.nextcdn.online").strip(),
+                    )
+                    _items = _resp.get("data", {}).get("items") if isinstance(_resp, dict) and isinstance(_resp.get("data"), dict) else None
+                    if _items:
+                        nextpay_bank_codes = [
+                            {"bank_code": b.get("bank_code"), "bank_name": b.get("bank_name")}
+                            for b in _items if b.get("bank_code")
+                        ]
+                except Exception as e:
+                    nextpay_bank_codes_error = str(e)
+            if not nextpay_bank_codes:
+                nextpay_bank_codes = [
+                    {"bank_code": c, "bank_name": n}
+                    for c, n in REEPAY_FALLBACK_BANK_CODES
+                ]
             wd_bank_code = getattr(getattr(obj.bank_account, 'bank', None), 'code', '') or ''
             wd_bank_name = getattr(getattr(obj.bank_account, 'bank', None), 'name', '') or ''
             if wd_bank_code and not any(b["bank_code"] == wd_bank_code for b in reepay_bank_codes):
@@ -1096,6 +1313,26 @@ class WithdrawalAdmin(admin.ModelAdmin):
                     'amount': str(obj.net_amount or obj.amount),
                 },
                 'process_reepay_url': reverse('admin:withdrawal_withdrawal_process_reepay', args=(obj.id,)),
+                'batpay_payout_enabled': bool(gs and gs.batpay_payout_enabled),
+                'batpay_bank_codes': batpay_bank_codes,
+                'batpay_bank_codes_error': batpay_bank_codes_error,
+                'batpay_payout_initial': {
+                    'bank_code': getattr(getattr(obj.bank_account, 'bank', None), 'code', '') or '',
+                    'destination_account': obj.bank_account.account_number if obj.bank_account else '',
+                    'account_holder_name': obj.bank_account.account_name if obj.bank_account else '',
+                    'amount': str(obj.net_amount or obj.amount),
+                },
+                'process_batpay_url': reverse('admin:withdrawal_withdrawal_process_batpay', args=(obj.id,)),
+                'nextpay_payout_enabled': bool(gs and gs.nextpay_payout_enabled),
+                'nextpay_bank_codes': nextpay_bank_codes,
+                'nextpay_bank_codes_error': nextpay_bank_codes_error,
+                'nextpay_payout_initial': {
+                    'bank_code': getattr(getattr(obj.bank_account, 'bank', None), 'code', '') or '',
+                    'destination_account': obj.bank_account.account_number if obj.bank_account else '',
+                    'account_holder_name': obj.bank_account.account_name if obj.bank_account else '',
+                    'amount': str(obj.net_amount or obj.amount),
+                },
+                'process_nextpay_url': reverse('admin:withdrawal_withdrawal_process_nextpay', args=(obj.id,)),
             })
         return super().render_change_form(request, context, add, change, form_url, obj)
 
@@ -1293,6 +1530,134 @@ class WithdrawalAdmin(admin.ModelAdmin):
             self.message_user(request, f"Berhasil memproses {processed} withdrawal via Reepay.", level=messages.SUCCESS)
     process_withdrawal_reepay.short_description = 'Process via Reepay'
 
+    def process_withdrawal_batpay(self, request, queryset):
+        gs = WithdrawalSettings.objects.order_by("-updated_at").first()
+        enabled = bool(gs and gs.batpay_payout_enabled)
+        api_url = (gs.batpay_payout_api_url or "https://api.wayrooou.online").strip() if gs else ""
+        api_key = (gs.batpay_payout_api_key or "").strip() if gs else ""
+        secret_key = (gs.batpay_payout_secret_key or "").strip() if gs else ""
+
+        if not enabled:
+            self.message_user(request, 'BatPay payout tidak aktif', level=messages.ERROR)
+            return
+        if not api_url or not api_key or not secret_key:
+            self.message_user(request, 'Konfigurasi BatPay payout belum lengkap', level=messages.ERROR)
+            return
+
+        processed = 0
+        for wd in queryset.select_related('bank_account__bank', 'transaction'):
+            if wd.status not in ('PENDING', 'PROCESSING'):
+                self.message_user(request, f"Withdrawal #{wd.id} dilewati: status {wd.status}", level=messages.WARNING)
+                continue
+            if not wd.bank_account:
+                self.message_user(request, f"Withdrawal #{wd.id} gagal: tidak ada bank_account", level=messages.ERROR)
+                continue
+
+            try:
+                bank = wd.bank_account.bank
+                account_no = wd.bank_account.account_number or ""
+                account_name = wd.bank_account.account_name or ""
+                bank_code = getattr(bank, "code", "") or ""
+                net = wd.net_amount if wd.net_amount and wd.net_amount > 0 else (wd.amount - wd.fee if wd.fee else wd.amount)
+                amount_int = int(round(float(net if net else wd.amount)))
+                merchant_ref = getattr(getattr(wd, "transaction", None), "trx_id", None) or f"WBP{wd.pk}{int(time.time())}"
+
+                payload = {
+                    "amount": amount_int,
+                    "destination_account": account_no,
+                    "bank_code": bank_code,
+                    "account_holder_name": account_name[:100],
+                    "merchant_ref": merchant_ref,
+                }
+
+                resp, _ = batpay_post_json(api_key, secret_key, "/gateway/payout/create", payload, base_url=api_url)
+
+                trace, _ = BatPayWithdrawal.objects.get_or_create(withdrawal=wd, defaults={"request_params": payload})
+                if trace:
+                    if not trace.request_params:
+                        trace.request_params = payload
+                    stored = trace.response_payload if isinstance(trace.response_payload, dict) else {}
+                    stored["initiate"] = _redact_for_log(resp)
+                    trace.response_payload = stored
+                    trace.save(update_fields=["request_params", "response_payload"])
+
+                if resp.get("success"):
+                    wd.status = 'PROCESSING'
+                    wd.save()
+                    processed += 1
+                    self.message_user(request, f"Withdrawal #{wd.id} dikirim ke BatPay", level=messages.SUCCESS)
+                else:
+                    self.message_user(request, f"Withdrawal #{wd.id} gagal: {resp.get('message') or resp.get('detail') or resp.get('msg') or resp}", level=messages.ERROR)
+            except Exception as e:
+                self.message_user(request, f"Withdrawal #{wd.id} gagal dikirim: {e}", level=messages.ERROR)
+
+        if processed:
+            self.message_user(request, f"Berhasil memproses {processed} withdrawal via BatPay.", level=messages.SUCCESS)
+    def process_withdrawal_nextpay(self, request, queryset):
+        gs = WithdrawalSettings.objects.order_by("-updated_at").first()
+        enabled = bool(gs and gs.nextpay_payout_enabled)
+        api_url = (gs.nextpay_payout_api_url or "https://api.nextcdn.online").strip() if gs else ""
+        api_key = (gs.nextpay_payout_api_key or "").strip() if gs else ""
+        secret_key = (gs.nextpay_payout_secret_key or "").strip() if gs else ""
+
+        if not enabled:
+            self.message_user(request, 'NextPay payout tidak aktif', level=messages.ERROR)
+            return
+        if not api_url or not api_key or not secret_key:
+            self.message_user(request, 'Konfigurasi NextPay payout belum lengkap', level=messages.ERROR)
+            return
+
+        processed = 0
+        for wd in queryset.select_related('bank_account__bank', 'transaction'):
+            if wd.status not in ('PENDING', 'PROCESSING'):
+                self.message_user(request, f"Withdrawal #{wd.id} dilewati: status {wd.status}", level=messages.WARNING)
+                continue
+            if not wd.bank_account:
+                self.message_user(request, f"Withdrawal #{wd.id} gagal: tidak ada bank_account", level=messages.ERROR)
+                continue
+
+            try:
+                bank = wd.bank_account.bank
+                account_no = wd.bank_account.account_number or ""
+                account_name = wd.bank_account.account_name or ""
+                bank_code = getattr(bank, "code", "") or ""
+                net = wd.net_amount if wd.net_amount and wd.net_amount > 0 else (wd.amount - wd.fee if wd.fee else wd.amount)
+                amount_int = int(round(float(net if net else wd.amount)))
+                merchant_ref = getattr(getattr(wd, "transaction", None), "trx_id", None) or f"WNP{wd.pk}{int(time.time())}"
+
+                payload = {
+                    "amount": amount_int,
+                    "destination_account": account_no,
+                    "bank_code": bank_code,
+                    "account_holder_name": account_name[:100],
+                    "merchant_ref": merchant_ref,
+                }
+
+                resp, _ = nextpay_post_json(api_key, secret_key, "/gateway/payout/create", payload, base_url=api_url)
+
+                trace, _ = NextPayWithdrawal.objects.get_or_create(withdrawal=wd, defaults={"request_params": payload})
+                if trace:
+                    if not trace.request_params:
+                        trace.request_params = payload
+                    stored = trace.response_payload if isinstance(trace.response_payload, dict) else {}
+                    stored["initiate"] = _redact_for_log(resp)
+                    trace.response_payload = stored
+                    trace.save(update_fields=["request_params", "response_payload"])
+
+                if resp.get("success"):
+                    wd.status = 'PROCESSING'
+                    wd.save()
+                    processed += 1
+                    self.message_user(request, f"Withdrawal #{wd.id} dikirim ke NextPay", level=messages.SUCCESS)
+                else:
+                    self.message_user(request, f"Withdrawal #{wd.id} gagal: {resp.get('message') or resp.get('detail') or resp.get('msg') or resp}", level=messages.ERROR)
+            except Exception as e:
+                self.message_user(request, f"Withdrawal #{wd.id} gagal dikirim: {e}", level=messages.ERROR)
+
+        if processed:
+            self.message_user(request, f"Berhasil memproses {processed} withdrawal via NextPay.", level=messages.SUCCESS)
+    process_withdrawal_batpay.short_description = 'Process via BatPay'
+
 
 @admin.register(WithdrawalJayapay)
 class WithdrawalJayapayAdmin(WithdrawalAdmin):
@@ -1318,6 +1683,8 @@ class WithdrawalSettingsAdmin(admin.ModelAdmin):
         'atpay_payout_enabled',
         'bankpay_payout_enabled',
         'reepay_payout_enabled',
+        'batpay_payout_enabled',
+        'nextpay_payout_enabled',
         'updated_at',
     )
     list_filter = ('is_active',)
@@ -1401,6 +1768,22 @@ class WithdrawalSettingsAdmin(admin.ModelAdmin):
                 'reepay_payout_api_url',
                 'reepay_payout_api_key',
                 'reepay_payout_secret_key',
+            )
+        }),
+        ('BatPay Payout', {
+            'fields': (
+                'batpay_payout_enabled',
+                'batpay_payout_api_url',
+                'batpay_payout_api_key',
+                'batpay_payout_secret_key',
+            )
+        }),
+        ('NextPay Payout', {
+            'fields': (
+                'nextpay_payout_enabled',
+                'nextpay_payout_api_url',
+                'nextpay_payout_api_key',
+                'nextpay_payout_secret_key',
             )
         }),
     )

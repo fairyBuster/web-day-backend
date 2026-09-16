@@ -8,7 +8,7 @@ from django.utils import timezone
 @admin.register(GatewaySettings)
 class GatewaySettingsAdmin(admin.ModelAdmin):
     list_display = (
-        'default_wallet_type', 'app_domain', 'min_deposit_amount', 'max_deposit_amount', 'usd_gateway_min_deposit_amount', 'usd_gateway_max_deposit_amount', 'jayapay_enabled', 'jayapay_ph_enabled', 'klikpay_enabled', 'usd_gateway_enabled', 'ppaypros_enabled', 'clienthub_enabled', 'sitransferhub_enabled', 'atpay_enabled', 'bankpay_enabled', 'qris_enabled', 'reepay_enabled', 'updated_at'
+        'default_wallet_type', 'app_domain', 'min_deposit_amount', 'max_deposit_amount', 'usd_gateway_min_deposit_amount', 'usd_gateway_max_deposit_amount', 'jayapay_enabled', 'jayapay_ph_enabled', 'klikpay_enabled', 'usd_gateway_enabled', 'ppaypros_enabled', 'clienthub_enabled', 'sitransferhub_enabled', 'atpay_enabled', 'bankpay_enabled', 'qris_enabled', 'reepay_enabled', 'batpay_enabled', 'nextpay_enabled', 'updated_at'
     )
     readonly_fields = ('updated_at',)
 
@@ -17,7 +17,7 @@ class GatewaySettingsAdmin(admin.ModelAdmin):
         return not GatewaySettings.objects.exists()
     fieldsets = (
         ('Global', {
-            'fields': ('default_wallet_type', 'app_domain', 'min_deposit_amount', 'max_deposit_amount', 'jayapay_enabled', 'jayapay_ph_enabled', 'klikpay_enabled', 'usd_gateway_enabled', 'ppaypros_enabled', 'clienthub_enabled', 'sitransferhub_enabled', 'atpay_enabled', 'bankpay_enabled', 'qris_enabled', 'reepay_enabled')
+            'fields': ('default_wallet_type', 'app_domain', 'min_deposit_amount', 'max_deposit_amount', 'jayapay_enabled', 'jayapay_ph_enabled', 'klikpay_enabled', 'usd_gateway_enabled', 'ppaypros_enabled', 'clienthub_enabled', 'sitransferhub_enabled', 'atpay_enabled', 'bankpay_enabled', 'qris_enabled', 'reepay_enabled', 'batpay_enabled', 'nextpay_enabled')
         }),
         ('Jayapay', {
             'fields': (
@@ -135,6 +135,24 @@ class GatewaySettingsAdmin(admin.ModelAdmin):
                 'reepay_return_url',
             ),
             'description': 'Konfigurasi Reepay (RogueCDN). Auth HMAC-SHA256 via header X-API-Key, X-Timestamp, X-Signature.',
+        }),
+        ('BatPay', {
+            'fields': (
+                'batpay_api_url',
+                'batpay_api_key',
+                'batpay_secret_key',
+                'batpay_return_url',
+            ),
+            'description': 'Konfigurasi BatPay (api.wayrooou.online). Auth HMAC-SHA256 via header X-API-Key, X-Timestamp, X-Signature (sama seperti Reepay). Secret key panjang (347 karakter).',
+        }),
+        ('NextPay', {
+            'fields': (
+                'nextpay_api_url',
+                'nextpay_api_key',
+                'nextpay_secret_key',
+                'nextpay_return_url',
+            ),
+            'description': 'Konfigurasi NextPay (api.nextcdn.online). Auth HMAC-SHA256 via header X-API-Key, X-Timestamp, X-Signature (sama seperti Reepay). Secret key panjang (347 karakter).',
         }),
     )
 

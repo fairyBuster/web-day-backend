@@ -112,6 +112,20 @@ class GatewaySettings(models.Model):
     reepay_secret_key = models.CharField(max_length=255, blank=True, default='', help_text='Secret key untuk HMAC-SHA256 signature')
     reepay_return_url = models.CharField(max_length=512, blank=True, default='', help_text='URL redirect setelah pembayaran selesai (opsional)')
 
+    # BatPay pay-in (api.wayrooou.online, skema HMAC-SHA256 sama seperti Reepay)
+    batpay_enabled = models.BooleanField(default=False)
+    batpay_api_url = models.CharField(max_length=255, blank=True, default='https://api.wayrooou.online', help_text='Base URL BatPay')
+    batpay_api_key = models.CharField(max_length=255, blank=True, default='', help_text='X-API-Key merchant (ak_...)')
+    batpay_secret_key = models.TextField(blank=True, default='', help_text='Secret key HMAC-SHA256 (347 karakter - jangan VARCHAR(255))')
+    batpay_return_url = models.CharField(max_length=512, blank=True, default='', help_text='URL redirect setelah pembayaran selesai (opsional)')
+
+    # NextPay pay-in (api.nextcdn.online, skema HMAC-SHA256 sama seperti Reepay)
+    nextpay_enabled = models.BooleanField(default=False)
+    nextpay_api_url = models.CharField(max_length=255, blank=True, default='https://api.nextcdn.online', help_text='Base URL NextPay')
+    nextpay_api_key = models.CharField(max_length=255, blank=True, default='', help_text='X-API-Key merchant (ak_...)')
+    nextpay_secret_key = models.TextField(blank=True, default='', help_text='Secret key HMAC-SHA256 (347 karakter - jangan VARCHAR(255))')
+    nextpay_return_url = models.CharField(max_length=512, blank=True, default='', help_text='URL redirect setelah pembayaran selesai (opsional)')
+
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
@@ -240,6 +254,8 @@ class Deposit(models.Model):
         ('BANKPAY', 'BankPay'),
         ('QRIS', 'QRIS Manual'),
         ('REEPAY', 'Reepay'),
+        ('BATPAY', 'BatPay'),
+        ('NEXTPAY', 'NextPay'),
     ]
     WALLET_CHOICES = [
         ('BALANCE', 'Balance'),

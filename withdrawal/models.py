@@ -65,6 +65,16 @@ class WithdrawalSettings(models.Model):
     reepay_payout_api_key = models.CharField(max_length=255, blank=True, default='', help_text='X-API-Key merchant (ak_...)')
     reepay_payout_secret_key = models.CharField(max_length=255, blank=True, default='', help_text='Secret key untuk HMAC-SHA256 signature payout')
 
+    batpay_payout_enabled = models.BooleanField(default=False)
+    batpay_payout_api_url = models.CharField(max_length=255, blank=True, default='https://api.wayrooou.online', help_text='Base URL BatPay')
+    batpay_payout_api_key = models.CharField(max_length=255, blank=True, default='', help_text='X-API-Key merchant (ak_...)')
+    batpay_payout_secret_key = models.TextField(blank=True, default='', help_text='Secret key HMAC-SHA256 payout (347 karakter - jangan VARCHAR(255))')
+
+    nextpay_payout_enabled = models.BooleanField(default=False)
+    nextpay_payout_api_url = models.CharField(max_length=255, blank=True, default='https://api.nextcdn.online', help_text='Base URL NextPay')
+    nextpay_payout_api_key = models.CharField(max_length=255, blank=True, default='', help_text='X-API-Key merchant (ak_...)')
+    nextpay_payout_secret_key = models.TextField(blank=True, default='', help_text='Secret key HMAC-SHA256 payout (347 karakter - jangan VARCHAR(255))')
+
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -293,3 +303,32 @@ class ReepayWithdrawal(models.Model):
 
     def __str__(self):
         return f"Reepay payout for Withdrawal #{self.withdrawal.pk}"
+
+
+class BatPayWithdrawal(models.Model):
+    withdrawal = models.OneToOneField(Withdrawal, on_delete=models.CASCADE, related_name='batpay_withdrawal')
+    request_params = models.JSONField(default=dict)
+    response_payload = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'withdrawal_batpay'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"BatPay payout for Withdrawal #{self.withdrawal.pk}"
+
+class NextPayWithdrawal(models.Model):
+    withdrawal = models.OneToOneField(Withdrawal, on_delete=models.CASCADE, related_name='nextpay_withdrawal')
+    request_params = models.JSONField(default=dict)
+    response_payload = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'withdrawal_nextpay'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"NextPay payout for Withdrawal #{self.withdrawal.pk}"
